@@ -1,8 +1,9 @@
 //! A maintained mini-fork of jj's storage format: the simple backend and
 //! simple op-store canonical encodings and their `ContentHash` scheme,
 //! reimplemented without jj-lib so validation is no-I/O and panic-free.
-//! Every jj format change (new fields, hash inputs, validity rules) must be
-//! mirrored here; parity with the frozen v2 codec is guarded by
+//! Mirrors the format as of jj-lib 0.42.0, audited against that source;
+//! every jj format change (new fields, hash inputs, validity rules) must be
+//! mirrored here per the AGENTS.md parity procedure. ID parity is guarded by
 //! `tests/v2_golden.txt`.
 
 mod backend;

@@ -289,11 +289,16 @@ pub(crate) fn validate_commit(bytes: &[u8]) -> Result<ValidatedObject, Validatio
             stored.change_id.len()
         )));
     }
-    let conflict_labels = if stored.conflict_labels.is_empty()
-        || stored.conflict_labels.iter().all(String::is_empty)
-    {
+    // Mirrors jj's ConflictLabels: only an absent field is unlabeled, and
+    // resolved labels must be the empty string, which is never stored.
+    let conflict_labels = if stored.conflict_labels.is_empty() {
         vec![String::new()]
     } else {
+        if stored.conflict_labels.len() == 1 {
+            return Err(ValidationError::new(
+                "resolved conflict labels are stored as an absent field",
+            ));
+        }
         if stored.conflict_labels.len().is_multiple_of(2)
             || stored.conflict_labels.len() != stored.root_tree.len()
         {
