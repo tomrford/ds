@@ -1,0 +1,13 @@
+[package]
+name = "devspace-kernel-wasm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+devspace-kernel = { path = "../kernel" }
+

@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/kernel", "crates/kernel-wasm"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.97"
+
+[workspace.dependencies]
+blake2 = "0.10.6"
+prost = "=0.14.3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"

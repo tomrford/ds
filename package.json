@@ -1,0 +1,20 @@
+{
+  "name": "devspace-v3-spike",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm build:wasm && wrangler deploy --dry-run --outdir dist/worker",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "check": "pnpm types && pnpm build:wasm && tsc --noEmit && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check",
+    "dev": "pnpm build:wasm && wrangler dev",
+    "format": "cargo fmt --all",
+    "test": "cargo test --workspace && pnpm build:wasm && vitest run",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.18.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.10",
+    "wrangler": "4.107.1"
+  }
+}
