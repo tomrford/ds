@@ -128,6 +128,40 @@ early-install rejection, retry idempotency, transaction rollback after a later
 object fails validation, cross-pack references and eviction between quarantine
 and installation.
 
+## Cloud download and native installation
+
+Each installed pack receives an append-only repository-local sequence. An
+incarnation-scoped catalog returns at most 256 logical pack IDs per page. The
+first page captures a high-water sequence, and later pages are bounded by that
+same value, so concurrent installs cannot extend or change an in-progress
+catalog traversal. The sequence is a pagination cursor only; pack identity
+remains the manifest hash. A separate catalog table is backfilled
+idempotently in bounded, retryable batches for Durable Objects created before
+download support existed. Client-supplied high-water values above the current
+catalog frontier are rejected.
+
+Authenticated GETs return the exact installed manifest and its logical chunks.
+The Durable Object reconstructs each chunk from canonical objects and the
+installed pack index, then checks the chunk hash before returning it. Stored
+manifest parts are also rehashed against the requested pack ID. Neither the
+catalog nor the pack URLs reveal whether those bytes currently live in SQLite,
+R2 or another byte store.
+
+`devspace-machine` strictly decodes the same manifest format, checks the
+manifest ID, every chunk and the whole-pack hash, and validates every object
+and ID through the kernel. Canonical objects are installed into jj's stock
+simple stores using synced no-clobber writes. An exact existing object makes a
+retry idempotent and retries its parent-directory sync; different bytes at an
+existing content path fail closed.
+Valid immutable objects installed before a later pack failure may remain as a
+safe cache, but pack installation never publishes an operation head.
+
+The Worker test reconstructs a multi-object pack whose object crosses a chunk
+boundary and compares every downloaded byte with the upload. The native test
+builds a real repository pack, installs it into a fresh stock repository,
+retries it idempotently and only then reconciles its operation head. Corrupt
+download bytes are rejected without changing the stock head store.
+
 ## Cloud operation heads
 
 The repository Durable Object is initialized once with a 128-bit incarnation.

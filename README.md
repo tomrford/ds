@@ -26,7 +26,10 @@ The Worker accepts authenticated manifest and chunk uploads under
 request. Uploads are quarantined until the Durable Object has checked the
 manifest, chunk and whole-pack hashes and revalidated every object through the
 Rust/Wasm kernel in one atomic install transaction. Authenticated head reads
-and transactions use `/repositories/:repository/heads`.
+and transactions use `/repositories/:repository/heads`. An
+incarnation-scoped, paginated GET on `/repositories/:repository/packs` lists
+installed logical packs; their exact manifests and chunks are downloadable
+from the same pack routes.
 
 ## Current boundary
 
@@ -46,6 +49,11 @@ jj stores. The same crate discovers deterministic raw-object closures from all
 local operation heads, stops at the cloud-accepted operation frontier, and
 encodes cloud-missing objects into deterministic, size-bounded, hash-verified
 packs.
+
+Downloaded packs are decoded and hash-checked again before the machine installs
+their canonical objects into the stock simple stores with no-clobber writes.
+Pack installation never publishes an operation head; complete-closure
+validation and native reconciliation remain the authority boundary.
 
 When cloud operation objects have been installed locally, the machine validates
 their complete closure before adding them to jj's stock operation-head store.

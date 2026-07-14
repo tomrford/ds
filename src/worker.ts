@@ -15,6 +15,8 @@ import {
 const MAX_OBJECT_BYTES = 1024 * 1024;
 const REPOSITORY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const PACK_ID_PATTERN = /^[0-9a-f]{128}$/;
+const PACK_CATALOG_PAGE = 256;
+const PACK_CATALOG_MIGRATION_BATCH = 256;
 
 interface Env {
   REPOSITORIES: DurableObjectNamespace<Repository>;
@@ -28,6 +30,11 @@ interface UploadRow extends Record<string, SqlStorageValue> {
   chunk_bytes: number;
   object_count: number;
   chunk_count: number;
+}
+
+interface InstalledPackRow extends Record<string, SqlStorageValue> {
+  pack_id: ArrayBuffer;
+  sequence: number;
 }
 
 interface ObjectRow extends Record<string, SqlStorageValue> {
@@ -48,6 +55,11 @@ interface ChunkRow extends Record<string, SqlStorageValue> {
 
 interface BytesRow extends Record<string, SqlStorageValue> {
   bytes: ArrayBuffer;
+}
+
+interface InstalledObjectBytesRow extends BytesRow {
+  byte_offset: number;
+  byte_length: number;
 }
 
 class PackValidationError extends Error {}
@@ -127,6 +139,10 @@ export class Repository extends DurableObject<Env> {
         object_count INTEGER NOT NULL,
         chunk_count INTEGER NOT NULL
       ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS installed_pack_catalog (
+        pack_id BLOB PRIMARY KEY,
+        sequence INTEGER NOT NULL UNIQUE
+      ) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS installed_pack_manifest_parts (
         pack_id BLOB NOT NULL,
         position INTEGER NOT NULL,
@@ -157,6 +173,7 @@ export class Repository extends DurableObject<Env> {
         PRIMARY KEY (pack_id, position)
       ) WITHOUT ROWID;
     `);
+    this.backfillInstalledPackCatalog();
     this.heads = new HeadStore(this.ctx, this.kernel);
   }
 
@@ -335,6 +352,149 @@ export class Repository extends DurableObject<Env> {
     return this.heads.transact(value);
   }
 
+  listInstalledPacks(incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
+    const state = this.heads.get(incarnationValue);
+    if (!state.ok) return state;
+    if (!this.backfillInstalledPackCatalog()) {
+      return {
+        ok: false as const,
+        status: 503,
+        error: "installed pack catalog migration is incomplete; retry",
+      };
+    }
+    if (typeof afterValue !== "number" || !Number.isSafeInteger(afterValue) || afterValue < 0) {
+      return { ok: false as const, status: 400, error: "pack cursor must be a non-negative integer" };
+    }
+    const highWater = this.installedPackHighWater();
+    const through = throughValue === undefined ? highWater : throughValue;
+    if (
+      typeof through !== "number" ||
+      !Number.isSafeInteger(through) ||
+      through < afterValue ||
+      through > highWater
+    ) {
+      return {
+        ok: false as const,
+        status: 400,
+        error: "pack high-water must be between the cursor and current catalog frontier",
+      };
+    }
+    const rows = this.ctx.storage.sql
+      .exec<InstalledPackRow>(
+        `SELECT pack_id, sequence FROM installed_pack_catalog
+         WHERE sequence > ? AND sequence <= ? ORDER BY sequence LIMIT ?`,
+        afterValue,
+        through,
+        PACK_CATALOG_PAGE + 1,
+      )
+      .toArray();
+    const hasMore = rows.length > PACK_CATALOG_PAGE;
+    const page = rows.slice(0, PACK_CATALOG_PAGE);
+    return {
+      ok: true as const,
+      packs: page.map((row) => ({ sequence: row.sequence, id: toHex(new Uint8Array(row.pack_id)) })),
+      nextAfter: page.at(-1)?.sequence ?? afterValue,
+      through,
+      hasMore,
+    };
+  }
+
+  getInstalledPackManifest(packId: string, incarnationValue: unknown) {
+    const state = this.heads.get(incarnationValue);
+    if (!state.ok) return state;
+    let id: ArrayBuffer;
+    try {
+      id = exactBuffer(fromHex(packId));
+    } catch (error) {
+      return {
+        ok: false as const,
+        status: 400,
+        error: error instanceof Error ? error.message : "invalid pack ID",
+      };
+    }
+    const installed = this.installed(id);
+    if (installed === undefined) {
+      return { ok: false as const, status: 404, error: "installed pack does not exist" };
+    }
+    const bytes = concatParts(
+      this.installedManifestParts(id),
+      Math.min(installed.manifest_length, MAX_MANIFEST_BYTES),
+    );
+    if (bytes.byteLength !== installed.manifest_length) {
+      throw new Error("installed pack manifest is incomplete");
+    }
+    if (!equalBytes(this.kernel.hash([bytes]), new Uint8Array(id))) {
+      throw new Error("installed pack manifest hash changed");
+    }
+    return { ok: true as const, bytes: exactBuffer(bytes) };
+  }
+
+  getInstalledPackChunk(packId: string, position: number, incarnationValue: unknown) {
+    const state = this.heads.get(incarnationValue);
+    if (!state.ok) return state;
+    let id: ArrayBuffer;
+    try {
+      id = exactBuffer(fromHex(packId));
+    } catch (error) {
+      return {
+        ok: false as const,
+        status: 400,
+        error: error instanceof Error ? error.message : "invalid pack ID",
+      };
+    }
+    const chunk = this.ctx.storage.sql
+      .exec<ChunkRow>(
+        `SELECT position, byte_offset, byte_length, hash, 1 AS received
+         FROM installed_pack_chunks WHERE pack_id = ? AND position = ?`,
+        id,
+        position,
+      )
+      .toArray()[0];
+    if (chunk === undefined) {
+      return { ok: false as const, status: 404, error: "installed pack chunk does not exist" };
+    }
+    const end = chunk.byte_offset + chunk.byte_length;
+    const objects = this.ctx.storage.sql
+      .exec<InstalledObjectBytesRow>(
+        `SELECT indexed.byte_offset, indexed.byte_length, objects.bytes
+         FROM installed_pack_objects AS indexed
+         JOIN objects ON objects.kind = indexed.kind AND objects.id = indexed.id
+         WHERE indexed.pack_id = ?
+           AND indexed.byte_offset < ?
+           AND indexed.byte_offset + indexed.byte_length > ?
+         ORDER BY indexed.position`,
+        id,
+        end,
+        chunk.byte_offset,
+      )
+      .toArray();
+    const bytes = new Uint8Array(chunk.byte_length);
+    let filled = 0;
+    for (const object of objects) {
+      const objectBytes = new Uint8Array(object.bytes);
+      if (objectBytes.byteLength !== object.byte_length) {
+        throw new Error("installed object length does not match its pack index");
+      }
+      const overlapStart = Math.max(chunk.byte_offset, object.byte_offset);
+      const overlapEnd = Math.min(end, object.byte_offset + object.byte_length);
+      if (overlapStart !== chunk.byte_offset + filled || overlapEnd <= overlapStart) {
+        throw new Error("installed pack object ranges do not reconstruct the requested chunk");
+      }
+      bytes.set(
+        objectBytes.subarray(overlapStart - object.byte_offset, overlapEnd - object.byte_offset),
+        filled,
+      );
+      filled += overlapEnd - overlapStart;
+    }
+    if (filled !== bytes.byteLength) {
+      throw new Error("installed pack chunk is incomplete");
+    }
+    if (!equalBytes(this.kernel.hash([bytes]), new Uint8Array(chunk.hash))) {
+      throw new Error("installed pack chunk hash changed");
+    }
+    return { ok: true as const, bytes: exactBuffer(bytes) };
+  }
+
   private storeManifest(id: ArrayBuffer, bytes: Uint8Array, manifest: PackManifest) {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
@@ -479,6 +639,11 @@ export class Repository extends DurableObject<Env> {
       upload.chunk_count,
     );
     this.ctx.storage.sql.exec(
+      "INSERT INTO installed_pack_catalog VALUES (?, ?)",
+      id,
+      this.nextInstalledPackSequence(),
+    );
+    this.ctx.storage.sql.exec(
       `INSERT INTO installed_pack_manifest_parts
        SELECT pack_id, position, bytes FROM pack_upload_manifest_parts WHERE pack_id = ?`,
       id,
@@ -585,6 +750,46 @@ export class Repository extends DurableObject<Env> {
       .toArray()[0];
   }
 
+  private nextInstalledPackSequence(): number {
+    const previous = this.installedPackHighWater();
+    if (previous >= Number.MAX_SAFE_INTEGER) throw new Error("installed pack sequence exhausted");
+    return previous + 1;
+  }
+
+  private installedPackHighWater(): number {
+    return this.ctx.storage.sql
+      .exec<{ sequence: number }>(
+        "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM installed_pack_catalog",
+      )
+      .one().sequence;
+  }
+
+  private backfillInstalledPackCatalog(): boolean {
+    const missing = this.ctx.storage.sql
+      .exec<{ pack_id: ArrayBuffer }>(
+        `SELECT installed.pack_id FROM installed_packs AS installed
+         LEFT JOIN installed_pack_catalog AS catalog ON catalog.pack_id = installed.pack_id
+         WHERE catalog.pack_id IS NULL ORDER BY installed.pack_id LIMIT ?`,
+        PACK_CATALOG_MIGRATION_BATCH + 1,
+      )
+      .toArray();
+    if (missing.length === 0) return true;
+    const batch = missing.slice(0, PACK_CATALOG_MIGRATION_BATCH);
+    this.ctx.storage.transactionSync(() => {
+      let sequence = this.installedPackHighWater();
+      for (const row of batch) {
+        sequence += 1;
+        if (!Number.isSafeInteger(sequence)) throw new Error("installed pack sequence exhausted");
+        this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO installed_pack_catalog VALUES (?, ?)",
+          row.pack_id,
+          sequence,
+        );
+      }
+    });
+    return missing.length <= PACK_CATALOG_MIGRATION_BATCH;
+  }
+
   private manifestParts(id: ArrayBuffer): Uint8Array[] {
     return this.ctx.storage.sql
       .exec<BytesRow>(
@@ -653,7 +858,8 @@ export default {
       url.pathname,
     );
     const headMatch = /^\/repositories\/([^/]+)\/heads$/.exec(url.pathname);
-    const repository = chunkMatch?.[1] ?? packMatch?.[1] ?? headMatch?.[1];
+    const packCatalogMatch = /^\/repositories\/([^/]+)\/packs$/.exec(url.pathname);
+    const repository = chunkMatch?.[1] ?? packMatch?.[1] ?? headMatch?.[1] ?? packCatalogMatch?.[1];
     const packId = chunkMatch?.[2] ?? packMatch?.[2];
     if (repository === undefined) return errorResponse(404, "not found");
     if (!REPOSITORY_PATTERN.test(repository)) return errorResponse(400, "invalid repository name");
@@ -673,6 +879,32 @@ export default {
         }
         return rpcResponse(await stub.putPackManifest(packId, bytes));
       }
+      if (packCatalogMatch !== null && request.method === "GET") {
+        const after = url.searchParams.get("after") ?? "0";
+        if (!/^(0|[1-9][0-9]*)$/.test(after) || !Number.isSafeInteger(Number(after))) {
+          return errorResponse(400, "invalid pack cursor");
+        }
+        const throughValue = url.searchParams.get("through");
+        if (
+          throughValue !== null &&
+          (!/^(0|[1-9][0-9]*)$/.test(throughValue) || !Number.isSafeInteger(Number(throughValue)))
+        ) {
+          return errorResponse(400, "invalid pack high-water");
+        }
+        return rpcResponse(
+          await stub.listInstalledPacks(
+            url.searchParams.get("incarnation"),
+            Number(after),
+            throughValue === null ? undefined : Number(throughValue),
+          ),
+        );
+      }
+      if (packMatch?.[3] === "manifest" && request.method === "GET") {
+        if (packId === undefined) throw new Error("pack route did not capture an ID");
+        return binaryRpcResponse(
+          await stub.getInstalledPackManifest(packId, url.searchParams.get("incarnation")),
+        );
+      }
       if (chunkMatch !== null && request.method === "PUT") {
         if (packId === undefined) throw new Error("chunk route did not capture a pack ID");
         if (!/^(0|[1-9][0-9]*)$/.test(chunkMatch[3])) {
@@ -687,6 +919,21 @@ export default {
           return errorResponse(400, error instanceof Error ? error.message : "invalid chunk body");
         }
         return rpcResponse(await stub.putPackChunk(packId, position, bytes));
+      }
+      if (chunkMatch !== null && request.method === "GET") {
+        if (packId === undefined) throw new Error("chunk route did not capture a pack ID");
+        if (!/^(0|[1-9][0-9]*)$/.test(chunkMatch[3])) {
+          return errorResponse(400, "invalid chunk position");
+        }
+        const position = Number(chunkMatch[3]);
+        if (!Number.isSafeInteger(position)) return errorResponse(400, "invalid chunk position");
+        return binaryRpcResponse(
+          await stub.getInstalledPackChunk(
+            packId,
+            position,
+            url.searchParams.get("incarnation"),
+          ),
+        );
       }
       if (packMatch?.[3] === "install" && request.method === "POST") {
         if (packId === undefined) throw new Error("pack route did not capture an ID");
@@ -724,4 +971,17 @@ function rpcResponse(result: { ok: boolean; error?: string; status?: number }): 
   }
   const { ok: _, status: __, ...body } = result;
   return Response.json(body);
+}
+
+function binaryRpcResponse(result: {
+  ok: boolean;
+  error?: string;
+  status?: number;
+  bytes?: ArrayBuffer;
+}): Response {
+  if (!result.ok) {
+    return errorResponse(result.status ?? 400, result.error ?? "repository request failed");
+  }
+  if (result.bytes === undefined) throw new Error("binary repository response is missing bytes");
+  return new Response(result.bytes, { headers: { "content-type": "application/octet-stream" } });
 }

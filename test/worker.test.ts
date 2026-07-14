@@ -364,6 +364,77 @@ describe("cloud operation heads", () => {
   });
 });
 
+describe("cloud pack download", () => {
+  const incarnation = "33".repeat(16);
+
+  it("lists installed packs and reproduces their exact manifest and chunks", async () => {
+    const repository = "pack-download";
+    await env.REPOSITORIES.getByName(repository).initializeRepository(incarnation);
+    const manifest = helloManifest();
+    expect((await putManifest(repository, helloPackId, manifest)).status).toBe(200);
+    expect((await putChunk(repository, helloPackId, 0, hello)).status).toBe(200);
+    expect((await install(repository, helloPackId)).status).toBe(200);
+
+    expect(await listPacks(repository, incarnation, 0)).toEqual({
+      status: 200,
+      body: {
+        packs: [{ sequence: 1, id: helloPackId }],
+        nextAfter: 1,
+        through: 1,
+        hasMore: false,
+      },
+    });
+    expect(await listPacks(repository, incarnation, 1, 1)).toEqual({
+      status: 200,
+      body: { packs: [], nextAfter: 1, through: 1, hasMore: false },
+    });
+    expect(await listPacks(repository, incarnation, 1, 99)).toEqual({
+      status: 400,
+      body: {
+        error: "pack high-water must be between the cursor and current catalog frontier",
+      },
+    });
+    expect(await downloadPackManifest(repository, helloPackId, incarnation)).toEqual(manifest);
+    expect(await downloadPackChunk(repository, helloPackId, 0, incarnation)).toEqual(hello);
+
+    const spanning = spanningObjectPack();
+    expect((await putManifest(repository, spanning.id, spanning.manifest)).status).toBe(200);
+    for (const [position, chunk] of spanning.chunks.entries()) {
+      expect((await putChunk(repository, spanning.id, position, chunk)).status).toBe(200);
+    }
+    expect((await install(repository, spanning.id)).status).toBe(200);
+    expect(await listPacks(repository, incarnation, 1, 1)).toEqual({
+      status: 200,
+      body: { packs: [], nextAfter: 1, through: 1, hasMore: false },
+    });
+    expect(await listPacks(repository, incarnation, 1)).toEqual({
+      status: 200,
+      body: {
+        packs: [{ sequence: 2, id: spanning.id }],
+        nextAfter: 2,
+        through: 2,
+        hasMore: false,
+      },
+    });
+    expect(await downloadPackManifest(repository, spanning.id, incarnation)).toEqual(
+      spanning.manifest,
+    );
+    for (const [position, chunk] of spanning.chunks.entries()) {
+      expect(await downloadPackChunk(repository, spanning.id, position, incarnation)).toEqual(
+        chunk,
+      );
+    }
+
+    expect(await listPacks(repository, "44".repeat(16), 0)).toEqual({
+      status: 409,
+      body: { error: "repository incarnation does not match" },
+    });
+    const missing = await fetchPackChunk(repository, "00".repeat(64), 0, incarnation);
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toEqual({ error: "installed pack chunk does not exist" });
+  });
+});
+
 async function putManifest(repository: string, packId: string, bytes: Uint8Array) {
   return exports.default.fetch(
     new Request(`https://example.com/repositories/${repository}/packs/${packId}/manifest`, {
@@ -456,6 +527,58 @@ async function getHeads(repository: string, incarnation: string) {
   return { status: response.status, body: await response.json() };
 }
 
+async function listPacks(
+  repository: string,
+  incarnation: string,
+  after: number,
+  through?: number,
+) {
+  const highWater = through === undefined ? "" : `&through=${through}`;
+  const response = await exports.default.fetch(
+    new Request(
+      `https://example.com/repositories/${repository}/packs?incarnation=${incarnation}&after=${after}${highWater}`,
+      { headers: authorization },
+    ),
+  );
+  return { status: response.status, body: await response.json() };
+}
+
+async function downloadPackManifest(repository: string, packId: string, incarnation: string) {
+  const response = await exports.default.fetch(
+    new Request(
+      `https://example.com/repositories/${repository}/packs/${packId}/manifest?incarnation=${incarnation}`,
+      { headers: authorization },
+    ),
+  );
+  expect(response.status).toBe(200);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+async function fetchPackChunk(
+  repository: string,
+  packId: string,
+  position: number,
+  incarnation: string,
+) {
+  return exports.default.fetch(
+    new Request(
+      `https://example.com/repositories/${repository}/packs/${packId}/chunks/${position}?incarnation=${incarnation}`,
+      { headers: authorization },
+    ),
+  );
+}
+
+async function downloadPackChunk(
+  repository: string,
+  packId: string,
+  position: number,
+  incarnation: string,
+) {
+  const response = await fetchPackChunk(repository, packId, position, incarnation);
+  expect(response.status).toBe(200);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
 function helloManifest(): Uint8Array {
   const id = fromHex(helloId);
   const bytes = new Uint8Array(96 + 88 + 80);
@@ -523,6 +646,44 @@ function rollbackFixture() {
   view.setUint32(280, 2, true);
   manifest.set(packHash, 288);
   return { bytes, id: toHex(kernel.hash([manifest])), manifest };
+}
+
+function spanningObjectPack() {
+  const kernel = new Kernel();
+  const chunkBytes = 64 * 1024;
+  const objects = [new Uint8Array(40 * 1024).fill(1), new Uint8Array(40 * 1024).fill(2)]
+    .map((bytes) => ({ bytes, id: kernel.validate(KIND.file, bytes).id }))
+    .sort((left, right) => toHex(left.id).localeCompare(toHex(right.id)));
+  const packBytes = concat(...objects.map((object) => object.bytes));
+  const chunks = [packBytes.slice(0, chunkBytes), packBytes.slice(chunkBytes)];
+  const packHash = kernel.hash([packBytes]);
+  const manifest = new Uint8Array(96 + objects.length * 88 + chunks.length * 80);
+  const view = new DataView(manifest.buffer);
+  manifest.set(new TextEncoder().encode("DSPK"));
+  view.setUint16(4, 1, true);
+  view.setUint32(8, chunkBytes, true);
+  view.setUint32(16, objects.length, true);
+  view.setUint32(20, chunks.length, true);
+  view.setBigUint64(24, BigInt(packBytes.byteLength), true);
+  manifest.set(packHash, 32);
+  let byteOffset = 0;
+  for (const [position, object] of objects.entries()) {
+    const offset = 96 + position * 88;
+    manifest[offset] = KIND.file;
+    manifest.set(object.id, offset + 8);
+    view.setBigUint64(offset + 72, BigInt(byteOffset), true);
+    view.setBigUint64(offset + 80, BigInt(object.bytes.byteLength), true);
+    byteOffset += object.bytes.byteLength;
+  }
+  byteOffset = 0;
+  for (const [position, chunk] of chunks.entries()) {
+    const offset = 96 + objects.length * 88 + position * 80;
+    view.setBigUint64(offset, BigInt(byteOffset), true);
+    view.setUint32(offset + 8, chunk.byteLength, true);
+    manifest.set(kernel.hash([chunk]), offset + 16);
+    byteOffset += chunk.byteLength;
+  }
+  return { id: toHex(kernel.hash([manifest])), manifest, chunks };
 }
 
 function fromHex(value: string): Uint8Array {

@@ -1,10 +1,11 @@
 use thiserror::Error;
 
-use crate::ObjectKey;
+use crate::object_closure::MAX_OBJECT_BYTES;
 use crate::object_closure::ObjectId;
 use crate::pack::{
     MAX_CHUNK_BYTES, MAX_PACK_BYTES, MAX_PACK_OBJECTS, MAX_PACK_OPERATION_HEADS, MIN_CHUNK_BYTES,
 };
+use crate::{ObjectKey, ObjectKind};
 
 const MANIFEST_MAGIC: &[u8; 4] = b"DSPK";
 const MANIFEST_VERSION: u16 = 1;
@@ -126,6 +127,118 @@ impl PackManifest {
         bytes
     }
 
+    pub fn decode(bytes: &[u8]) -> Result<Self, PackManifestError> {
+        if bytes.len() < MANIFEST_HEADER_BYTES {
+            return Err(PackManifestError::InvalidEncoding {
+                reason: "manifest header is truncated",
+            });
+        }
+        if &bytes[..4] != MANIFEST_MAGIC {
+            return Err(PackManifestError::InvalidEncoding {
+                reason: "invalid manifest magic",
+            });
+        }
+        if read_u16(bytes, 4) != MANIFEST_VERSION {
+            return Err(PackManifestError::InvalidEncoding {
+                reason: "unsupported manifest version",
+            });
+        }
+        require_zero(&bytes[6..8], "manifest header reserved bytes")?;
+
+        let chunk_bytes = read_u32(bytes, 8);
+        let head_count = read_u32(bytes, 12) as usize;
+        let object_count = read_u32(bytes, 16) as usize;
+        let chunk_count = read_u32(bytes, 20) as usize;
+        let pack_length = read_u64(bytes, 24);
+        for (field, count, maximum) in [
+            ("operation heads", head_count, MAX_PACK_OPERATION_HEADS),
+            ("objects", object_count, MAX_PACK_OBJECTS as usize),
+            ("chunks", chunk_count, MAX_PACK_CHUNKS),
+        ] {
+            if count > maximum {
+                return Err(PackManifestError::TooManyEntries {
+                    field,
+                    count,
+                    maximum,
+                });
+            }
+        }
+        let expected_length = MANIFEST_HEADER_BYTES
+            .checked_add(head_count * 64)
+            .and_then(|length| length.checked_add(object_count * OBJECT_ENTRY_BYTES))
+            .and_then(|length| length.checked_add(chunk_count * CHUNK_ENTRY_BYTES))
+            .ok_or(PackManifestError::InvalidEncoding {
+                reason: "manifest length overflows",
+            })?;
+        if bytes.len() != expected_length {
+            return Err(PackManifestError::InvalidEncoding {
+                reason: "manifest length does not match counts",
+            });
+        }
+
+        let pack_hash = bytes[32..96].try_into().unwrap();
+        let mut offset = MANIFEST_HEADER_BYTES;
+        let mut operation_heads = Vec::with_capacity(head_count);
+        for _ in 0..head_count {
+            operation_heads.push(bytes[offset..offset + 64].try_into().unwrap());
+            offset += 64;
+        }
+
+        let mut objects = Vec::with_capacity(object_count);
+        for index in 0..object_count {
+            let kind = ObjectKind::try_from(bytes[offset]).map_err(|_| {
+                PackManifestError::UnknownObjectKind {
+                    index,
+                    kind: bytes[offset],
+                }
+            })?;
+            require_zero(
+                &bytes[offset + 1..offset + 8],
+                "manifest object reserved bytes",
+            )?;
+            let length = read_u64(bytes, offset + 80);
+            if length > MAX_OBJECT_BYTES {
+                return Err(PackManifestError::ObjectTooLarge {
+                    index,
+                    length,
+                    maximum: MAX_OBJECT_BYTES,
+                });
+            }
+            objects.push(ObjectEntry {
+                key: ObjectKey {
+                    kind,
+                    id: bytes[offset + 8..offset + 72].try_into().unwrap(),
+                },
+                offset: read_u64(bytes, offset + 72),
+                length,
+            });
+            offset += OBJECT_ENTRY_BYTES;
+        }
+
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for _ in 0..chunk_count {
+            require_zero(
+                &bytes[offset + 12..offset + 16],
+                "manifest chunk reserved bytes",
+            )?;
+            chunks.push(ChunkEntry {
+                offset: read_u64(bytes, offset),
+                length: read_u32(bytes, offset + 8),
+                hash: bytes[offset + 16..offset + 80].try_into().unwrap(),
+            });
+            offset += CHUNK_ENTRY_BYTES;
+        }
+
+        Self::new(
+            chunk_bytes,
+            pack_length,
+            pack_hash,
+            operation_heads,
+            objects,
+            chunks,
+        )
+    }
+
     fn validate(&self) -> Result<(), PackManifestError> {
         if !(MIN_CHUNK_BYTES..=MAX_CHUNK_BYTES).contains(&self.chunk_bytes) {
             return Err(PackManifestError::InvalidChunkSize {
@@ -170,6 +283,18 @@ impl PackManifest {
         {
             return Err(PackManifestError::NonCanonicalOrder { field: "objects" });
         }
+        if let Some((index, object)) = self
+            .objects
+            .iter()
+            .enumerate()
+            .find(|(_, object)| object.length > MAX_OBJECT_BYTES)
+        {
+            return Err(PackManifestError::ObjectTooLarge {
+                index,
+                length: object.length,
+                maximum: MAX_OBJECT_BYTES,
+            });
+        }
         validate_ranges(
             "object",
             self.objects
@@ -186,6 +311,26 @@ impl PackManifest {
             self.pack_length,
             Some(self.chunk_bytes),
         )
+    }
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn require_zero(bytes: &[u8], reason: &'static str) -> Result<(), PackManifestError> {
+    if bytes.iter().all(|byte| *byte == 0) {
+        Ok(())
+    } else {
+        Err(PackManifestError::InvalidEncoding { reason })
     }
 }
 
@@ -232,6 +377,16 @@ fn validate_ranges(
 
 #[derive(Debug, Error)]
 pub enum PackManifestError {
+    #[error("invalid pack manifest: {reason}")]
+    InvalidEncoding { reason: &'static str },
+    #[error("manifest object {index} has unknown kind {kind}")]
+    UnknownObjectKind { index: usize, kind: u8 },
+    #[error("manifest object {index} is {length} bytes, exceeding the {maximum}-byte limit")]
+    ObjectTooLarge {
+        index: usize,
+        length: u64,
+        maximum: u64,
+    },
     #[error("manifest {field} count {count} exceeds the u32 format limit")]
     CountTooLarge { field: &'static str, count: usize },
     #[error("manifest {field} count {count} exceeds the {maximum}-entry format limit")]
@@ -366,6 +521,36 @@ mod tests {
             hex(id),
             "606591ef0c95a0b8ab99b4ccc8cfd34f05e143f82cf4e7ff0766183d21f0fce42456f1d602deaaef70fcaed78de2ca8cee73a055853d7aff1409c7a26b185733"
         );
+        assert_eq!(PackManifest::decode(&manifest.encode()).unwrap(), manifest);
+    }
+
+    #[test]
+    fn decoder_rejects_noncanonical_reserved_bytes() {
+        let mut bytes = PackManifest::new(
+            DEFAULT_CHUNK_BYTES,
+            1,
+            [4; 64],
+            Vec::new(),
+            vec![ObjectEntry {
+                key: key(1),
+                offset: 0,
+                length: 1,
+            }],
+            vec![ChunkEntry {
+                offset: 0,
+                length: 1,
+                hash: [3; 64],
+            }],
+        )
+        .unwrap()
+        .encode();
+        bytes[97] = 1;
+        assert!(matches!(
+            PackManifest::decode(&bytes),
+            Err(PackManifestError::InvalidEncoding {
+                reason: "manifest object reserved bytes"
+            })
+        ));
     }
 
     fn hex_id(value: &str) -> ObjectId {

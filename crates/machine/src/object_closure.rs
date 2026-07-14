@@ -220,7 +220,7 @@ impl MachineRepository {
         Ok(())
     }
 
-    fn object_path(&self, key: ObjectKey) -> PathBuf {
+    pub(crate) fn object_path(&self, key: ObjectKey) -> PathBuf {
         let (store, directory) = match key.kind {
             ObjectKind::File => ("store", "files"),
             ObjectKind::Symlink => ("store", "symlinks"),

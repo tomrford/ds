@@ -1,3 +1,4 @@
+mod install;
 mod object_closure;
 mod pack;
 mod pack_manifest;
@@ -22,6 +23,7 @@ use jj_lib::simple_op_store::SimpleOpStore;
 use thiserror::Error;
 
 pub use devspace_kernel::ObjectKind;
+pub use install::{InstalledPack, PackInstallError};
 pub use object_closure::{
     MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectId, ObjectKey,
 };
