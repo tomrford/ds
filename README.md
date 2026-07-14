@@ -25,14 +25,18 @@ The Worker accepts authenticated manifest and chunk uploads under
 `/repositories/:repository/packs/:pack`, followed by an explicit install
 request. Uploads are quarantined until the Durable Object has checked the
 manifest, chunk and whole-pack hashes and revalidated every object through the
-Rust/Wasm kernel in one atomic install transaction.
+Rust/Wasm kernel in one atomic install transaction. Authenticated head reads
+and transactions use `/repositories/:repository/heads`.
 
 ## Current boundary
 
 The no-I/O Rust kernel owns canonical protobuf validation, jj-compatible object
 IDs, referenced-object extraction, and hidden-path parsing. The Worker owns
 request limits and routing. One SQLite-backed Durable Object per repository
-owns object persistence and coordination.
+owns object persistence, the repository incarnation, authoritative operation
+heads, monotonic cursors and idempotency receipts. A head transaction checks
+that its complete object closure is installed, adds the new head and removes
+only the exact heads observed by that client.
 
 The native machine crate initializes and reloads stock jj repositories. It
 rejects repositories whose backend, operation store, operation-head store,

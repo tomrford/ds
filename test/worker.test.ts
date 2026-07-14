@@ -2,6 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { evictDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import v2Golden from "../crates/kernel/tests/v2_golden.txt?raw";
+import { MAX_HEAD_REQUEST_BYTES, MAX_OBSERVED_HEADS } from "../src/head_protocol";
 import { KIND, Kernel, isKindName, toHex } from "../src/kernel";
 import { MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, decodeManifest } from "../src/pack_protocol";
 
@@ -11,6 +12,7 @@ const helloId =
 const helloPackId =
   "606591ef0c95a0b8ab99b4ccc8cfd34f05e143f82cf4e7ff0766183d21f0fce42456f1d602deaaef70fcaed78de2ca8cee73a055853d7aff1409c7a26b185733";
 const hello = new TextEncoder().encode("hello");
+const zeroId = "00".repeat(64);
 
 describe("validation kernel", () => {
   it("matches v2 IDs for every object kind through Wasm", () => {
@@ -194,6 +196,174 @@ describe("pack installation", () => {
   });
 });
 
+describe("cloud operation heads", () => {
+  const incarnation = "11".repeat(16);
+  const otherIncarnation = "22".repeat(16);
+
+  it("preserves unseen concurrent heads and replays the exact idempotent result", async () => {
+    const repository = "head-convergence";
+    const stub = env.REPOSITORIES.getByName(repository);
+    expect(await stub.initializeRepository(incarnation)).toEqual({
+      ok: true,
+      initialized: true,
+      cursor: 0,
+      heads: [],
+    });
+    expect(await stub.initializeRepository(incarnation)).toEqual({
+      ok: true,
+      initialized: false,
+      cursor: 0,
+      heads: [],
+    });
+    expect(await stub.initializeRepository(otherIncarnation)).toMatchObject({
+      ok: false,
+      status: 409,
+      error: "repository incarnation does not match",
+    });
+
+    const base = await installOperation(repository, "base");
+    const left = await installOperation(repository, "left", [base]);
+    const right = await installOperation(repository, "right", [base]);
+    const merged = await installOperation(repository, "merged", [left, right]);
+    const unrelated = await installOperation(repository, "unrelated");
+
+    expect(await headTransaction(repository, incarnation, "01".repeat(16), base, [])).toEqual({
+      status: 200,
+      body: { cursor: 1, heads: [base] },
+    });
+    const leftRequest = headRequest(incarnation, "02".repeat(16), left, [base]);
+    expect(await postHeads(repository, leftRequest)).toEqual({
+      status: 200,
+      body: { cursor: 2, heads: [left] },
+    });
+    expect(await headTransaction(repository, incarnation, "03".repeat(16), right, [base])).toEqual({
+      status: 200,
+      body: { cursor: 3, heads: [left, right].sort() },
+    });
+
+    expect(await postHeads(repository, leftRequest)).toEqual({
+      status: 200,
+      body: { cursor: 2, heads: [left] },
+    });
+    expect(
+      await headTransaction(repository, incarnation, "02".repeat(16), merged, [left, right]),
+    ).toEqual({
+      status: 409,
+      body: { error: "idempotency key was already used for a different head request" },
+    });
+    expect(await headTransaction(repository, incarnation, "04".repeat(16), merged, [right, left]))
+      .toEqual({ status: 200, body: { cursor: 4, heads: [merged] } });
+    expect(await headTransaction(repository, incarnation, "09".repeat(16), unrelated, [merged]))
+      .toEqual({
+        status: 409,
+        body: { error: `observed current head is not an ancestor of new head: ${merged}` },
+      });
+    expect(await getHeads(repository, incarnation)).toEqual({
+      status: 200,
+      body: { cursor: 4, heads: [merged] },
+    });
+    expect(await getHeads(repository, otherIncarnation)).toEqual({
+      status: 409,
+      body: { error: "repository incarnation does not match" },
+    });
+    expect(
+      await headTransaction(repository, otherIncarnation, "05".repeat(16), left, [merged]),
+    ).toEqual({
+      status: 409,
+      body: { error: "repository incarnation does not match" },
+    });
+  });
+
+  it("rejects an incomplete closure without consuming its idempotency key", async () => {
+    const repository = "head-closure";
+    const stub = env.REPOSITORIES.getByName(repository);
+    await stub.initializeRepository(incarnation);
+    const view = canonicalEmptyView();
+    const viewId = toHex(new Kernel().validate(KIND.view, view).id);
+    const parent = canonicalOperation(fromHex(viewId), "needs view");
+    const parentId = toHex(new Kernel().validate(KIND.operation, parent).id);
+    const child = canonicalOperation(new Uint8Array(64), "needs parent", [fromHex(parentId)]);
+    const childId = await installObject(repository, KIND.operation, child);
+    const request = headRequest(incarnation, "06".repeat(16), childId, []);
+
+    expect(await postHeads(repository, request)).toEqual({
+      status: 409,
+      body: { error: `head closure is missing operation ${parentId}` },
+    });
+    expect(await getHeads(repository, incarnation)).toEqual({
+      status: 200,
+      body: { cursor: 0, heads: [] },
+    });
+
+    expect(await installObject(repository, KIND.operation, parent)).toBe(parentId);
+    expect(await postHeads(repository, request)).toEqual({
+      status: 409,
+      body: { error: `head closure is missing view ${viewId}` },
+    });
+    expect(await installObject(repository, KIND.view, view)).toBe(viewId);
+    expect(await postHeads(repository, request)).toEqual({
+      status: 200,
+      body: { cursor: 1, heads: [childId] },
+    });
+    await evictDurableObject(stub);
+    expect(await getHeads(repository, incarnation)).toEqual({
+      status: 200,
+      body: { cursor: 1, heads: [childId] },
+    });
+  });
+
+  it("validates the bounded canonical head request surface", async () => {
+    const repository = "head-validation";
+    expect(await getHeads("head-uninitialized", incarnation)).toEqual({
+      status: 409,
+      body: { error: "repository is not initialized" },
+    });
+    await env.REPOSITORIES.getByName(repository).initializeRepository(incarnation);
+    const operation = await installOperation(repository, "validation");
+    expect(
+      await postHeads(repository, {
+        ...headRequest(incarnation, "07".repeat(16), operation, []),
+        unexpected: true,
+      }),
+    ).toEqual({
+      status: 400,
+      body: {
+        error: "head request fields must be exactly incarnation, idempotencyKey, newHead, observedHeads",
+      },
+    });
+    expect(
+      await postHeads(repository, headRequest(incarnation, "07".repeat(16), operation, [zeroId, zeroId])),
+    ).toEqual({
+      status: 400,
+      body: { error: "observedHeads must not contain duplicates" },
+    });
+    expect(await postRawHeads(repository, "{")).toEqual({
+      status: 400,
+      body: { error: "head request must be valid JSON" },
+    });
+    expect(
+      await postHeads(
+        repository,
+        headRequest(
+          incarnation,
+          "08".repeat(16),
+          operation,
+          Array.from({ length: MAX_OBSERVED_HEADS + 1 }, (_, index) =>
+            index.toString(16).padStart(128, "0"),
+          ),
+        ),
+      ),
+    ).toEqual({
+      status: 400,
+      body: { error: `observedHeads exceeds the ${MAX_OBSERVED_HEADS}-head limit` },
+    });
+    expect(await postRawHeads(repository, "x".repeat(MAX_HEAD_REQUEST_BYTES + 1))).toEqual({
+      status: 400,
+      body: { error: `head request exceeds ${MAX_HEAD_REQUEST_BYTES} byte limit` },
+    });
+  });
+});
+
 async function putManifest(repository: string, packId: string, bytes: Uint8Array) {
   return exports.default.fetch(
     new Request(`https://example.com/repositories/${repository}/packs/${packId}/manifest`, {
@@ -220,6 +390,70 @@ async function install(repository: string, packId: string) {
       headers: authorization,
     }),
   );
+}
+
+async function installOperation(
+  repository: string,
+  description: string,
+  parents: string[] = [zeroId],
+): Promise<string> {
+  return installObject(
+    repository,
+    KIND.operation,
+    canonicalOperation(new Uint8Array(64), description, parents.map(fromHex)),
+  );
+}
+
+async function installObject(repository: string, kind: number, bytes: Uint8Array): Promise<string> {
+  const fixture = singleObjectPack(kind, bytes);
+  expect((await putManifest(repository, fixture.id, fixture.manifest)).status).toBe(200);
+  expect((await putChunk(repository, fixture.id, 0, bytes)).status).toBe(200);
+  expect((await install(repository, fixture.id)).status).toBe(200);
+  return fixture.objectId;
+}
+
+function headRequest(
+  incarnation: string,
+  idempotencyKey: string,
+  newHead: string,
+  observedHeads: string[],
+) {
+  return { incarnation, idempotencyKey, newHead, observedHeads };
+}
+
+async function headTransaction(
+  repository: string,
+  incarnation: string,
+  idempotencyKey: string,
+  newHead: string,
+  observedHeads: string[],
+) {
+  return postHeads(repository, headRequest(incarnation, idempotencyKey, newHead, observedHeads));
+}
+
+async function postHeads(repository: string, body: unknown) {
+  return postRawHeads(repository, JSON.stringify(body));
+}
+
+async function postRawHeads(repository: string, body: string) {
+  const response = await exports.default.fetch(
+    new Request(`https://example.com/repositories/${repository}/heads`, {
+      method: "POST",
+      headers: { ...authorization, "content-type": "application/json" },
+      body,
+    }),
+  );
+  return { status: response.status, body: await response.json() };
+}
+
+async function getHeads(repository: string, incarnation: string) {
+  const response = await exports.default.fetch(
+    new Request(
+      `https://example.com/repositories/${repository}/heads?incarnation=${incarnation}`,
+      { headers: authorization },
+    ),
+  );
+  return { status: response.status, body: await response.json() };
 }
 
 function helloManifest(): Uint8Array {
@@ -259,7 +493,7 @@ function singleObjectPack(kind: number, objectBytes: Uint8Array) {
   view.setBigUint64(176, BigInt(objectBytes.byteLength), true);
   view.setUint32(192, objectBytes.byteLength, true);
   manifest.set(packHash, 200);
-  return { id: toHex(kernel.hash([manifest])), manifest };
+  return { id: toHex(kernel.hash([manifest])), manifest, objectId: toHex(objectId) };
 }
 
 function rollbackFixture() {
@@ -305,6 +539,27 @@ function treeWithFiles(entries: Array<[string, Uint8Array]>): Uint8Array {
       const entry = concat(field(1, new TextEncoder().encode(name)), field(2, value));
       return field(1, entry);
     }),
+  );
+}
+
+function canonicalEmptyView(): Uint8Array {
+  return new Uint8Array([0x4a, 0x04, 0x1a, 0x02, 0x12, 0x00, 0x60, 0x01]);
+}
+
+function canonicalOperation(
+  viewId: Uint8Array,
+  description: string,
+  parents: Uint8Array[] = [new Uint8Array(64)],
+): Uint8Array {
+  const metadata = concat(
+    field(1, new Uint8Array()),
+    field(2, new Uint8Array()),
+    field(3, new TextEncoder().encode(description)),
+  );
+  return concat(
+    field(1, viewId),
+    ...parents.map((parent) => field(2, parent)),
+    field(3, metadata),
   );
 }
 

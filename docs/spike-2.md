@@ -128,21 +128,61 @@ early-install rejection, retry idempotency, transaction rollback after a later
 object fails validation, cross-pack references and eviction between quarantine
 and installation.
 
+## Cloud operation heads
+
+The repository Durable Object is initialized once with a 128-bit incarnation.
+Initialization is currently a service-binding RPC because the control plane is
+outside this spike. Repeating the same initialization is safe; a different
+incarnation is rejected. Head reads and writes require the matching
+incarnation.
+
+An authenticated head transaction carries one new operation head, the exact
+set of heads observed by the client and a 128-bit idempotency key. The request
+surface and resulting authoritative head set are bounded at 4,096 heads. The
+observed set is sorted before its canonical request hash is computed. In one
+bounded maintenance transaction the Durable Object prunes expired receipts.
+It then uses one SQLite transaction to:
+
+1. checks the incarnation and any existing idempotency receipt;
+2. walks the new operation's complete reference graph and rejects the update
+   if any non-implicit object is absent;
+3. proves that every observed head which is still current is in the new
+   operation's parent ancestry;
+4. removes only those observed heads, adds the new head and advances a
+   monotonic cursor; and
+5. stores the cursor and resulting ordered head set as the exact retry result.
+
+The zero operation, zero view and root commit remain implicit jj objects.
+Failed closure or ancestry checks do not consume the idempotency key, so a
+client can install a missing pack and retry the same logical request. Complete
+object closures are recorded once; later descendants stop at that immutable
+proven frontier instead of rescanning the repository. A successful replay
+within the 7-day receipt window returns its original cursor and head set even
+if later transactions changed the repository. A reused key with different
+canonical input is rejected. Receipt and stored-head quotas bound SQLite use,
+and expired receipts are removed in bounded batches. A retry after expiry can
+at worst restore an ancestral head as explicit divergence: the ancestry rule
+still prevents it from deleting unrelated acknowledged work.
+
+The Workers tests exercise real branch and merge operation ancestry, stale
+concurrent clients, rejection of unrelated-head removal, exact-observation
+removal, ordered convergence, exact retry replay, conflicting key reuse,
+incarnation isolation, transitive closure failures followed by pack
+installation, Durable Object eviction and protocol bounds.
+
 ## Remaining proof
 
 The remaining vertical slices are:
 
-1. Atomically add a new cloud operation head while removing only the exact
-   heads observed by the client, with an incarnation and idempotency key.
-2. Reconcile concurrent cloud heads into each native repository using jj's
+1. Reconcile concurrent cloud heads into each native repository using jj's
    operation machinery.
-3. Run the 2-machine fault matrix at every upload, install, cursor and outbox
+2. Run the 2-machine fault matrix at every upload, install, cursor and outbox
    boundary; retries must be idempotent and acknowledged state must survive.
-4. Delete one fully synchronised machine store and rebuild it exactly from the
+3. Delete one fully synchronised machine store and rebuild it exactly from the
    cloud.
-5. Run the same engine only at command boundaries and prove queued work is
+4. Run the same engine only at command boundaries and prove queued work is
    rediscovered even when the outbox hint is missing.
-6. Measure warm local command latency with the network disabled. It must stay
+5. Measure warm local command latency with the network disabled. It must stay
    within 2 times local jj and make zero cloud requests.
 
 Pack size, chunk count and SQLite versus R2 placement are measured outputs of

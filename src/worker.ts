@@ -1,11 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import {
-  Kernel,
-  equalBytes,
-  exactBuffer,
-  fromHex,
-  toHex,
-} from "./kernel";
+import { HeadStore } from "./head_store";
+import { MAX_HEAD_REQUEST_BYTES } from "./head_protocol";
+import { Kernel, equalBytes, exactBuffer, fromHex, toHex } from "./kernel";
 import {
   MAX_CHUNK_BYTES,
   MAX_MANIFEST_BYTES,
@@ -58,6 +54,7 @@ class PackValidationError extends Error {}
 
 export class Repository extends DurableObject<Env> {
   private kernel = new Kernel();
+  private heads: HeadStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -160,6 +157,7 @@ export class Repository extends DurableObject<Env> {
         PRIMARY KEY (pack_id, position)
       ) WITHOUT ROWID;
     `);
+    this.heads = new HeadStore(this.ctx, this.kernel);
   }
 
   putPackManifest(packId: string, bytes: Uint8Array) {
@@ -323,6 +321,18 @@ export class Repository extends DurableObject<Env> {
     return this.ctx.storage.sql
       .exec<{ count: number }>("SELECT count(*) AS count FROM installed_packs")
       .one().count;
+  }
+
+  initializeRepository(incarnationValue: unknown) {
+    return this.heads.initialize(incarnationValue);
+  }
+
+  getHeads(incarnationValue: unknown) {
+    return this.heads.get(incarnationValue);
+  }
+
+  transactHeads(value: unknown) {
+    return this.heads.transact(value);
   }
 
   private storeManifest(id: ArrayBuffer, bytes: Uint8Array, manifest: PackManifest) {
@@ -642,15 +652,19 @@ export default {
     const packMatch = /^\/repositories\/([^/]+)\/packs\/([^/]+)\/(manifest|install)$/.exec(
       url.pathname,
     );
-    const repository = chunkMatch?.[1] ?? packMatch?.[1];
+    const headMatch = /^\/repositories\/([^/]+)\/heads$/.exec(url.pathname);
+    const repository = chunkMatch?.[1] ?? packMatch?.[1] ?? headMatch?.[1];
     const packId = chunkMatch?.[2] ?? packMatch?.[2];
-    if (repository === undefined || packId === undefined) return errorResponse(404, "not found");
+    if (repository === undefined) return errorResponse(404, "not found");
     if (!REPOSITORY_PATTERN.test(repository)) return errorResponse(400, "invalid repository name");
-    if (!PACK_ID_PATTERN.test(packId)) return errorResponse(400, "invalid pack ID");
+    if (packId !== undefined && !PACK_ID_PATTERN.test(packId)) {
+      return errorResponse(400, "invalid pack ID");
+    }
     const stub = env.REPOSITORIES.getByName(repository);
 
     try {
       if (packMatch?.[3] === "manifest" && request.method === "PUT") {
+        if (packId === undefined) throw new Error("pack route did not capture an ID");
         let bytes: Uint8Array;
         try {
           bytes = await readBoundedBody(request, MAX_MANIFEST_BYTES, "manifest");
@@ -660,6 +674,7 @@ export default {
         return rpcResponse(await stub.putPackManifest(packId, bytes));
       }
       if (chunkMatch !== null && request.method === "PUT") {
+        if (packId === undefined) throw new Error("chunk route did not capture a pack ID");
         if (!/^(0|[1-9][0-9]*)$/.test(chunkMatch[3])) {
           return errorResponse(400, "invalid chunk position");
         }
@@ -674,7 +689,26 @@ export default {
         return rpcResponse(await stub.putPackChunk(packId, position, bytes));
       }
       if (packMatch?.[3] === "install" && request.method === "POST") {
+        if (packId === undefined) throw new Error("pack route did not capture an ID");
         return rpcResponse(await stub.installPack(packId));
+      }
+      if (headMatch !== null && request.method === "GET") {
+        return rpcResponse(await stub.getHeads(url.searchParams.get("incarnation")));
+      }
+      if (headMatch !== null && request.method === "POST") {
+        let bytes: Uint8Array;
+        try {
+          bytes = await readBoundedBody(request, MAX_HEAD_REQUEST_BYTES, "head request");
+        } catch (error) {
+          return errorResponse(400, error instanceof Error ? error.message : "invalid head request");
+        }
+        let body: unknown;
+        try {
+          body = JSON.parse(new TextDecoder().decode(bytes));
+        } catch {
+          return errorResponse(400, "head request must be valid JSON");
+        }
+        return rpcResponse(await stub.transactHeads(body));
       }
       return errorResponse(404, "not found");
     } catch (error) {
@@ -684,8 +718,10 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-function rpcResponse(result: { ok: boolean; error?: string }): Response {
-  if (!result.ok) return errorResponse(400, result.error ?? "pack request failed");
-  const { ok: _, ...body } = result;
+function rpcResponse(result: { ok: boolean; error?: string; status?: number }): Response {
+  if (!result.ok) {
+    return errorResponse(result.status ?? 400, result.error ?? "repository request failed");
+  }
+  const { ok: _, status: __, ...body } = result;
   return Response.json(body);
 }
