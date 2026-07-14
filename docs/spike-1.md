@@ -31,15 +31,17 @@ rejects any non-canonical bytes. Both stores hold only canonical bytes; v3
 moves normalization to the machine because replication is byte-exact, so the
 cloud must never rewrite what a client uploaded.
 
-`kernel-wasm` exposes a small allocation and validation ABI. The release profile
+`kernel-wasm` exposes a small allocation and validation ABI plus an incremental
+raw Blake2b-512 state used for pack and chunk verification. The release profile
 uses `panic = "abort"`. Checked conversion replaces panic-catching at the
 protobuf boundary, so malformed object bytes return an error. The optimized
 module has no imports, and the build rejects modules larger than 200 KiB.
 
-One SQLite-backed `Repository` Durable Object owns each repository name. It runs
-the Wasm validator before inserting immutable object bytes and their references
-in one synchronous transaction. The Worker applies authentication, repository
-name validation and a 1 MiB request-body limit before the RPC call.
+One SQLite-backed `Repository` Durable Object owns each repository name. It
+quarantines bounded pack manifests and chunks, then runs the Wasm validator
+before inserting immutable object bytes and their references in one synchronous
+install transaction. The Worker applies authentication, repository name
+validation and endpoint-specific request bounds before each RPC call.
 
 ## Verification
 
@@ -56,15 +58,10 @@ the same vectors. The malformed-input suite exercises every truncation and
 single-byte mutation of each structured vector without panic-catching.
 
 Workers Vitest also covers canonical rejection, reference extraction,
-idempotent insertion, bounded requests, authentication, exact RPC byte views,
-and SQLite persistence across Durable Object eviction.
+idempotent insertion, bounded requests, authentication, quarantine and install
+retries, and SQLite persistence across Durable Object eviction.
 
-The live spike is deployed as `devspace-v3-spike` at
-`https://devspace-v3-spike.t-ba8.workers.dev`. It requires the `SPIKE_TOKEN`
-secret and has observability enabled.
-
-This surface stores validated individual objects. Repository closure, manifest
-transitions, Git projection and machine ownership remain outside this spike.
-Spike 2 (the convergence proof) replaces the per-object PUT surface with pack
-manifests and head transactions; the kernel and the per-object reference index
-are the parts built to survive it.
+The original per-object HTTP spike surface has been removed. Phase 2 uses pack
+manifests and chunks; the kernel and per-object reference index remain the
+validation boundary beneath that protocol. Head transactions, Git projection
+and machine ownership remain separate work.

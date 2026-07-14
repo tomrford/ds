@@ -13,8 +13,32 @@ pub(crate) fn content_id(value: &impl ContentHash) -> [u8; 64] {
     state.finalize().into()
 }
 
+pub struct RawHasher(Blake2b512);
+
+impl RawHasher {
+    pub fn new() -> Self {
+        Self(Blake2b512::default())
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        Update::update(&mut self.0, bytes);
+    }
+
+    pub fn finalize(self) -> [u8; 64] {
+        self.0.finalize().into()
+    }
+}
+
+impl Default for RawHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub(crate) fn raw_id(bytes: &[u8]) -> [u8; 64] {
-    Blake2b512::digest(bytes).into()
+    let mut hasher = RawHasher::new();
+    hasher.update(bytes);
+    hasher.finalize()
 }
 
 impl ContentHash for bool {

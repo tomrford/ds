@@ -21,9 +21,11 @@ pnpm test
 pnpm build
 ```
 
-The Worker accepts `PUT /repositories/:repository/objects/:kind`, where `kind`
-is `file`, `symlink`, `tree`, `commit`, `view`, or `operation`. The body is
-validated by the Rust/Wasm kernel before the Durable Object stores it.
+The Worker accepts authenticated manifest and chunk uploads under
+`/repositories/:repository/packs/:pack`, followed by an explicit install
+request. Uploads are quarantined until the Durable Object has checked the
+manifest, chunk and whole-pack hashes and revalidated every object through the
+Rust/Wasm kernel in one atomic install transaction.
 
 ## Current boundary
 

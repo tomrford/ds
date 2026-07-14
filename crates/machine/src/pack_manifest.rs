@@ -259,7 +259,9 @@ pub enum PackManifestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_closure::hex;
     use crate::{DEFAULT_CHUNK_BYTES, ObjectKind};
+    use blake2::{Blake2b512, Digest};
 
     fn key(byte: u8) -> ObjectKey {
         ObjectKey {
@@ -332,5 +334,45 @@ mod tests {
                 index: 0
             })
         ));
+    }
+
+    #[test]
+    fn hello_manifest_matches_the_worker_protocol_vector() {
+        let object_id = hex_id(
+            "e4cfa39a3d37be31c59609e807970799caa68a19bfaa15135f165085e01d41a65ba1e1b146aeb6bd0092b49eac214c103ccfa3a365954bbbe52f74a2b3620c94",
+        );
+        let manifest = PackManifest::new(
+            DEFAULT_CHUNK_BYTES,
+            5,
+            object_id,
+            Vec::new(),
+            vec![ObjectEntry {
+                key: ObjectKey {
+                    kind: ObjectKind::File,
+                    id: object_id,
+                },
+                offset: 0,
+                length: 5,
+            }],
+            vec![ChunkEntry {
+                offset: 0,
+                length: 5,
+                hash: object_id,
+            }],
+        )
+        .unwrap();
+        let id: ObjectId = Blake2b512::digest(manifest.encode()).into();
+        assert_eq!(
+            hex(id),
+            "606591ef0c95a0b8ab99b4ccc8cfd34f05e143f82cf4e7ff0766183d21f0fce42456f1d602deaaef70fcaed78de2ca8cee73a055853d7aff1409c7a26b185733"
+        );
+    }
+
+    fn hex_id(value: &str) -> ObjectId {
+        let mut id = [0; 64];
+        for (index, byte) in id.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        id
     }
 }

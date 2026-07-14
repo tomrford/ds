@@ -14,6 +14,7 @@ mod op_store;
 mod proto;
 
 pub use error::ValidationError;
+pub use hash::RawHasher;
 use hash::raw_id;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

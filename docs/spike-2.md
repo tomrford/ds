@@ -92,23 +92,57 @@ prove byte-for-byte determinism, cloud-known filtering, deterministic
 multi-pack boundaries, bounded chunking, source revalidation and
 corrupted-pack rejection.
 
+## Cloud installation
+
+The Worker exposes authenticated manifest and chunk PUTs under a pack ID and a
+separate install POST. The pack ID must match the Blake2b-512 manifest hash.
+The Durable Object decodes the Rust manifest format strictly, including all
+reserved fields, ordering, range and size bounds, before it creates quarantine
+state. Manifest and chunk retries are byte-exact and idempotent.
+
+Quarantine is an implementation detail. SQLite values are split into 1 MiB
+parts below the row limit, but neither the manifest nor any HTTP identifier
+contains a SQLite or R2 location. A later storage move therefore preserves the
+wire protocol and content identities.
+
+Install requires every declared chunk. In one synchronous Durable Object
+transaction it rereads bounded chunk parts, verifies each chunk and the
+whole-pack hash incrementally, reconstructs at most one 1 MiB object at a time,
+and validates every object and ID through the Wasm kernel. Only then does it
+promote the canonical manifest plus head, object and chunk indexes to installed
+state and discard the transient uploaded chunk parts. The object table and
+installed index can reproduce the pack without making its identity depend on
+the current byte-store layout. Any error rolls back the object writes. An
+installed pack is also an idempotency record, so a lost install response is
+safe to retry; later manifest and chunk retries are checked against its retained
+index before they are acknowledged.
+
+Pack installation deliberately does not require every reference to exist yet
+and never advances a head. Deterministic multi-pack splitting can place a
+same-kind parent in a later pack. The head transaction is the correct closure
+gate: it can advance only after the complete referenced graph exists, while
+individual packs remain independently uploadable in any order.
+
+The Workers tests prove a frozen Rust-format vector, corrupt-chunk rejection,
+early-install rejection, retry idempotency, transaction rollback after a later
+object fails validation, cross-pack references and eviction between quarantine
+and installation.
+
 ## Remaining proof
 
 The remaining vertical slices are:
 
-1. Upload the manifest and chunks, then validate and install the pack through
-   the Durable Object without baking SQLite or R2 locations into the protocol.
-2. Atomically add a new cloud operation head while removing only the exact
+1. Atomically add a new cloud operation head while removing only the exact
    heads observed by the client, with an incarnation and idempotency key.
-3. Reconcile concurrent cloud heads into each native repository using jj's
+2. Reconcile concurrent cloud heads into each native repository using jj's
    operation machinery.
-4. Run the 2-machine fault matrix at every upload, install, cursor and outbox
+3. Run the 2-machine fault matrix at every upload, install, cursor and outbox
    boundary; retries must be idempotent and acknowledged state must survive.
-5. Delete one fully synchronised machine store and rebuild it exactly from the
+4. Delete one fully synchronised machine store and rebuild it exactly from the
    cloud.
-6. Run the same engine only at command boundaries and prove queued work is
+5. Run the same engine only at command boundaries and prove queued work is
    rediscovered even when the outbox hint is missing.
-7. Measure warm local command latency with the network disabled. It must stay
+6. Measure warm local command latency with the network disabled. It must stay
    within 2 times local jj and make zero cloud requests.
 
 Pack size, chunk count and SQLite versus R2 placement are measured outputs of

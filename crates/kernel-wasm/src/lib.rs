@@ -1,4 +1,4 @@
-use devspace_kernel::{ObjectKind, validate};
+use devspace_kernel::{ObjectKind, RawHasher, validate};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_alloc(length: u32) -> u32 {
@@ -49,6 +49,54 @@ pub unsafe extern "C" fn kernel_validate(kind: u32, pointer: u32, length: u32) -
     (u64::from(length) << 32) | u64::from(pointer)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_hash_new() -> u32 {
+    Box::into_raw(Box::new(RawHasher::new())) as u32
+}
+
+/// Adds bytes to a raw Blake2b-512 hash state.
+///
+/// # Safety
+///
+/// `state` must identify a live state returned by `kernel_hash_new`. `pointer`
+/// and `length` must identify an initialized buffer returned by `kernel_alloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kernel_hash_update(state: u32, pointer: u32, length: u32) {
+    let bytes = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: The caller contract requires a live, initialized input allocation.
+        unsafe { std::slice::from_raw_parts(pointer as *const u8, length as usize) }
+    };
+    // SAFETY: The caller contract requires a live hash state.
+    unsafe { &mut *(state as *mut RawHasher) }.update(bytes);
+}
+
+/// Finishes and consumes a raw hash state, returning a 64-byte allocation.
+///
+/// # Safety
+///
+/// `state` must identify a live state returned by `kernel_hash_new` and must
+/// not be used again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kernel_hash_finish(state: u32) -> u32 {
+    // SAFETY: The caller transfers ownership of a live hash state.
+    let hasher = unsafe { Box::from_raw(state as *mut RawHasher) };
+    leak(hasher.finalize().to_vec())
+}
+
+/// Drops a raw hash state without finishing it.
+///
+/// # Safety
+///
+/// `state` must identify a live state returned by `kernel_hash_new` and must
+/// not be used again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kernel_hash_drop(state: u32) {
+    // SAFETY: The caller transfers ownership of a live hash state.
+    unsafe { drop(Box::from_raw(state as *mut RawHasher)) };
+}
+
 fn encode(
     result: Result<devspace_kernel::ValidatedObject, devspace_kernel::ValidationError>,
 ) -> Vec<u8> {
@@ -91,5 +139,16 @@ mod tests {
         let response = encode(validate(ObjectKind::File, b"hello"));
         assert_eq!(response[0], 0);
         assert_eq!(&response[65..69], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn streaming_hash_matches_file_validation() {
+        let mut hasher = RawHasher::new();
+        hasher.update(b"hel");
+        hasher.update(b"lo");
+        assert_eq!(
+            hasher.finalize(),
+            validate(ObjectKind::File, b"hello").unwrap().id
+        );
     }
 }
