@@ -54,7 +54,6 @@ enum TreeValue {
     },
     Symlink(Id),
     Tree(Id),
-    GitSubmodule(Vec<u8>),
 }
 
 impl ContentHash for TreeValue {
@@ -77,10 +76,6 @@ impl ContentHash for TreeValue {
             Self::Tree(id) => {
                 2_u32.hash(state);
                 id.hash(state);
-            }
-            Self::GitSubmodule(id) => {
-                3_u32.hash(state);
-                Id(id.clone()).hash(state);
             }
         }
     }
@@ -134,15 +129,6 @@ pub(crate) fn validate_tree(bytes: &[u8]) -> Result<ValidatedObject, ValidationE
                 let id = id("tree", bytes.clone())?;
                 references.push(reference(ObjectKind::Tree, &id));
                 TreeValue::Tree(id)
-            }
-            proto::tree_value::Value::SubmoduleId(bytes) => {
-                if !matches!(bytes.len(), 20 | 32) {
-                    return Err(ValidationError::new(format!(
-                        "Git submodule commit id must be 20 or 32 bytes, got {}",
-                        bytes.len()
-                    )));
-                }
-                TreeValue::GitSubmodule(bytes.clone())
             }
         };
         entries.push((entry.name.clone(), value));
@@ -413,6 +399,21 @@ mod tests {
                 "accepted {name:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_tree_value_extensions_outside_jj_simple_store() {
+        let mut tree_value = vec![0x2a, 20];
+        tree_value.extend([7; 20]);
+
+        let mut entry = vec![0x0a, 6];
+        entry.extend(b"vendor");
+        entry.extend([0x12, tree_value.len() as u8]);
+        entry.extend(tree_value);
+
+        let mut tree = vec![0x0a, entry.len() as u8];
+        tree.extend(entry);
+        assert!(validate_tree(&tree).is_err());
     }
 
     #[test]

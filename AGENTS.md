@@ -22,3 +22,6 @@ Gate: `nix develop -c pnpm check` and `nix develop -c pnpm test`.
 - Golden vectors are canonical bytes with jj ContentHash IDs, emitted at
   jj-lib 0.42.0. The kernel rejects non-canonical encodings rather than
   normalizing; normalization is machine-side work.
+- The accepted schema is exactly jj's simple backend and simple operation-store
+  schema. Do not add Devspace-only fields. Values the simple backend cannot
+  store, including Git submodules, must fail before encoding.

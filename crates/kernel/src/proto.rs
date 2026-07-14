@@ -20,7 +20,7 @@ pub(crate) struct TreeEntry {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub(crate) struct TreeValue {
-    #[prost(oneof = "tree_value::Value", tags = "2, 3, 4, 5")]
+    #[prost(oneof = "tree_value::Value", tags = "2, 3, 4")]
     pub value: Option<tree_value::Value>,
 }
 
@@ -43,8 +43,6 @@ pub(crate) mod tree_value {
         SymlinkId(Vec<u8>),
         #[prost(bytes = "vec", tag = "4")]
         TreeId(Vec<u8>),
-        #[prost(bytes = "vec", tag = "5")]
-        SubmoduleId(Vec<u8>),
     }
 }
 
