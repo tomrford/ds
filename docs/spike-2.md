@@ -170,19 +170,50 @@ removal, ordered convergence, exact retry replay, conflicting key reuse,
 incarnation isolation, transitive closure failures followed by pack
 installation, Durable Object eviction and protocol bounds.
 
+## Native reconciliation
+
+After cloud objects have been installed in a native repository,
+`devspace-machine` validates their complete closure from the supplied operation
+heads before changing jj's stock operation-head store. It then holds the stock
+head-store lock while adding every cloud head without removing any local head.
+The lock is released before the repository reloads through jj's
+`RepoLoader::load_at_head()`.
+
+Structured objects are rechecked through the kernel during closure discovery.
+At this authority boundary, file leaves are additionally hashed while streaming
+and symlink bytes are checked for both their ID and UTF-8 validity. A mid-batch
+head-store write can leave an earlier immutable head durably added because the
+stock file store has no batch API. In that case the method reloads and
+reconciles every successfully visible head before returning an explicit partial
+publication error, so its exposed repository cannot remain behind its durable
+head store.
+
+That reload uses jj's own operation resolver. Ancestor heads are removed without
+creating another operation. Genuine divergent heads are merged through jj's
+operation and view machinery, and the resulting merge operation becomes the
+single stock head. Reapplying an already merged ancestor therefore resolves to
+the existing merge operation rather than producing another one.
+
+The integration tests create 2 stock repositories, make different offline
+operations, install one native closure into the other and prove jj creates a
+merge containing both views. Installing the merged closure back into the first
+repository converges both to the same operation ID and view. A separate test
+copies an operation without its view and proves validation fails before the
+cloud head is published locally. Further tests corrupt file and symlink leaves,
+and inject a failure after the first of 2 cloud-head writes to prove recovery
+keeps the exposed repository aligned with the durable stock head store.
+
 ## Remaining proof
 
 The remaining vertical slices are:
 
-1. Reconcile concurrent cloud heads into each native repository using jj's
-   operation machinery.
-2. Run the 2-machine fault matrix at every upload, install, cursor and outbox
+1. Run the 2-machine fault matrix at every upload, install, cursor and outbox
    boundary; retries must be idempotent and acknowledged state must survive.
-3. Delete one fully synchronised machine store and rebuild it exactly from the
+2. Delete one fully synchronised machine store and rebuild it exactly from the
    cloud.
-4. Run the same engine only at command boundaries and prove queued work is
+3. Run the same engine only at command boundaries and prove queued work is
    rediscovered even when the outbox hint is missing.
-5. Measure warm local command latency with the network disabled. It must stay
+4. Measure warm local command latency with the network disabled. It must stay
    within 2 times local jj and make zero cloud requests.
 
 Pack size, chunk count and SQLite versus R2 placement are measured outputs of

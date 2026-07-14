@@ -47,6 +47,11 @@ local operation heads, stops at the cloud-accepted operation frontier, and
 encodes cloud-missing objects into deterministic, size-bounded, hash-verified
 packs.
 
+When cloud operation objects have been installed locally, the machine validates
+their complete closure before adding them to jj's stock operation-head store.
+Reloading through jj removes ancestor heads and creates jj's own merge operation
+for genuine divergence; Devspace does not implement a parallel view merge.
+
 See [`docs/spike-1.md`](docs/spike-1.md) for the kernel contract and its
 verification surface and [`docs/spike-2.md`](docs/spike-2.md) for the
 convergence proof.
