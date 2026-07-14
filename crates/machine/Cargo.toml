@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+devspace-kernel = { path = "../kernel" }
 jj-lib.workspace = true
 thiserror.workspace = true
 

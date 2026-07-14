@@ -219,6 +219,7 @@ dependencies = [
 name = "devspace-machine"
 version = "0.1.0"
 dependencies = [
+ "devspace-kernel",
  "jj-lib",
  "tempfile",
  "thiserror",

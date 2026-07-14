@@ -1,3 +1,5 @@
+mod object_closure;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,6 +13,11 @@ use jj_lib::simple_backend::SimpleBackend;
 use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
 use jj_lib::simple_op_store::SimpleOpStore;
 use thiserror::Error;
+
+pub use devspace_kernel::ObjectKind;
+pub use object_closure::{
+    MAX_STRUCTURED_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectKey,
+};
 
 /// A native jj repository in a machine store.
 ///

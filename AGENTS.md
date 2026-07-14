@@ -16,9 +16,10 @@ Gate: `nix develop -c pnpm check` and `nix develop -c pnpm test`.
   (cargo registry copy), surface by surface: `content_hash.rs` impls;
   `ContentHash` struct field orders and enum ordinals in `backend.rs`,
   `op_store.rs`, `merge.rs`; `conflict_labels.rs`; conversion and legacy
-  decode branches in `simple_backend.rs` and `simple_op_store.rs`. Mirror
-  what changed, regenerate `crates/kernel/tests/v2_golden.txt` from the new
-  jj version, and run the full gate.
+  decode branches and object path layouts in `simple_backend.rs` and
+  `simple_op_store.rs`. Mirror what changed, regenerate
+  `crates/kernel/tests/v2_golden.txt` from the new jj version, and run the full
+  gate.
 - Golden vectors are canonical bytes with jj ContentHash IDs, emitted at
   jj-lib 0.42.0. The kernel rejects non-canonical encodings rather than
   normalizing; normalization is machine-side work.

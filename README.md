@@ -36,7 +36,8 @@ The native machine crate initializes and reloads stock jj repositories. It
 rejects repositories whose backend, operation store, operation-head store,
 index or submodule-store type differs from the jj 0.42 defaults. Git projection
 and sync state will live beside this native repository, not inside replacement
-jj stores.
+jj stores. The same crate discovers deterministic raw-object closures from all
+local operation heads and stops at the cloud-accepted operation frontier.
 
 See [`docs/spike-1.md`](docs/spike-1.md) for the kernel contract and its
 verification surface and [`docs/spike-2.md`](docs/spike-2.md) for the
