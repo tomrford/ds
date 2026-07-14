@@ -1,4 +1,6 @@
 mod object_closure;
+mod pack;
+mod pack_manifest;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,8 +18,14 @@ use thiserror::Error;
 
 pub use devspace_kernel::ObjectKind;
 pub use object_closure::{
-    MAX_STRUCTURED_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectKey,
+    MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectKey,
 };
+pub use pack::{
+    BuiltPack, BuiltPacks, DEFAULT_CHUNK_BYTES, DEFAULT_PACK_BYTES, DEFAULT_PACK_OBJECTS,
+    MAX_CHUNK_BYTES, MAX_PACK_BYTES, MAX_PACK_OBJECTS, MAX_PACK_OPERATION_HEADS, MIN_CHUNK_BYTES,
+    MIN_PACK_BYTES, PackBuildError, PackMetrics, PackOptions, build_packs,
+};
+pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
 
 /// A native jj repository in a machine store.
 ///

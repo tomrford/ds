@@ -11,6 +11,7 @@ rust-version = "1.97"
 blake2 = "0.10.6"
 jj-lib = { version = "=0.42.0", default-features = false }
 prost = "=0.14.3"
+tempfile = "=3.27.0"
 thiserror = "=2.0.18"
 
 [profile.release]

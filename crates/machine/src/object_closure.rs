@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::MachineRepository;
 
 pub type ObjectId = [u8; 64];
-pub const MAX_STRUCTURED_OBJECT_BYTES: u64 = 1024 * 1024;
+pub const MAX_OBJECT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ObjectKey {
@@ -89,26 +89,26 @@ impl MachineRepository {
                 })?;
 
             if is_structured(key.kind) {
-                if metadata.len() > MAX_STRUCTURED_OBJECT_BYTES {
+                if metadata.len() > MAX_OBJECT_BYTES {
                     return Err(ObjectClosureError::StructuredObjectTooLarge {
                         key,
                         length: metadata.len(),
-                        limit: MAX_STRUCTURED_OBJECT_BYTES,
+                        limit: MAX_OBJECT_BYTES,
                     });
                 }
                 let mut bytes = Vec::with_capacity(metadata.len() as usize);
-                file.take(MAX_STRUCTURED_OBJECT_BYTES + 1)
+                file.take(MAX_OBJECT_BYTES + 1)
                     .read_to_end(&mut bytes)
                     .map_err(|source| ObjectClosureError::ReadObject {
                         key,
                         path: path.clone(),
                         source,
                     })?;
-                if bytes.len() as u64 > MAX_STRUCTURED_OBJECT_BYTES {
+                if bytes.len() as u64 > MAX_OBJECT_BYTES {
                     return Err(ObjectClosureError::StructuredObjectTooLarge {
                         key,
                         length: bytes.len() as u64,
-                        limit: MAX_STRUCTURED_OBJECT_BYTES,
+                        limit: MAX_OBJECT_BYTES,
                     });
                 }
                 let validated = validate(key.kind, &bytes)
@@ -174,7 +174,7 @@ fn object_id(object: &'static str, bytes: &[u8]) -> Result<ObjectId, ObjectClosu
         })
 }
 
-fn hex(id: ObjectId) -> String {
+pub(crate) fn hex(id: ObjectId) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(id.len() * 2);
     for byte in id {

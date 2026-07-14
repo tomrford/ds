@@ -37,7 +37,9 @@ rejects repositories whose backend, operation store, operation-head store,
 index or submodule-store type differs from the jj 0.42 defaults. Git projection
 and sync state will live beside this native repository, not inside replacement
 jj stores. The same crate discovers deterministic raw-object closures from all
-local operation heads and stops at the cloud-accepted operation frontier.
+local operation heads, stops at the cloud-accepted operation frontier, and
+encodes cloud-missing objects into deterministic, size-bounded, hash-verified
+packs.
 
 See [`docs/spike-1.md`](docs/spike-1.md) for the kernel contract and its
 verification surface and [`docs/spike-2.md`](docs/spike-2.md) for the

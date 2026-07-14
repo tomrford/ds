@@ -1,9 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 
-use devspace_machine::{
-    MAX_STRUCTURED_OBJECT_BYTES, MachineRepository, ObjectClosureError, ObjectKind,
-};
+use devspace_machine::{MAX_OBJECT_BYTES, MachineRepository, ObjectClosureError, ObjectKind};
 use jj_lib::backend::{CopyId, TreeValue};
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::merge::Merge;
@@ -273,7 +271,7 @@ async fn rejects_oversized_structured_objects_before_buffering_them() {
         .write(true)
         .open(&operation.path)
         .unwrap()
-        .set_len(MAX_STRUCTURED_OBJECT_BYTES + 1)
+        .set_len(MAX_OBJECT_BYTES + 1)
         .unwrap();
 
     let error = machine_repo
@@ -284,8 +282,8 @@ async fn rejects_oversized_structured_objects_before_buffering_them() {
         error,
         ObjectClosureError::StructuredObjectTooLarge {
             length,
-            limit: MAX_STRUCTURED_OBJECT_BYTES,
+            limit: MAX_OBJECT_BYTES,
             ..
-        } if length == MAX_STRUCTURED_OBJECT_BYTES + 1
+        } if length == MAX_OBJECT_BYTES + 1
     ));
 }

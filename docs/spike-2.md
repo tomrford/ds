@@ -32,11 +32,10 @@ The sync input is derived from the stock operation-head store, not from the
 outbox. Starting from every local operation head, `devspace-machine` walks raw
 canonical files under the simple backend and operation store. Structured
 objects are validated by `devspace-kernel`, which also returns their references.
-File and symlink leaves are retained as a path and length so the pack writer can
-stream them in the next slice. Leaves are not hash-verified at discovery: the
-pack writer must verify each leaf against its ID while streaming and treat the
-recorded length as advisory. Structured objects are rejected above the current
-1 MiB Wasm validation limit before they are read into memory.
+File and symlink leaves are retained as a path and advisory length. The pack
+writer opens each path once and verifies the bytes against the object ID it is
+packing. Structured objects are rejected above the current 1 MiB Wasm
+validation limit before they are read into memory.
 
 The zero operation, zero view and root commit are implicit jj objects with no
 canonical file. An exact cloud-accepted operation head stops traversal of that
@@ -45,25 +44,60 @@ heads; no reconciliation happens during discovery.
 
 Accepted-head pruning cuts only the operation-parent chain. Every unaccepted
 operation's view still reaches the full commit graph, so discovery opens and
-validates the complete reachable object set on every run. Two obligations
-follow: the manifest must deduplicate against objects the cloud already holds,
-or uploads are O(repo) per sync; and discovery cost scales with repository
-size, which bears directly on the warm-latency budget. Both are measured, not
-assumed.
+validates the complete reachable object set on every run. Cloud object
+inventory removes known objects before packing, and pack metrics distinguish
+discovered, skipped and written objects. Discovery cost still scales with
+repository size and bears directly on the warm-latency budget; it must be
+measured rather than assumed.
 
 The integration tests create 2 offline operations from one base, prove both
 closures remain reachable, prove one accepted head does not hide the other,
 exercise the exact commit, tree, file and symlink paths, and prove missing
 leaves and missing, corrupt or oversized structured objects fail closed.
 
+## Pack format
+
+`devspace-machine` turns a closure into an ordered set of immutable packs.
+Objects are ordered by kind and ID, and objects already present in the supplied
+cloud inventory are omitted. No object crosses a pack boundary. The remaining
+canonical bytes are concatenated within each pack and split into fixed size
+chunks without padding.
+
+The provisional budgets are 64 MiB and 65,536 objects per pack, 4,096 operation
+heads per manifest, and 64 KiB to 8 MiB per chunk with a 1 MiB default. These
+bounds keep every pack, manifest allocation and retry scan finite. The 64 MiB
+pack budget is the largest candidate from the v3 plan, not a settled production
+choice; the spike measures pack and manifest sizes before that choice is made.
+
+The binary manifest records the local operation heads, ordered object keys,
+byte ranges, ordered chunk ranges, per-chunk Blake2b-512 hashes, total byte
+length and a whole-pack Blake2b-512 hash. The pack ID is the Blake2b-512 hash
+of the canonical manifest bytes. Counts, integers and reserved fields have one
+fixed encoding. A checked private constructor enforces strictly ordered unique
+heads and objects, contiguous object and chunk ranges, and every format budget
+before bytes can be encoded. The same closure, cloud inventory and options
+therefore produce the same ordered pack set on different machines.
+
+Packing reopens every source object and derives the recorded range from the
+bytes actually read. File leaves are hashed while streaming. Symlinks and all
+structured objects are validated by the kernel from that same open file before
+their bytes are written. Source objects are currently limited to 1 MiB; this
+keeps validation memory bounded until the measured spike establishes final
+limits.
+
+Chunks and the manifest are written into a temporary directory and made
+visible under the pack ID only after all files have been synced. Rebuilding an
+existing pack verifies its manifest and every chunk before reuse. The tests
+prove byte-for-byte determinism, cloud-known filtering, deterministic
+multi-pack boundaries, bounded chunking, source revalidation and
+corrupted-pack rejection.
+
 ## Remaining proof
 
-The next vertical slices are:
+The remaining vertical slices are:
 
-1. Encode the discovered closure as a deterministic manifest plus bounded
-   chunks, deduplicated against objects the cloud already holds, with leaf
-   hashes verified during streaming, then install and validate it through the
-   Durable Object.
+1. Upload the manifest and chunks, then validate and install the pack through
+   the Durable Object without baking SQLite or R2 locations into the protocol.
 2. Atomically add a new cloud operation head while removing only the exact
    heads observed by the client, with an incarnation and idempotency key.
 3. Reconcile concurrent cloud heads into each native repository using jj's
