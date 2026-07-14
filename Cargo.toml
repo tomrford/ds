@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/kernel", "crates/kernel-wasm"]
+members = ["crates/kernel", "crates/kernel-wasm", "crates/machine"]
 resolver = "2"
 
 [workspace.package]
@@ -9,7 +9,9 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 blake2 = "0.10.6"
+jj-lib = { version = "=0.42.0", default-features = false }
 prost = "=0.14.3"
+thiserror = "=2.0.18"
 
 [profile.release]
 codegen-units = 1
