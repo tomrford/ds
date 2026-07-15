@@ -1,3 +1,4 @@
+mod http_transport;
 mod install;
 mod object_closure;
 mod pack;
@@ -25,6 +26,7 @@ use jj_lib::simple_op_store::SimpleOpStore;
 use thiserror::Error;
 
 pub use devspace_kernel::ObjectKind;
+pub use http_transport::HttpTransport;
 pub use install::{InstalledPack, PackInstallError};
 pub use object_closure::{
     MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectId, ObjectKey,
