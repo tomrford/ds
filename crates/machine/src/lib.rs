@@ -4,6 +4,7 @@ mod pack;
 mod pack_manifest;
 #[cfg(test)]
 mod reconciliation_tests;
+mod sync_engine;
 mod sync_state;
 
 use std::collections::BTreeSet;
@@ -34,6 +35,10 @@ pub use pack::{
     MIN_PACK_BYTES, PackBuildError, PackMetrics, PackOptions, build_packs,
 };
 pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
+pub use sync_engine::{
+    CloudHeads, DownloadedPack, HeadTransactionResult, PackCatalogEntry, PackCatalogPage,
+    SyncEngine, SyncEngineError, SyncTransport, TransportError,
+};
 pub use sync_state::{
     MachineSyncLock, MachineSyncStore, PendingHeadTransaction, SyncState, SyncStateError,
 };

@@ -60,6 +60,11 @@ accepted cloud cursor and heads, installed catalog frontier, and the exact
 pending head transaction needed to replay an ambiguous response. These files
 do not replace jj's operation-head store.
 
+The native sync engine uses that sidecar around one transport contract. It
+replays pending head work first, installs new cloud packs, asks stock jj to
+reconcile, uploads the newly discovered local closure, and persists the exact
+head request before sending it.
+
 When cloud operation objects have been installed locally, the machine validates
 their complete closure before adding them to jj's stock operation-head store.
 Reloading through jj removes ancestor heads and creates jj's own merge operation

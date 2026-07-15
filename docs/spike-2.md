@@ -250,25 +250,50 @@ that parent and the new directory. Writes use a synced temporary file, atomic
 rename and directory sync. Removing the outbox, including a retry after an
 ambiguous removal failure, is also followed by a directory sync. The sync engine will
 hold the sidecar's process lock, write the outbox before sending a head
-transaction, persist the accepted result before clearing it, and replay an
-existing outbox before deriving new work. Missing state starts at the zero
+transaction, persist the accepted result before clearing it, and repair and
+replay an existing outbox before deriving new work. Missing state starts at the zero
 frontier; malformed state fails closed.
 
 The tests reopen the sidecar to prove cursor, frontier and exact request
 survival, prove outbox clearing is idempotent, and reject truncated or
 noncanonical files.
 
+## Native sync engine and fault matrix
+
+One generic engine now owns the command or daemon sync pass behind the
+machine-local process lock. It first reuploads the complete closure for an
+existing outbox and replays that exact request, then pages and
+installs cloud packs under one catalog high-water, reads cloud heads, and asks
+stock jj to resolve all local and cloud operation heads. It then discovers the
+remaining local closure, builds and uploads deterministic packs, durably writes
+the exact head request, sends it, persists the returned cursor and heads, and
+only then clears the outbox.
+
+The transport boundary matches the Worker protocol but remains independent of
+HTTP. Its head authority enforces the same observed-head ancestry rule. A
+deterministic fault transport uses one-object packs and one-pack catalog pages,
+and exercises catalog listing, pack download, lost responses after manifest
+upload, chunk upload, pack install and head mutation, plus failure before the
+head mutation. Re-presenting an already accepted request from the outbox proves
+that a crash before outbox clearing replays the receipt without advancing the
+cloud cursor again.
+
+For every boundary, 2 stock repositories create different offline operations.
+The first uploads, the second downloads and merges through jj before uploading
+the merge, and the first downloads it back. Both finish at the same operation
+ID, the cloud has one head and exactly 2 accepted head transactions, and no
+outbox remains. The machines share only the fault transport; they never copy
+objects directly or contact one another.
+
 ## Remaining proof
 
 The remaining vertical slices are:
 
-1. Run the 2-machine fault matrix at every upload, install, cursor and outbox
-   boundary; retries must be idempotent and acknowledged state must survive.
-2. Delete one fully synchronised machine store and rebuild it exactly from the
+1. Delete one fully synchronised machine store and rebuild it exactly from the
    cloud.
-3. Run the same engine only at command boundaries and prove queued work is
+2. Run the same engine only at command boundaries and prove queued work is
    rediscovered even when the outbox hint is missing.
-4. Measure warm local command latency with the network disabled. It must stay
+3. Measure warm local command latency with the network disabled. It must stay
    within 2 times local jj and make zero cloud requests.
 
 Pack size, chunk count and SQLite versus R2 placement are measured outputs of
