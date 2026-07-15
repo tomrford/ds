@@ -4,12 +4,15 @@ use std::time::{Duration, Instant};
 
 use devspace_machine::MachineRepository;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
-use jj_lib::repo::{RepoLoader, StoreFactories};
+use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
+use jj_lib::ref_name::{RefName, RemoteRefSymbol};
+use jj_lib::repo::{Repo as _, RepoLoader, StoreFactories};
 use jj_lib::settings::UserSettings;
 
 const WARMUP_BATCHES: usize = 5;
 const SAMPLE_BATCHES: usize = 21;
 const OPENS_PER_BATCH: usize = 20;
+const FIXTURE_OPERATIONS: usize = 64;
 
 fn settings() -> UserSettings {
     let mut config = StackedConfig::with_defaults();
@@ -64,7 +67,30 @@ async fn warm_local_open_stays_within_twice_stock_jj() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("repo");
     let settings = settings();
-    MachineRepository::init(&path, &settings).await.unwrap();
+    let repository = MachineRepository::init(&path, &settings).await.unwrap();
+    // A warm open reads the head operation and its view, so give the probe a
+    // repository with real operation depth and a view holding many bookmarks
+    // rather than measuring against a freshly-initialized store.
+    let mut repo = repository.repo().clone();
+    for index in 0..FIXTURE_OPERATIONS {
+        let mut transaction = repo.start_transaction();
+        transaction.repo_mut().set_remote_bookmark(
+            RemoteRefSymbol {
+                name: RefName::new(&format!("bookmark-{index:03}")),
+                remote: "origin".as_ref(),
+            },
+            RemoteRef {
+                target: RefTarget::normal(repo.store().root_commit_id().clone()),
+                state: RemoteRefState::New,
+            },
+        );
+        repo = transaction
+            .commit(format!("fixture operation {index}"))
+            .await
+            .unwrap();
+    }
+    drop(repo);
+    drop(repository);
 
     for batch in 0..WARMUP_BATCHES {
         if batch % 2 == 0 {
