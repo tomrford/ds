@@ -65,6 +65,10 @@ replays pending head work first, installs new cloud packs, asks stock jj to
 reconcile, uploads the newly discovered local closure, and persists the exact
 head request before sending it.
 
+Deleting a fully synchronized machine copy and its sync sidecar is recoverable:
+a fresh stock repository downloads the cloud catalog, installs canonical
+objects and resolves to the exact previous operation ID and view.
+
 When cloud operation objects have been installed locally, the machine validates
 their complete closure before adding them to jj's stock operation-head store.
 Reloading through jj removes ancestor heads and creates jj's own merge operation

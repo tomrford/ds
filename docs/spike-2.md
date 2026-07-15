@@ -285,15 +285,23 @@ ID, the cloud has one head and exactly 2 accepted head transactions, and no
 outbox remains. The machines share only the fault transport; they never copy
 objects directly or contact one another.
 
+## Exact cloud rebuild
+
+The rebuild test synchronizes a stock repository, records its operation ID,
+view and complete canonical object-key set, then deletes the entire machine
+copy: native repository, sync sidecar and local packs. A newly initialized
+stock repository starts with no cursor or inventory, downloads every logical
+cloud pack and authoritative head through the same engine, and reconstructs
+the exact operation ID, view and object set. Its rebuilt cursor and catalog
+frontier match the cloud and no outbox remains.
+
 ## Remaining proof
 
 The remaining vertical slices are:
 
-1. Delete one fully synchronised machine store and rebuild it exactly from the
-   cloud.
-2. Run the same engine only at command boundaries and prove queued work is
+1. Run the same engine only at command boundaries and prove queued work is
    rediscovered even when the outbox hint is missing.
-3. Measure warm local command latency with the network disabled. It must stay
+2. Measure warm local command latency with the network disabled. It must stay
    within 2 times local jj and make zero cloud requests.
 
 Pack size, chunk count and SQLite versus R2 placement are measured outputs of

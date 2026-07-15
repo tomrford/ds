@@ -397,3 +397,76 @@ async fn two_offline_machines_converge_across_every_remote_retry_boundary() {
         assert!(right_state.load_outbox().unwrap().is_none());
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_fully_synchronised_machine_rebuilds_exactly_from_cloud_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let machine = temp.path().join("machine");
+    fs::create_dir(&machine).unwrap();
+    let mut repository = offline_machine(&machine.join("repo"), "durable").await;
+    let state_store = MachineSyncStore::open(machine.join("sync")).unwrap();
+    let cloud = Rc::new(RefCell::new(
+        FakeCloud::new(&temp.path().join("cloud-objects")).await,
+    ));
+    let mut transport = FakeTransport::new(cloud.clone(), None);
+    run_until_success(
+        &mut repository,
+        &state_store,
+        &machine.join("packs"),
+        &mut transport,
+    )
+    .await;
+
+    let expected_operation = repository.repo().op_id().clone();
+    let expected_view = repository.repo().view().store_view().clone();
+    let expected_objects = repository
+        .object_closure(&BTreeSet::new())
+        .await
+        .unwrap()
+        .objects
+        .into_iter()
+        .map(|object| object.key)
+        .collect::<BTreeSet<_>>();
+    drop(repository);
+    drop(state_store);
+    fs::remove_dir_all(&machine).unwrap();
+
+    fs::create_dir(&machine).unwrap();
+    let mut rebuilt = MachineRepository::init(machine.join("repo"), &settings())
+        .await
+        .unwrap();
+    let rebuilt_state = MachineSyncStore::open(machine.join("sync")).unwrap();
+    let mut rebuilt_transport = FakeTransport::new(cloud.clone(), None);
+    run_until_success(
+        &mut rebuilt,
+        &rebuilt_state,
+        &machine.join("packs"),
+        &mut rebuilt_transport,
+    )
+    .await;
+
+    assert_eq!(rebuilt.repo().op_id(), &expected_operation);
+    assert_eq!(rebuilt.repo().view().store_view(), &expected_view);
+    assert_eq!(
+        rebuilt
+            .object_closure(&BTreeSet::new())
+            .await
+            .unwrap()
+            .objects
+            .into_iter()
+            .map(|object| object.key)
+            .collect::<BTreeSet<_>>(),
+        expected_objects
+    );
+    let state = rebuilt_state.load_state().unwrap();
+    assert_eq!(state.cloud_cursor, 1);
+    assert_eq!(
+        state.catalog_sequence,
+        cloud.borrow().installed.len() as u64
+    );
+    assert_eq!(
+        state.accepted_heads,
+        BTreeSet::from([expected_operation.as_bytes().try_into().unwrap()])
+    );
+    assert!(rebuilt_state.load_outbox().unwrap().is_none());
+}
