@@ -73,6 +73,10 @@ The same sync engine also runs safely without a daemon. At a later command
 boundary it rediscovers native operations even when no outbox hint was written,
 and it durably replays any exact head request queued by an interrupted boundary.
 
+The warm local repository-open wrapper measures 1.49 to 1.50 times stock jj in
+the release-only probe and cannot issue cloud requests. End-to-end command
+latency remains to be measured once the v3 command runner exists.
+
 When cloud operation objects have been installed locally, the machine validates
 their complete closure before adding them to jj's stock operation-head store.
 Reloading through jj removes ancestor heads and creates jj's own merge operation

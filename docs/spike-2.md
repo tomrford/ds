@@ -306,11 +306,26 @@ and replays that queued request, then a later native transaction is likewise
 discovered and published at the following command boundary. Both accepted
 cursors and heads persist and no outbox remains.
 
+## Warm repository-open latency
+
+The release-only probe compares `MachineRepository::open()` with stock jj's
+`RepoLoader::load_at_head()` on the same warm stock repository. It alternates
+the order of 5 warm-up batches and 21 measured batches, takes the median batch
+time, and amortizes each over 20 opens. Three consecutive runs measured the
+Devspace wrapper at 1.503, 1.497 and 1.491 times stock jj, inside the 2 times
+budget for this shared subpath.
+
+The wrapper validates the 5 stock store-type markers and delegates to jj's
+loader. This code path has no cloud client or `SyncTransport` value, so the
+probe makes zero cloud requests by construction.
+
 ## Remaining proof
 
-The remaining vertical slice measures warm local command latency with the
-network disabled. It must stay within 2 times local jj and make zero cloud
-requests.
+This does not yet close the warm-command acceptance gate. The v3 command runner
+and daemon availability probe do not exist, so there is no end-to-end command
+seam to measure honestly. Once that seam exists, measure a representative warm
+local command against local jj with the network disabled. The complete command
+must remain within 2 times jj and issue zero cloud requests.
 
 Pack size, chunk count and SQLite versus R2 placement are measured outputs of
 this spike. The protocol must not bake in a storage-provider-specific object
