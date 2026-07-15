@@ -4,6 +4,7 @@ mod pack;
 mod pack_manifest;
 #[cfg(test)]
 mod reconciliation_tests;
+mod sync_state;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -33,6 +34,9 @@ pub use pack::{
     MIN_PACK_BYTES, PackBuildError, PackMetrics, PackOptions, build_packs,
 };
 pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
+pub use sync_state::{
+    MachineSyncLock, MachineSyncStore, PendingHeadTransaction, SyncState, SyncStateError,
+};
 
 /// A native jj repository in a machine store.
 ///

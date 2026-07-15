@@ -55,6 +55,11 @@ their canonical objects into the stock simple stores with no-clobber writes.
 Pack installation never publishes an operation head; complete-closure
 validation and native reconciliation remain the authority boundary.
 
+Machine-local sync progress is a separate, locked sidecar. It records the
+accepted cloud cursor and heads, installed catalog frontier, and the exact
+pending head transaction needed to replay an ambiguous response. These files
+do not replace jj's operation-head store.
+
 When cloud operation objects have been installed locally, the machine validates
 their complete closure before adding them to jj's stock operation-head store.
 Reloading through jj removes ancestor heads and creates jj's own merge operation

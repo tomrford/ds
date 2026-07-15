@@ -237,6 +237,27 @@ cloud head is published locally. Further tests corrupt file and symlink leaves,
 and inject a failure after the first of 2 cloud-head writes to prove recovery
 keeps the exposed repository aligned with the durable stock head store.
 
+## Durable machine sync state
+
+`MachineSyncStore` owns a machine-local sidecar, separate from every stock jj
+store. One file records the last accepted cloud cursor and head set plus the
+installed pack-catalog frontier. A second file records the exact pending head
+transaction: its idempotency key, new head and observed heads. Both formats are
+strict, versioned, bounded to 4,096 heads and reject noncanonical ordering.
+
+The sidecar requires an existing machine-store parent; creating it syncs both
+that parent and the new directory. Writes use a synced temporary file, atomic
+rename and directory sync. Removing the outbox, including a retry after an
+ambiguous removal failure, is also followed by a directory sync. The sync engine will
+hold the sidecar's process lock, write the outbox before sending a head
+transaction, persist the accepted result before clearing it, and replay an
+existing outbox before deriving new work. Missing state starts at the zero
+frontier; malformed state fails closed.
+
+The tests reopen the sidecar to prove cursor, frontier and exact request
+survival, prove outbox clearing is idempotent, and reject truncated or
+noncanonical files.
+
 ## Remaining proof
 
 The remaining vertical slices are:
