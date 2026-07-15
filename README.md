@@ -101,3 +101,7 @@ for genuine divergence; Devspace does not implement a parallel view merge.
 See [`docs/kernel.md`](docs/kernel.md) for the validation kernel contract,
 [`docs/sync.md`](docs/sync.md) for synchronization and convergence, and
 [`docs/git-projection.md`](docs/git-projection.md) for Git projection.
+[`docs/hidden.md`](docs/hidden.md), [`docs/git-push.md`](docs/git-push.md)
+and [`docs/git-fetch.md`](docs/git-fetch.md) specify the hidden-file model
+and the Git transport surfaces for the product build-out; probe reports
+backing them are archived under [`docs/archive/`](docs/archive/).

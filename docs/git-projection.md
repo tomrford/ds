@@ -127,8 +127,12 @@ The validation Wasm is 163,051 bytes and remains below its 200 KiB build gate.
 - The live test omits the first callback at the protocol boundary; it does not
   launch and hard-kill a separate CLI process because the command runner
   does not exist.
-- Fetch-side hidden-lineage lifting, remote replacement and production Git
-  credential handling remain open product work outside these invariants.
+- Fetch-side hidden-lineage lifting, remote identity and production Git
+  credential handling are specified in [`git-fetch.md`](git-fetch.md) and
+  [`git-push.md`](git-push.md) but not yet implemented. The per-commit hidden
+  model in [`hidden.md`](hidden.md) supersedes the repository-scoped policy
+  epochs this journal currently implements; the epoch surface is retired by
+  the fetch work.
 - Projection width and depth need observational scaling measurements before
   production limits are set. Exercise at least 1,000, 10,000 and 100,000 tree
   entries, and history depths of 1, 100 and 1,000 commits, recording cold

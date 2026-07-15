@@ -366,7 +366,7 @@ and replays that queued request, then a later native transaction is likewise
 discovered and published at the following command boundary. Both accepted
 cursors and heads persist and no outbox remains.
 
-## Warm repository-open latency
+## Warm latency
 
 The release-only probe compares `MachineRepository::open()` with stock jj's
 `RepoLoader::load_at_head()` on the same warm stock repository, whose fixture
@@ -381,13 +381,23 @@ The wrapper validates the 5 stock store-type markers and delegates to jj's
 loader. This code path has no cloud client or `SyncTransport` value, so the
 probe makes zero cloud requests by construction.
 
-## Open verification
+The complete-command budget of 2 times local jj with zero cloud requests is
+met. A probe measured a representative warm read command — open the
+repository, walk and render 50 commits with ignore-working-copy semantics —
+as an end-to-end process against an equivalent stock jj-lib binary, spawn
+included, on 64-operation and 1,000-operation fixtures. Release builds, 101
+alternating samples per binary: the worst ratio was 1.0135 times stock jj,
+with no Devspace-specific cost growing with repository size. The fixed
+store-marker validation cost disappears into process startup and shared jj
+work. A network-denied run and a call-graph check confirmed zero cloud
+requests. The archived report is
+[`archive/probe-warm-command.md`](archive/probe-warm-command.md).
 
-The warm-command acceptance gate remains open. The command runner
-and daemon availability probe do not exist, so there is no end-to-end command
-seam to measure honestly. Once that seam exists, measure a representative warm
-local command against local jj with the network disabled. The complete command
-must remain within 2 times jj and issue zero cloud requests.
+The command runner must therefore open the bare machine repository directly,
+as the probe did. Wrapping it in a temporary jj workspace, as the stock CLI
+requires, adds an order of magnitude of avoidable work.
+
+## Open verification
 
 Pack size, chunk count and SQLite versus R2 placement still require production
 measurements. The protocol must not bake in a storage-provider-specific object
