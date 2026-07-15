@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_tree_id_matches_v2_format_constant() {
+    fn empty_tree_id_matches_jj_format_constant() {
         let object = validate_tree(&[]).unwrap();
         assert_eq!(
             hex(&object.id),

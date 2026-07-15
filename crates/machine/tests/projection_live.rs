@@ -131,10 +131,10 @@ async fn write_private_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "live projection test; needs DEVSPACE_SPIKE_URL and DEVSPACE_SPIKE_TOKEN"]
+#[ignore = "live projection test; needs DEVSPACE_URL and DEVSPACE_TOKEN"]
 async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
-    let base_url = std::env::var("DEVSPACE_SPIKE_URL").expect("set DEVSPACE_SPIKE_URL");
-    let token = std::env::var("DEVSPACE_SPIKE_TOKEN").expect("set DEVSPACE_SPIKE_TOKEN");
+    let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
+    let token = std::env::var("DEVSPACE_TOKEN").expect("set DEVSPACE_TOKEN");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

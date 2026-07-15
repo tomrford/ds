@@ -1,5 +1,5 @@
 {
-  description = "Devspace v3 validation-kernel spike";
+  description = "Cloudflare-native devspace";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -32,4 +32,3 @@
         };
       });
 }
-

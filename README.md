@@ -1,14 +1,11 @@
-# Devspace v3
+# Devspace
 
-This repository is a clean implementation of the v3 architecture. The
-validation kernel stays independent of `jj-lib`, compiles to small WebAssembly
-and runs inside a Cloudflare Durable Object. The machine store uses jj's stock
-simple backend, operation store and operation-head store. A rebuildable Git
-sidecar projects public history while the Durable Object owns its policy and
-recovery journal.
-
-The v2 checkout is an oracle for wire-format compatibility and fixtures. It is
-not a source dependency.
+Devspace synchronizes stock jj repositories through Cloudflare. Its validation
+kernel stays independent of `jj-lib`, compiles to small WebAssembly and runs
+inside a Cloudflare Durable Object. The machine store uses jj's stock simple
+backend, operation store and operation-head store. A rebuildable Git sidecar
+projects public history while the Durable Object owns its policy and recovery
+journal.
 
 ## Development
 
@@ -68,7 +65,7 @@ replays pending head work first, installs new cloud packs, asks stock jj to
 reconcile, uploads the newly discovered local closure, and persists the exact
 head request before sending it. `HttpTransport` implements that contract over
 the Worker protocol; the ignored `cloud_live` test converges 2 machines
-through a real Worker via `DEVSPACE_SPIKE_URL` and `DEVSPACE_SPIKE_TOKEN`.
+through a real Worker via `DEVSPACE_URL` and `DEVSPACE_TOKEN`.
 
 Deleting a fully synchronized machine copy and its sync sidecar is recoverable:
 a fresh stock repository downloads the cloud catalog, installs canonical
@@ -89,13 +86,13 @@ rebuild an empty sidecar from cloud objects and accepted mappings.
 The warm local repository-open wrapper measures 1.297 to 1.300 times stock jj in
 the release-only probe against a 64-operation fixture repository and cannot
 issue cloud requests. End-to-end command latency remains to be measured once
-the v3 command runner exists.
+the command runner exists.
 
 When cloud operation objects have been installed locally, the machine validates
 their complete closure before adding them to jj's stock operation-head store.
 Reloading through jj removes ancestor heads and creates jj's own merge operation
 for genuine divergence; Devspace does not implement a parallel view merge.
 
-See [`docs/spike-1.md`](docs/spike-1.md) for the kernel contract,
-[`docs/spike-2.md`](docs/spike-2.md) for the convergence proof and
-[`docs/spike-3.md`](docs/spike-3.md) for the Git projection proof.
+See [`docs/kernel.md`](docs/kernel.md) for the validation kernel contract,
+[`docs/sync.md`](docs/sync.md) for synchronization and convergence, and
+[`docs/git-projection.md`](docs/git-projection.md) for Git projection.

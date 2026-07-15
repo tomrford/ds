@@ -1,7 +1,7 @@
 import { env, exports } from "cloudflare:workers";
 import { evictDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import v2Golden from "../crates/kernel/tests/v2_golden.txt?raw";
+import jjGolden from "../crates/kernel/tests/jj_golden.txt?raw";
 import { MAX_HEAD_REQUEST_BYTES, MAX_OBSERVED_HEADS } from "../src/head_protocol";
 import { KIND, Kernel, isKindName, toHex } from "../src/kernel";
 import { MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, decodeManifest } from "../src/pack_protocol";
@@ -17,9 +17,9 @@ const headsPackId =
 const zeroId = "00".repeat(64);
 
 describe("validation kernel", () => {
-  it("matches v2 IDs for every object kind through Wasm", () => {
+  it("matches jj IDs for every object kind through Wasm", () => {
     const kernel = new Kernel();
-    for (const line of v2Golden.trim().split("\n")) {
+    for (const line of jjGolden.trim().split("\n")) {
       const [kind, expectedId, encoded] = line.split("|");
       if (!isKindName(kind)) throw new Error(`unknown golden kind ${kind}`);
       const result = kernel.validate(KIND[kind], decodeRle(encoded));

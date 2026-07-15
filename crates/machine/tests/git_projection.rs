@@ -65,8 +65,8 @@ async fn write_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
     let hidden_path = RepoPathBuf::from_internal_string("secrets/.env").unwrap();
     let visible_path = RepoPathBuf::from_internal_string("visible.txt").unwrap();
     let hidden_values = vec![
-        b"PHASE3_PRIVATE_SENTINEL=first\0\xff".to_vec(),
-        b"PHASE3_PRIVATE_SENTINEL=second\0\xfe".to_vec(),
+        b"DEVSPACE_PRIVATE_SENTINEL=first\0\xff".to_vec(),
+        b"DEVSPACE_PRIVATE_SENTINEL=second\0\xfe".to_vec(),
     ];
     let mut parent = store.root_commit_id().clone();
     for (index, hidden) in hidden_values.iter().enumerate() {

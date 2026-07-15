@@ -50,46 +50,9 @@ class HeadTransactionError extends Error {
 export class HeadStore {
   constructor(
     private readonly ctx: DurableObjectState,
+    private readonly sql: SqlStorage,
     private readonly kernel: Kernel,
-  ) {
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS repository_state (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        incarnation BLOB NOT NULL,
-        cursor INTEGER NOT NULL CHECK (cursor >= 0),
-        receipt_count INTEGER NOT NULL CHECK (receipt_count >= 0),
-        receipt_head_count INTEGER NOT NULL CHECK (receipt_head_count >= 0)
-      );
-      CREATE TABLE IF NOT EXISTS operation_heads (
-        id BLOB PRIMARY KEY
-      ) WITHOUT ROWID;
-      CREATE TABLE IF NOT EXISTS head_transactions (
-        incarnation BLOB NOT NULL,
-        idempotency_key BLOB NOT NULL,
-        request_hash BLOB NOT NULL,
-        cursor INTEGER NOT NULL,
-        created_at_ms INTEGER NOT NULL,
-        PRIMARY KEY (incarnation, idempotency_key)
-      ) WITHOUT ROWID;
-      CREATE INDEX IF NOT EXISTS head_transactions_created_at
-        ON head_transactions (created_at_ms);
-      CREATE TABLE IF NOT EXISTS head_transaction_heads (
-        incarnation BLOB NOT NULL,
-        idempotency_key BLOB NOT NULL,
-        position INTEGER NOT NULL,
-        id BLOB NOT NULL,
-        PRIMARY KEY (incarnation, idempotency_key, position)
-      ) WITHOUT ROWID;
-      CREATE TABLE IF NOT EXISTS pending_observed_heads (
-        id BLOB PRIMARY KEY
-      ) WITHOUT ROWID;
-      CREATE TABLE IF NOT EXISTS complete_object_closures (
-        kind INTEGER NOT NULL,
-        id BLOB NOT NULL,
-        PRIMARY KEY (kind, id)
-      ) WITHOUT ROWID;
-    `);
-  }
+  ) {}
 
   initialize(incarnationValue: unknown) {
     let incarnation: ArrayBuffer;
@@ -102,7 +65,7 @@ export class HeadStore {
       return this.ctx.storage.transactionSync(() => {
         const state = this.repositoryState();
         if (state === undefined) {
-          this.ctx.storage.sql.exec(
+          this.sql.exec(
             "INSERT INTO repository_state VALUES (1, ?, 0, 0, 0)",
             incarnation,
           );
@@ -157,7 +120,7 @@ export class HeadStore {
       return this.ctx.storage.transactionSync(() => {
         const state = this.requireRepositoryState();
         this.requireIncarnation(state, incarnation);
-        const previous = this.ctx.storage.sql
+        const previous = this.sql
           .exec<HeadTransactionRow>(
             `SELECT request_hash, cursor FROM head_transactions
              WHERE incarnation = ? AND idempotency_key = ?`,
@@ -187,9 +150,9 @@ export class HeadStore {
             409,
           );
         }
-        this.ctx.storage.sql.exec("DELETE FROM pending_observed_heads");
+        this.sql.exec("DELETE FROM pending_observed_heads");
         for (const observed of request.observedHeads) {
-          this.ctx.storage.sql.exec(
+          this.sql.exec(
             "INSERT INTO pending_observed_heads VALUES (?)",
             exactBuffer(observed),
           );
@@ -203,13 +166,13 @@ export class HeadStore {
         }
         this.markClosureComplete(newHead);
         for (const observed of request.observedHeads) {
-          this.ctx.storage.sql.exec(
+          this.sql.exec(
             "DELETE FROM operation_heads WHERE id = ?",
             exactBuffer(observed),
           );
         }
-        this.ctx.storage.sql.exec("INSERT OR IGNORE INTO operation_heads VALUES (?)", newHead);
-        const headCount = this.ctx.storage.sql
+        this.sql.exec("INSERT OR IGNORE INTO operation_heads VALUES (?)", newHead);
+        const headCount = this.sql
           .exec<{ count: number }>("SELECT count(*) AS count FROM operation_heads")
           .one().count;
         if (headCount > MAX_OPERATION_HEADS) {
@@ -222,13 +185,13 @@ export class HeadStore {
           throw new Error("repository cursor exceeds the safe integer range");
         }
         const cursor = state.cursor + 1;
-        this.ctx.storage.sql.exec(
+        this.sql.exec(
           "UPDATE repository_state SET cursor = ? WHERE singleton = 1",
           cursor,
         );
         const heads = this.currentHeads();
         this.requireReceiptCapacity(state, heads.length);
-        this.ctx.storage.sql.exec(
+        this.sql.exec(
           "INSERT INTO head_transactions VALUES (?, ?, ?, ?, ?)",
           incarnation,
           idempotencyKey,
@@ -237,7 +200,7 @@ export class HeadStore {
           nowMs,
         );
         for (const [position, head] of heads.entries()) {
-          this.ctx.storage.sql.exec(
+          this.sql.exec(
             "INSERT INTO head_transaction_heads VALUES (?, ?, ?, ?)",
             incarnation,
             idempotencyKey,
@@ -245,14 +208,14 @@ export class HeadStore {
             head,
           );
         }
-        this.ctx.storage.sql.exec(
+        this.sql.exec(
           `UPDATE repository_state
            SET receipt_count = receipt_count + 1,
                receipt_head_count = receipt_head_count + ?
            WHERE singleton = 1`,
           heads.length,
         );
-        this.ctx.storage.sql.exec("DELETE FROM pending_observed_heads");
+        this.sql.exec("DELETE FROM pending_observed_heads");
         return {
           ok: true as const,
           cursor,
@@ -265,7 +228,7 @@ export class HeadStore {
   }
 
   private repositoryState(): RepositoryStateRow | undefined {
-    return this.ctx.storage.sql
+    return this.sql
       .exec<RepositoryStateRow>(
         `SELECT incarnation, cursor, receipt_count, receipt_head_count
          FROM repository_state WHERE singleton = 1`,
@@ -274,7 +237,7 @@ export class HeadStore {
   }
 
   private pruneExpiredReceipts(cutoffMs: number) {
-    const expired = this.ctx.storage.sql
+    const expired = this.sql
       .exec<ReceiptKeyRow>(
         `SELECT incarnation, idempotency_key
          FROM head_transactions
@@ -286,7 +249,7 @@ export class HeadStore {
       .toArray();
     let removedHeads = 0;
     for (const receipt of expired) {
-      removedHeads += this.ctx.storage.sql
+      removedHeads += this.sql
         .exec<{ count: number }>(
           `SELECT count(*) AS count FROM head_transaction_heads
            WHERE incarnation = ? AND idempotency_key = ?`,
@@ -294,13 +257,13 @@ export class HeadStore {
           receipt.idempotency_key,
         )
         .one().count;
-      this.ctx.storage.sql.exec(
+      this.sql.exec(
         `DELETE FROM head_transaction_heads
          WHERE incarnation = ? AND idempotency_key = ?`,
         receipt.incarnation,
         receipt.idempotency_key,
       );
-      this.ctx.storage.sql.exec(
+      this.sql.exec(
         `DELETE FROM head_transactions
          WHERE incarnation = ? AND idempotency_key = ?`,
         receipt.incarnation,
@@ -308,7 +271,7 @@ export class HeadStore {
       );
     }
     if (expired.length !== 0) {
-      this.ctx.storage.sql.exec(
+      this.sql.exec(
         `UPDATE repository_state
          SET receipt_count = receipt_count - ?,
              receipt_head_count = receipt_head_count - ?
@@ -341,7 +304,7 @@ export class HeadStore {
   }
 
   private currentHeads(): ArrayBuffer[] {
-    return this.ctx.storage.sql
+    return this.sql
       .exec<HeadRow>("SELECT id FROM operation_heads ORDER BY id")
       .toArray()
       .map((row) => row.id);
@@ -352,7 +315,7 @@ export class HeadStore {
   }
 
   private transactionHeadHexes(incarnation: ArrayBuffer, idempotencyKey: ArrayBuffer): string[] {
-    return this.ctx.storage.sql
+    return this.sql
       .exec<HeadRow>(
         `SELECT id FROM head_transaction_heads
          WHERE incarnation = ? AND idempotency_key = ? ORDER BY position`,
@@ -364,7 +327,7 @@ export class HeadStore {
   }
 
   private findMissingReachableObject(head: ArrayBuffer): MissingObjectRow | undefined {
-    return this.ctx.storage.sql
+    return this.sql
       .exec<MissingObjectRow>(
         `WITH RECURSIVE reachable(kind, id) AS (
            VALUES (${KIND.operation}, ?)
@@ -395,7 +358,7 @@ export class HeadStore {
   }
 
   private markClosureComplete(head: ArrayBuffer) {
-    this.ctx.storage.sql.exec(
+    this.sql.exec(
       `INSERT OR IGNORE INTO complete_object_closures
        WITH RECURSIVE reachable(kind, id) AS (
          VALUES (${KIND.operation}, ?)
@@ -415,7 +378,7 @@ export class HeadStore {
   }
 
   private findObservedHeadOutsideAncestry(head: ArrayBuffer): HeadRow | undefined {
-    return this.ctx.storage.sql
+    return this.sql
       .exec<HeadRow>(
         `WITH RECURSIVE ancestors(id) AS (
            VALUES (?)

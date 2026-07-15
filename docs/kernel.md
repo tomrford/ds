@@ -1,8 +1,7 @@
 # Validation kernel
 
-Spike 1 of the Cloudflare-native v3 plan: prove that object validation can run
-inside a TypeScript Durable Object through a narrow Rust kernel compiled to
-Wasm. Every bar the plan set for this spike holds:
+Object validation runs inside the TypeScript Durable Object through a narrow
+Rust kernel compiled to Wasm. The kernel has these constraints:
 
 - Narrow dependency graph: the kernel depends on `prost` and `blake2` only —
   no `jj-lib`. It is a maintained mini-fork of jj's simple backend and
@@ -13,9 +12,9 @@ Wasm. Every bar the plan set for this spike holds:
   single-byte mutation of each structured golden vector.
 - Small Wasm binary: the optimized module is ~140 KiB with zero imports; the
   build fails above 200 KiB.
-- v2 ID parity: every golden vector produces the same ID and the same
-  accept/reject outcome in the frozen v2 codec, the native kernel, and the
-  Wasm kernel inside the Durable Object.
+- jj ID parity: every golden vector produces the canonical jj-lib 0.42.0 ID
+  and the same accept/reject outcome in the native kernel and the Wasm kernel
+  inside the Durable Object.
 
 The validation kernel is a no-I/O Rust crate with two dependencies: `prost` for
 the jj-compatible protobuf envelope and `blake2` for object IDs. It does not
@@ -26,9 +25,8 @@ object references needed for closure checks. It covers files, symlinks, trees,
 commits, views and operations. Hidden-path parsing lives in the same no-I/O
 crate; tree traversal and Git projection do not.
 
-Unlike the v2 server, which normalizes legacy encodings on ingest, the kernel
-rejects any non-canonical bytes. Both stores hold only canonical bytes; v3
-moves normalization to the machine because replication is byte-exact, so the
+The kernel rejects non-canonical bytes. Both stores hold only canonical bytes;
+normalization belongs on the machine because replication is byte-exact, so the
 cloud must never rewrite what a client uploaded.
 
 `kernel-wasm` exposes a small allocation and validation ABI plus an incremental
@@ -45,12 +43,12 @@ validation and endpoint-specific request bounds before each RPC call.
 
 ## Verification
 
-`crates/kernel/tests/v2_golden.txt` contains 32 frozen objects and IDs. Most
-come from importing a real repository (mint, ~90 commits) through v2 and
-walking the stored history. The remaining vectors cover jj simple-store edge
-cases that import does not produce: signed commits, conflicted root trees with
-labels, merge commits with predecessors, executable files, symlinks and nested
-trees. Every vector uses the unextended jj-lib 0.42.0 simple backend or simple
+`crates/kernel/tests/jj_golden.txt` contains 32 frozen objects and IDs. Most
+come from walking the stored history of a real repository (mint, about 90
+commits). The remaining vectors cover jj simple-store edge cases that import
+does not produce: signed commits, conflicted root trees with labels, merge
+commits with predecessors, executable files, symlinks and nested trees. Every
+vector uses the unextended jj-lib 0.42.0 simple backend or simple
 operation-store schema.
 
 The Rust suite and Workers Vitest suite validate all six object kinds against
@@ -61,7 +59,6 @@ Workers Vitest also covers canonical rejection, reference extraction,
 idempotent insertion, bounded requests, authentication, quarantine and install
 retries, and SQLite persistence across Durable Object eviction.
 
-The original per-object HTTP spike surface has been removed. Phase 2 uses pack
-manifests and chunks; the kernel and per-object reference index remain the
-validation boundary beneath that protocol. Head transactions, Git projection
-and machine ownership remain separate work.
+The Worker uses pack manifests and chunks. The kernel and per-object reference
+index remain the validation boundary beneath that protocol. Head transactions,
+Git projection and machine ownership sit outside the kernel.

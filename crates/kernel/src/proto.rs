@@ -1,6 +1,6 @@
 //! Mirrors the wire shapes of `jj_lib::protos::simple_store` and
-//! `simple_op_store`, plus the v2 codec's canonical variants that pin
-//! deterministic field and map ordering.
+//! `simple_op_store`, including the canonical variants that pin deterministic
+//! field and map ordering.
 
 use std::collections::HashMap;
 

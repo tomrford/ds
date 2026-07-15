@@ -4,7 +4,7 @@
 //! Mirrors the format as of jj-lib 0.42.0, audited against that source;
 //! every jj format change (new fields, hash inputs, validity rules) must be
 //! mirrored here per the AGENTS.md parity procedure. ID parity is guarded by
-//! `tests/v2_golden.txt`.
+//! `tests/jj_golden.txt`.
 
 mod backend;
 mod error;

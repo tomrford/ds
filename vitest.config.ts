@@ -5,10 +5,9 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       miniflare: {
-        bindings: { SPIKE_TOKEN: "test-token" },
+        bindings: { DEVSPACE_TOKEN: "test-token" },
       },
       wrangler: { configPath: "./wrangler.jsonc" },
     }),
   ],
 });
-

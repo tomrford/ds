@@ -1,8 +1,8 @@
-# Spike 2: convergence proof
+# Synchronization and convergence
 
-Phase 2 proves that stock jj repositories on 2 machines can diverge offline
-and converge through the Cloudflare authority without losing acknowledged
-state. It does not implement Git projection.
+Stock jj repositories on 2 machines can diverge offline and converge through
+the Cloudflare authority without losing acknowledged state. Git projection is
+a separate subsystem described in [`git-projection.md`](git-projection.md).
 
 ## Native repository boundary
 
@@ -18,11 +18,9 @@ index is rebuildable. The presence of jj's submodule store does not make Git
 submodule tree entries encodable by the simple backend; repositories containing
 Git links are unsupported.
 
-Phase 2 has no Git import or projection path, so no Git link can currently
-reach `SimpleBackend::write_tree()`. The future import boundary must inspect
-Git trees and reject a link before asking jj to encode it; the simple backend's
-panic is not an acceptable rejection path. That boundary and its Git-link
-fixture belong to the Phase 3 projection work.
+The Git import boundary inspects trees and rejects a Git link before asking jj
+to encode it; the simple backend's panic is not an acceptable rejection path.
+The projection tests cover this boundary with a Git-link fixture.
 
 Devspace sync metadata, cloud cursors, the durable outbox and the rebuildable
 Git projection belong beside this repository. They do not replace or extend a
@@ -72,8 +70,8 @@ chunks without padding.
 The provisional budgets are 64 MiB and 65,536 objects per pack, 4,096 operation
 heads per manifest, and 64 KiB to 8 MiB per chunk with a 1 MiB default. These
 bounds keep every pack, manifest allocation and retry scan finite. The 64 MiB
-pack budget is the largest candidate from the v3 plan, not a settled production
-choice; the spike measures pack and manifest sizes before that choice is made.
+pack budget is an upper candidate, not a settled production choice. Pack and
+manifest measurements must inform the final limit.
 
 The binary manifest records the local operation heads, ordered object keys,
 byte ranges, ordered chunk ranges, per-chunk Blake2b-512 hashes, total byte
@@ -88,8 +86,7 @@ Packing reopens every source object and derives the recorded range from the
 bytes actually read. File leaves are hashed while streaming. Symlinks and all
 structured objects are validated by the kernel from that same open file before
 their bytes are written. Source objects are currently limited to 1 MiB; this
-keeps validation memory bounded until the measured spike establishes final
-limits.
+keeps validation memory bounded until measurements establish final limits.
 
 Chunks and the manifest are written into a temporary directory and made
 visible under the pack ID only after all files have been synced. Rebuilding an
@@ -266,7 +263,7 @@ noncanonical files.
 
 ## Native sync engine and fault matrix
 
-One generic engine now owns the command or daemon sync pass behind the
+One generic engine owns the command or daemon sync pass behind the
 machine-local process lock. It first reuploads the complete closure for an
 existing outbox and replays that exact request, then pages and
 installs cloud packs under one catalog high-water, reads cloud heads, and asks
@@ -297,7 +294,7 @@ objects directly or contact one another.
 protocol: bearer authentication, incarnation-scoped catalog, manifest and
 chunk routes, and the JSON head transaction. The ignored `cloud_live` test
 runs the two-machine convergence flow against a real Worker — `wrangler dev`
-or a deployment — via `DEVSPACE_SPIKE_URL` and `DEVSPACE_SPIKE_TOKEN`, so
+or a deployment — via `DEVSPACE_URL` and `DEVSPACE_TOKEN`, so
 heads-carrying manifests, pack installation, chunk reconstruction and head
 transactions cross the Rust/TypeScript boundary rather than a test fake. The
 in-repo fault matrix stays on the deterministic fake; the live test is the
@@ -339,16 +336,16 @@ The wrapper validates the 5 stock store-type markers and delegates to jj's
 loader. This code path has no cloud client or `SyncTransport` value, so the
 probe makes zero cloud requests by construction.
 
-## Remaining proof
+## Open verification
 
-This does not yet close the warm-command acceptance gate. The v3 command runner
+The warm-command acceptance gate remains open. The command runner
 and daemon availability probe do not exist, so there is no end-to-end command
 seam to measure honestly. Once that seam exists, measure a representative warm
 local command against local jj with the network disabled. The complete command
 must remain within 2 times jj and issue zero cloud requests.
 
-Pack size, chunk count and SQLite versus R2 placement are measured outputs of
-this spike. The protocol must not bake in a storage-provider-specific object
+Pack size, chunk count and SQLite versus R2 placement still require production
+measurements. The protocol must not bake in a storage-provider-specific object
 location.
 
 ## Deferred concerns

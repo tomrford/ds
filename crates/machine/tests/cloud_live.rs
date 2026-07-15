@@ -3,8 +3,8 @@
 //! Run against `wrangler dev` (or a deployed Worker):
 //!
 //! ```sh
-//! wrangler dev --port 8787 --var SPIKE_TOKEN:dev-token &
-//! DEVSPACE_SPIKE_URL=http://127.0.0.1:8787 DEVSPACE_SPIKE_TOKEN=dev-token \
+//! wrangler dev --port 8787 --var DEVSPACE_TOKEN:dev-token &
+//! DEVSPACE_URL=http://127.0.0.1:8787 DEVSPACE_TOKEN=dev-token \
 //!   cargo test -p devspace-machine --test cloud_live -- --ignored --nocapture
 //! ```
 //!
@@ -59,15 +59,15 @@ async fn offline_machine(path: &std::path::Path, name: &str) -> MachineRepositor
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "live cloud test; needs DEVSPACE_SPIKE_URL and DEVSPACE_SPIKE_TOKEN"]
+#[ignore = "live cloud test; needs DEVSPACE_URL and DEVSPACE_TOKEN"]
 async fn two_machines_converge_through_a_live_worker() {
-    let base_url = std::env::var("DEVSPACE_SPIKE_URL").expect("set DEVSPACE_SPIKE_URL");
-    let token = std::env::var("DEVSPACE_SPIKE_TOKEN").expect("set DEVSPACE_SPIKE_TOKEN");
+    let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
+    let token = std::env::var("DEVSPACE_TOKEN").expect("set DEVSPACE_TOKEN");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let repository_name = format!("spike-live-{nanos:x}-{:x}", std::process::id());
+    let repository_name = format!("sync-live-{nanos:x}-{:x}", std::process::id());
     let incarnation: [u8; 16] = Blake2b512::digest(repository_name.as_bytes())[..16]
         .try_into()
         .unwrap();

@@ -1,4 +1,4 @@
-//! `SyncTransport` over the spike Worker's HTTP protocol.
+//! `SyncTransport` over the devspace Worker's HTTP protocol.
 
 use std::collections::BTreeSet;
 

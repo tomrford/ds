@@ -1,8 +1,8 @@
 use devspace_kernel::{ObjectKind, validate};
 
 #[test]
-fn ids_match_frozen_v2_oracle_vectors() {
-    for (line_number, line) in include_str!("v2_golden.txt").lines().enumerate() {
+fn ids_match_jj_format_golden_vectors() {
+    for (line_number, line) in include_str!("jj_golden.txt").lines().enumerate() {
         let mut fields = line.split('|');
         let kind_name = fields.next().unwrap();
         let expected_id = decode_hex(fields.next().unwrap());
@@ -25,7 +25,7 @@ fn ids_match_frozen_v2_oracle_vectors() {
 
 #[test]
 fn every_structured_golden_mutation_returns_without_panicking() {
-    for line in include_str!("v2_golden.txt").lines() {
+    for line in include_str!("jj_golden.txt").lines() {
         let mut fields = line.split('|');
         let kind = match fields.next().unwrap() {
             "file" | "symlink" => continue,
