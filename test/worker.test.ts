@@ -1,6 +1,6 @@
 import { env, exports } from "cloudflare:workers";
 import { evictDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import jjGolden from "../crates/kernel/tests/jj_golden.txt?raw";
 import { MAX_HEAD_REQUEST_BYTES, MAX_OBSERVED_HEADS } from "../src/head_protocol";
 import { KIND, Kernel, isKindName, toHex } from "../src/kernel";
@@ -10,7 +10,17 @@ import {
 } from "../src/object_protocol";
 import { MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, decodeManifest } from "../src/pack_protocol";
 
-const authorization = { authorization: "Bearer test-token" };
+const defaultMachine = "66".repeat(16);
+const recoveryMachine = "77".repeat(16);
+const repositories = new Map<
+  string,
+  { repositoryId: string; incarnation: string; logicalIncarnation: string }
+>();
+let authorization: Record<string, string>;
+
+beforeAll(async () => {
+  authorization = authorizationFor(defaultMachine);
+});
 const helloId =
   "e4cfa39a3d37be31c59609e807970799caa68a19bfaa15135f165085e01d41a65ba1e1b146aeb6bd0092b49eac214c103ccfa3a365954bbbe52f74a2b3620c94";
 const helloPackId =
@@ -83,7 +93,7 @@ describe("pack installation", () => {
     const installed = await install("pack", helloPackId);
     expect(installed.status).toBe(200);
     expect(await installed.json()).toEqual({ installed: true, insertedObjects: 1 });
-    const stub = env.REPOSITORIES.getByName("pack");
+    const stub = await repositoryStub("pack");
     expect(await stub.countObjects()).toBe(1);
     expect(await stub.countInstalledPacks()).toBe(1);
 
@@ -106,20 +116,21 @@ describe("pack installation", () => {
   });
 
   it("survives eviction between quarantine and install", async () => {
-    const stub = env.REPOSITORIES.getByName("eviction");
-    await stub.putPackManifest(helloPackId, helloManifest());
-    await stub.putPackChunk(helloPackId, 0, hello);
+    const stub = await repositoryStub("eviction");
+    const authority = await repositoryAuthority("eviction");
+    await stub.putPackManifest(authority, helloPackId, helloManifest());
+    await stub.putPackChunk(authority, helloPackId, 0, hello);
     await evictDurableObject(stub);
 
-    const reloaded = env.REPOSITORIES.getByName("eviction");
-    expect(await reloaded.installPack(helloPackId)).toEqual({
+    const reloaded = await repositoryStub("eviction");
+    expect(await reloaded.installPack(authority, helloPackId)).toEqual({
       ok: true,
       installed: true,
       insertedObjects: 1,
     });
     expect(await reloaded.countObjects()).toBe(1);
     await evictDurableObject(reloaded);
-    expect(await env.REPOSITORIES.getByName("eviction").putPackManifest(helloPackId, helloManifest()))
+    expect(await (await repositoryStub("eviction")).putPackManifest(authority, helloPackId, helloManifest()))
       .toEqual({ ok: true, inserted: false, installed: true });
   });
 
@@ -134,7 +145,7 @@ describe("pack installation", () => {
       installed: true,
       insertedObjects: 1,
     });
-    expect(await env.REPOSITORIES.getByName("cross-pack").countObjects()).toBe(1);
+    expect(await (await repositoryStub("cross-pack")).countObjects()).toBe(1);
   });
 
   it("rolls back earlier object inserts when a later object is invalid", async () => {
@@ -144,7 +155,7 @@ describe("pack installation", () => {
     const response = await install("rollback", fixture.id);
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: "object 1 ID does not match manifest" });
-    const stub = env.REPOSITORIES.getByName("rollback");
+    const stub = await repositoryStub("rollback");
     expect(await stub.countObjects()).toBe(0);
     expect(await stub.countInstalledPacks()).toBe(0);
   });
@@ -170,7 +181,7 @@ describe("pack installation", () => {
     const response = await putManifest("bad-manifest", helloPackId, manifest);
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: expect.stringContaining("hashes to") });
-    expect(await env.REPOSITORIES.getByName("bad-manifest").countInstalledPacks()).toBe(0);
+    expect(await (await repositoryStub("bad-manifest")).countInstalledPacks()).toBe(0);
   });
 
   it("enforces authentication, identifiers, routes and body bounds", async () => {
@@ -181,7 +192,14 @@ describe("pack installation", () => {
       }),
     );
     expect(unauthorized.status).toBe(401);
-    expect((await putManifest("UPPER", helloPackId, helloManifest())).status).toBe(400);
+    const invalidName = await exports.default.fetch(
+      new Request("https://example.com/repositories", {
+        method: "POST",
+        headers: { ...authorization, "content-type": "application/json" },
+        body: JSON.stringify({ name: "UPPER", idempotencyKey: "10".repeat(16) }),
+      }),
+    );
+    expect(invalidName.status).toBe(400);
     expect((await putManifest("repo", "bad", helloManifest())).status).toBe(400);
     expect((await putChunk("repo", helloPackId, -1, hello)).status).toBe(400);
     const oldObjectRoute = await exports.default.fetch(
@@ -220,36 +238,19 @@ describe("cloud operation heads", () => {
   const incarnation = "11".repeat(16);
   const otherIncarnation = "22".repeat(16);
 
-  it("initializes a repository over HTTP idempotently", async () => {
-    const incarnation = "ab".repeat(16);
-    const first = await initialize("http-init", incarnation);
-    expect(first).toEqual({ status: 200, body: { initialized: true, cursor: 0, heads: [] } });
-    const replay = await initialize("http-init", incarnation);
-    expect(replay).toEqual({ status: 200, body: { initialized: false, cursor: 0, heads: [] } });
-    const conflict = await initialize("http-init", "cd".repeat(16));
-    expect(conflict.status).toBe(409);
-    expect(conflict.body).toEqual({ error: "repository incarnation does not match" });
-  });
-
   it("preserves unseen concurrent heads and replays the exact idempotent result", async () => {
     const repository = "head-convergence";
-    const stub = env.REPOSITORIES.getByName(repository);
-    expect(await stub.initializeRepository(incarnation)).toEqual({
-      ok: true,
-      initialized: true,
-      cursor: 0,
-      heads: [],
+    expect(await initialize(repository, incarnation)).toEqual({
+      status: 200,
+      body: { initialized: true, cursor: 0, heads: [] },
     });
-    expect(await stub.initializeRepository(incarnation)).toEqual({
-      ok: true,
-      initialized: false,
-      cursor: 0,
-      heads: [],
+    expect(await initialize(repository, incarnation)).toEqual({
+      status: 200,
+      body: { initialized: false, cursor: 0, heads: [] },
     });
-    expect(await stub.initializeRepository(otherIncarnation)).toMatchObject({
-      ok: false,
+    expect(await initialize(repository, otherIncarnation)).toEqual({
       status: 409,
-      error: "repository incarnation does not match",
+      body: { error: "repository incarnation does not match" },
     });
 
     const base = await installOperation(repository, "base");
@@ -307,8 +308,8 @@ describe("cloud operation heads", () => {
 
   it("rejects an incomplete closure without consuming its idempotency key", async () => {
     const repository = "head-closure";
-    const stub = env.REPOSITORIES.getByName(repository);
-    await stub.initializeRepository(incarnation);
+    await initialize(repository, incarnation);
+    const stub = await repositoryStub(repository, incarnation);
     const view = canonicalEmptyView();
     const viewId = toHex(new Kernel().validate(KIND.view, view).id);
     const parent = canonicalOperation(fromHex(viewId), "needs view");
@@ -345,11 +346,17 @@ describe("cloud operation heads", () => {
 
   it("validates the bounded canonical head request surface", async () => {
     const repository = "head-validation";
-    expect(await getHeads("head-uninitialized", incarnation)).toEqual({
-      status: 409,
-      body: { error: "repository is not initialized" },
-    });
-    await env.REPOSITORIES.getByName(repository).initializeRepository(incarnation);
+    const missing = await exports.default.fetch(
+      new Request(`https://example.com/repositories/${"00".repeat(32)}/heads`, {
+        headers: {
+          ...authorization,
+          "x-devspace-incarnation": incarnation,
+        },
+      }),
+    );
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toEqual({ error: "repository not found" });
+    await initialize(repository, incarnation);
     const operation = await installOperation(repository, "validation");
     expect(
       await postHeads(repository, {
@@ -400,7 +407,7 @@ describe("cloud pack download", () => {
 
   it("lists installed packs and reproduces their exact manifest and chunks", async () => {
     const repository = "pack-download";
-    await env.REPOSITORIES.getByName(repository).initializeRepository(incarnation);
+    await initialize(repository, incarnation);
     const manifest = helloManifest();
     expect((await putManifest(repository, helloPackId, manifest)).status).toBe(200);
     expect((await putChunk(repository, helloPackId, 0, hello)).status).toBe(200);
@@ -471,7 +478,7 @@ describe("cloud object inventory", () => {
 
   it("returns the installed subset of a bounded canonical candidate set", async () => {
     const repository = "object-inventory";
-    await env.REPOSITORIES.getByName(repository).initializeRepository(incarnation);
+    await initialize(repository, incarnation);
     expect(await installObject(repository, KIND.file, hello)).toBe(helloId);
     const missingFile = "ff".repeat(64);
     const missingOperation = "01".repeat(64);
@@ -502,8 +509,8 @@ describe("cloud object inventory", () => {
 
   it("rejects noncanonical, oversized and inexact inventory requests", async () => {
     const repository = "object-inventory-validation";
-    const stub = env.REPOSITORIES.getByName(repository);
-    await stub.initializeRepository(incarnation);
+    await initialize(repository, incarnation);
+    const stub = await repositoryStub(repository, incarnation);
     expect(
       await objectInventory(repository, {
         incarnation,
@@ -529,7 +536,7 @@ describe("cloud object inventory", () => {
       body: { error: "objects must be strictly sorted and unique" },
     });
     expect(
-      await stub.inventoryObjects({
+      await stub.inventoryObjects(await repositoryAuthority(repository), {
         incarnation,
         objects: Array.from({ length: MAX_OBJECT_INVENTORY_KEYS + 1 }, (_, index) => ({
           kind: KIND.file,
@@ -559,6 +566,46 @@ describe("Git projection journal", () => {
   const incarnation = "55".repeat(16);
   const firstMachine = "66".repeat(16);
   const recoveryMachine = "77".repeat(16);
+
+  it("binds projection ownership to the authenticated machine", async () => {
+    const repository = "projection-machine-auth";
+    await initializeProjectionRepository(repository, incarnation);
+    const target = await ensureRepository(repository, incarnation);
+    const response = await repositoryRequest(
+      repository,
+      "git/pushes",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          incarnation: target.incarnation,
+          batchId: "79".repeat(16),
+          machineId: recoveryMachine,
+          remote: "origin",
+          policyEpoch: 0,
+          updates: [
+            {
+              bookmark: "main",
+              expectedOldOid: null,
+              states: [
+                {
+                  gitOid: "01".repeat(20),
+                  canonicalCommitId: "01".repeat(64),
+                  publicCommitId: "02".repeat(64),
+                },
+              ],
+              proposedState: 0,
+            },
+          ],
+        }),
+      },
+      firstMachine,
+    );
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: "projection machine does not match authenticated machine",
+    });
+  });
 
   it("recovers an evicted post-push batch under a new fencing token", async () => {
     const repository = "projection-recovery";
@@ -633,7 +680,7 @@ describe("Git projection journal", () => {
       body: { error: "hidden policy cannot change while a push is pending" },
     });
 
-    await evictDurableObject(env.REPOSITORIES.getByName(repository));
+    await evictDurableObject(await repositoryStub(repository, incarnation));
     expect(
       await projectionRequest(repository, `git/pushes/${batchId}/claim`, {
         incarnation,
@@ -1059,13 +1106,82 @@ describe("Git projection journal", () => {
   });
 });
 
-async function putManifest(repository: string, packId: string, bytes: Uint8Array) {
-  return exports.default.fetch(
-    new Request(`https://example.com/repositories/${repository}/packs/${packId}/manifest`, {
-      method: "PUT",
-      headers: authorization,
-      body: bytes,
+function authorizationFor(machineId: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${env.DEVSPACE_SHARED_SECRET}`,
+    "x-devspace-machine-id": machineId,
+  };
+}
+
+async function ensureRepository(name: string, logicalIncarnation = "00".repeat(16)) {
+  const existing = repositories.get(name);
+  if (existing !== undefined) return existing;
+  const response = await exports.default.fetch(
+    new Request("https://example.com/repositories", {
+      method: "POST",
+      headers: { ...authorization, "content-type": "application/json" },
+      body: JSON.stringify({ name, idempotencyKey: randomHex(16) }),
     }),
+  );
+  if (!response.ok) throw new Error(`failed to create test repository ${name}: ${await response.text()}`);
+  const body = (await response.json()) as { repositoryId: string; incarnation: string };
+  const repository = { ...body, logicalIncarnation };
+  repositories.set(name, repository);
+  return repository;
+}
+
+async function repositoryStub(name: string, logicalIncarnation?: string) {
+  const repository = await ensureRepository(name, logicalIncarnation);
+  return env.REPOSITORIES.get(env.REPOSITORIES.idFromString(repository.repositoryId));
+}
+
+async function repositoryAuthority(name: string, machineId = defaultMachine) {
+  const repository = await ensureRepository(name);
+  return {
+    userId: env.DEVSPACE_DEVELOPMENT_USER_ID,
+    machineId,
+    repositoryId: repository.repositoryId,
+    incarnation: repository.incarnation,
+  };
+}
+
+async function repositoryRequest(
+  name: string,
+  path: string,
+  init: RequestInit,
+  machineId = defaultMachine,
+) {
+  const repository = await ensureRepository(name);
+  return exports.default.fetch(
+    new Request(`https://example.com/repositories/${repository.repositoryId}/${path}`, {
+      ...init,
+      headers: {
+        ...authorizationFor(machineId),
+        "x-devspace-incarnation": repository.incarnation,
+        ...init.headers,
+      },
+    }),
+  );
+}
+
+function translatedIncarnation(
+  repository: { incarnation: string; logicalIncarnation: string },
+  value: unknown,
+) {
+  return value === repository.logicalIncarnation ? repository.incarnation : value;
+}
+
+function randomHex(bytes: number): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(bytes)), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+async function putManifest(repository: string, packId: string, bytes: Uint8Array) {
+  return repositoryRequest(
+    repository,
+    `packs/${packId}/manifest`,
+    { method: "PUT", body: bytes },
   );
 }
 
@@ -1138,16 +1254,37 @@ function projectionBatch(
 }
 
 async function projectionRequest(repository: string, path: string, body: unknown) {
-  return projectionRawRequest(repository, path, new TextEncoder().encode(JSON.stringify(body)));
+  const record = body as { incarnation?: unknown; machineId?: unknown };
+  const target = await ensureRepository(
+    repository,
+    typeof record.incarnation === "string" ? record.incarnation : undefined,
+  );
+  const translated = {
+    ...(body as Record<string, unknown>),
+    ...(record.incarnation === undefined
+      ? {}
+      : { incarnation: translatedIncarnation(target, record.incarnation) }),
+  };
+  const machineId = typeof record.machineId === "string" ? record.machineId : defaultMachine;
+  return projectionRawRequest(
+    repository,
+    path,
+    new TextEncoder().encode(JSON.stringify(translated)),
+    machineId,
+  );
 }
 
-async function projectionRawRequest(repository: string, path: string, body: Uint8Array) {
-  const response = await exports.default.fetch(
-    new Request(`https://example.com/repositories/${repository}/${path}`, {
-      method: "POST",
-      headers: { ...authorization, "content-type": "application/json" },
-      body,
-    }),
+async function projectionRawRequest(
+  repository: string,
+  path: string,
+  body: Uint8Array,
+  machineId = defaultMachine,
+) {
+  const response = await repositoryRequest(
+    repository,
+    path,
+    { method: "POST", headers: { "content-type": "application/json" }, body },
+    machineId,
   );
   return { status: response.status, body: await response.json() };
 }
@@ -1159,41 +1296,35 @@ async function getProjection(
   through?: number,
 ) {
   const highWater = through === undefined ? "" : `&through=${through}`;
-  const response = await exports.default.fetch(
-    new Request(
-      `https://example.com/repositories/${repository}/projection?incarnation=${incarnation}&after=${after}${highWater}`,
-      { headers: authorization },
-    ),
+  const target = await ensureRepository(repository, incarnation);
+  const response = await repositoryRequest(
+    repository,
+    `projection?incarnation=${translatedIncarnation(target, incarnation)}&after=${after}${highWater}`,
+    {},
   );
   return { status: response.status, body: await response.json() };
 }
 
 async function getProjectionReplay(repository: string, batchId: string, incarnation: string) {
-  const response = await exports.default.fetch(
-    new Request(
-      `https://example.com/repositories/${repository}/git/pushes/${batchId}/replay?incarnation=${incarnation}`,
-      { headers: authorization },
-    ),
+  const target = await ensureRepository(repository, incarnation);
+  const response = await repositoryRequest(
+    repository,
+    `git/pushes/${batchId}/replay?incarnation=${translatedIncarnation(target, incarnation)}`,
+    {},
   );
   return { status: response.status, body: await response.json() };
 }
 
 async function putChunk(repository: string, packId: string, position: number, bytes: Uint8Array) {
-  return exports.default.fetch(
-    new Request(
-      `https://example.com/repositories/${repository}/packs/${packId}/chunks/${position}`,
-      { method: "PUT", headers: authorization, body: bytes },
-    ),
+  return repositoryRequest(
+    repository,
+    `packs/${packId}/chunks/${position}`,
+    { method: "PUT", body: bytes },
   );
 }
 
 async function install(repository: string, packId: string) {
-  return exports.default.fetch(
-    new Request(`https://example.com/repositories/${repository}/packs/${packId}/install`, {
-      method: "POST",
-      headers: authorization,
-    }),
-  );
+  return repositoryRequest(repository, `packs/${packId}/install`, { method: "POST" });
 }
 
 async function installOperation(
@@ -1237,13 +1368,21 @@ async function headTransaction(
 }
 
 async function initialize(repository: string, incarnation: string) {
-  const response = await exports.default.fetch(
-    new Request(
-      `https://example.com/repositories/${repository}/initialize?incarnation=${incarnation}`,
-      { method: "POST", headers: authorization },
-    ),
-  );
-  return { status: response.status, body: await response.json() };
+  const existing = repositories.get(repository);
+  if (existing !== undefined) {
+    if (existing.logicalIncarnation !== incarnation) {
+      return { status: 409, body: { error: "repository incarnation does not match" } };
+    }
+    const heads = await getHeads(repository, incarnation);
+    return {
+      status: heads.status,
+      body: heads.status === 200
+        ? { initialized: false, ...(heads.body as Record<string, unknown>) }
+        : heads.body,
+    };
+  }
+  await ensureRepository(repository, incarnation);
+  return { status: 200, body: { initialized: true, cursor: 0, heads: [] } };
 }
 
 async function postHeads(repository: string, body: unknown) {
@@ -1251,22 +1390,34 @@ async function postHeads(repository: string, body: unknown) {
 }
 
 async function postRawHeads(repository: string, body: string) {
-  const response = await exports.default.fetch(
-    new Request(`https://example.com/repositories/${repository}/heads`, {
-      method: "POST",
-      headers: { ...authorization, "content-type": "application/json" },
-      body,
-    }),
+  let translated = body;
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const target = await ensureRepository(
+      repository,
+      typeof parsed.incarnation === "string" ? parsed.incarnation : undefined,
+    );
+    if (parsed.incarnation !== undefined) {
+      parsed.incarnation = translatedIncarnation(target, parsed.incarnation);
+      translated = JSON.stringify(parsed);
+    }
+  } catch {
+    await ensureRepository(repository);
+  }
+  const response = await repositoryRequest(
+    repository,
+    "heads",
+    { method: "POST", headers: { "content-type": "application/json" }, body: translated },
   );
   return { status: response.status, body: await response.json() };
 }
 
 async function getHeads(repository: string, incarnation: string) {
-  const response = await exports.default.fetch(
-    new Request(
-      `https://example.com/repositories/${repository}/heads?incarnation=${incarnation}`,
-      { headers: authorization },
-    ),
+  const target = await ensureRepository(repository, incarnation);
+  const response = await repositoryRequest(
+    repository,
+    `heads?incarnation=${translatedIncarnation(target, incarnation)}`,
+    {},
   );
   return { status: response.status, body: await response.json() };
 }
@@ -1276,12 +1427,22 @@ async function objectInventory(repository: string, body: unknown) {
 }
 
 async function objectInventoryRaw(repository: string, body: Uint8Array) {
-  const response = await exports.default.fetch(
-    new Request(`https://example.com/repositories/${repository}/objects/inventory`, {
-      method: "POST",
-      headers: { ...authorization, "content-type": "application/json" },
-      body,
-    }),
+  let bytes = body;
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+    const target = await ensureRepository(
+      repository,
+      typeof parsed.incarnation === "string" ? parsed.incarnation : undefined,
+    );
+    parsed.incarnation = translatedIncarnation(target, parsed.incarnation);
+    bytes = new TextEncoder().encode(JSON.stringify(parsed));
+  } catch {
+    await ensureRepository(repository);
+  }
+  const response = await repositoryRequest(
+    repository,
+    "objects/inventory",
+    { method: "POST", headers: { "content-type": "application/json" }, body: bytes },
   );
   return { status: response.status, body: await response.json() };
 }
@@ -1293,21 +1454,21 @@ async function listPacks(
   through?: number,
 ) {
   const highWater = through === undefined ? "" : `&through=${through}`;
-  const response = await exports.default.fetch(
-    new Request(
-      `https://example.com/repositories/${repository}/packs?incarnation=${incarnation}&after=${after}${highWater}`,
-      { headers: authorization },
-    ),
+  const target = await ensureRepository(repository, incarnation);
+  const response = await repositoryRequest(
+    repository,
+    `packs?incarnation=${translatedIncarnation(target, incarnation)}&after=${after}${highWater}`,
+    {},
   );
   return { status: response.status, body: await response.json() };
 }
 
 async function downloadPackManifest(repository: string, packId: string, incarnation: string) {
-  const response = await exports.default.fetch(
-    new Request(
-      `https://example.com/repositories/${repository}/packs/${packId}/manifest?incarnation=${incarnation}`,
-      { headers: authorization },
-    ),
+  const target = await ensureRepository(repository, incarnation);
+  const response = await repositoryRequest(
+    repository,
+    `packs/${packId}/manifest?incarnation=${translatedIncarnation(target, incarnation)}`,
+    {},
   );
   expect(response.status).toBe(200);
   return new Uint8Array(await response.arrayBuffer());
@@ -1319,11 +1480,11 @@ async function fetchPackChunk(
   position: number,
   incarnation: string,
 ) {
-  return exports.default.fetch(
-    new Request(
-      `https://example.com/repositories/${repository}/packs/${packId}/chunks/${position}?incarnation=${incarnation}`,
-      { headers: authorization },
-    ),
+  const target = await ensureRepository(repository, incarnation);
+  return repositoryRequest(
+    repository,
+    `packs/${packId}/chunks/${position}?incarnation=${translatedIncarnation(target, incarnation)}`,
+    {},
   );
 }
 

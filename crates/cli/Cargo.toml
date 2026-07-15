@@ -1,0 +1,29 @@
+[package]
+name = "devspace-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ds"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+clap.workspace = true
+devspace-machine = { path = "../machine" }
+dunce.workspace = true
+getrandom.workspace = true
+jj-cli.workspace = true
+jj-lib.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { version = "=1.52.3", features = ["rt-multi-thread"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[dev-dependencies]
+tokio = { version = "=1.52.3", features = ["macros"] }

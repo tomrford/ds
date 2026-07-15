@@ -1,4 +1,7 @@
-declare module "cloudflare:workers" {
-  interface ProvidedEnv extends Env {}
-}
+import type { DevelopmentSecretEnv } from "../src/auth";
 
+declare global {
+  namespace Cloudflare {
+    interface Env extends DevelopmentSecretEnv {}
+  }
+}

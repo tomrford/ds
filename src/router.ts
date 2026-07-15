@@ -1,27 +1,40 @@
+import { authenticateDevelopmentRequest, type DevelopmentSecretEnv } from "./auth";
 import { MAX_HEAD_REQUEST_BYTES } from "./head_protocol";
-import {
-  MAX_CHUNK_BYTES,
-  MAX_MANIFEST_BYTES,
-  readBoundedBody,
-} from "./pack_protocol";
-import { MAX_PROJECTION_REQUEST_BYTES } from "./projection_protocol";
 import { MAX_OBJECT_INVENTORY_REQUEST_BYTES } from "./object_protocol";
-import { Env } from "./repository";
+import { MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, readBoundedBody } from "./pack_protocol";
+import { MAX_PROJECTION_REQUEST_BYTES } from "./projection_protocol";
+import type { Repository } from "./repository";
 
-const REPOSITORY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const DIRECTORY_REQUEST_BYTES = 4 * 1024;
+const REPOSITORY_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const PACK_ID_PATTERN = /^[0-9a-f]{128}$/;
+const CONTROL_PLANE_NAME = "directory";
+type WorkerEnv = Env & DevelopmentSecretEnv;
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const authorized =
-      env.DEVSPACE_TOKEN &&
-      (await tokenMatches(
-        request.headers.get("authorization") ?? "",
-        `Bearer ${env.DEVSPACE_TOKEN}`,
-      ));
-    if (!authorized) return errorResponse(401, "unauthorized");
+  async fetch(request: Request, env: WorkerEnv): Promise<Response> {
+    try {
+      return await route(request, env);
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          message: "Worker request failed",
+          path: new URL(request.url).pathname,
+          error: error instanceof Error ? error.name : "UnknownError",
+        }),
+      );
+      return errorResponse(500, "request failed");
+    }
+  },
+} satisfies ExportedHandler<WorkerEnv>;
 
+async function route(request: Request, env: WorkerEnv): Promise<Response> {
+    const authentication = await authenticateDevelopmentRequest(request, env);
+    if (!authentication.ok) return errorResponse(authentication.status, authentication.error);
+    const principal = authentication.principal;
+    const control = env.CONTROL_PLANE.getByName(CONTROL_PLANE_NAME);
     const url = new URL(request.url);
+
     const chunkMatch = /^\/repositories\/([^/]+)\/packs\/([^/]+)\/chunks\/([^/]+)$/.exec(
       url.pathname,
     );
@@ -40,8 +53,7 @@ export default {
     const objectInventoryMatch = /^\/repositories\/([^/]+)\/objects\/inventory$/.exec(
       url.pathname,
     );
-    const initializeMatch = /^\/repositories\/([^/]+)\/initialize$/.exec(url.pathname);
-    const repository =
+    const repositoryId =
       chunkMatch?.[1] ??
       packMatch?.[1] ??
       headMatch?.[1] ??
@@ -50,15 +62,47 @@ export default {
       projectionPushMatch?.[1] ??
       projectionPushActionMatch?.[1] ??
       packCatalogMatch?.[1] ??
-      objectInventoryMatch?.[1] ??
-      initializeMatch?.[1];
+      objectInventoryMatch?.[1];
     const packId = chunkMatch?.[2] ?? packMatch?.[2];
-    if (repository === undefined) return errorResponse(404, "not found");
-    if (!REPOSITORY_PATTERN.test(repository)) return errorResponse(400, "invalid repository name");
+    if (repositoryId === undefined) {
+      const directoryMatch = /^\/repositories\/([^/]+)$/.exec(url.pathname);
+      if (url.pathname === "/repositories" && request.method === "POST") {
+        const body = await readJsonBody(request, DIRECTORY_REQUEST_BYTES, "repository creation request");
+        if (body instanceof Response) return body;
+        return rpcResponse(await control.createRepository(principal, body));
+      }
+      if (directoryMatch !== null) {
+        const name = directoryMatch[1];
+        if (!REPOSITORY_NAME_PATTERN.test(name)) return errorResponse(400, "invalid repository name");
+        if (request.method === "GET") {
+          return rpcResponse(await control.resolveRepository(principal, name));
+        }
+        if (request.method === "DELETE") {
+          const body = await readJsonBody(request, DIRECTORY_REQUEST_BYTES, "repository deletion request");
+          if (body instanceof Response) return body;
+          if (!isRecord(body)) return errorResponse(400, "repository deletion request must be a JSON object");
+          return rpcResponse(await control.deleteRepository(principal, { ...body, name }));
+        }
+      }
+      return errorResponse(404, "not found");
+    }
+    const incarnation = request.headers.get("x-devspace-incarnation");
+    const authorization = await control.authorizeRepository(
+      principal,
+      repositoryId,
+      incarnation,
+    );
+    if (!authorization.ok) return rpcResponse(authorization);
     if (packId !== undefined && !PACK_ID_PATTERN.test(packId)) {
       return errorResponse(400, "invalid pack ID");
     }
-    const stub = env.REPOSITORIES.getByName(repository);
+    const authority = authorization.authority;
+    let stub: DurableObjectStub<Repository>;
+    try {
+      stub = env.REPOSITORIES.get(env.REPOSITORIES.idFromString(repositoryId));
+    } catch {
+      return errorResponse(404, "repository not found");
+    }
 
     try {
       if (packMatch?.[3] === "manifest" && request.method === "PUT") {
@@ -69,16 +113,12 @@ export default {
         } catch (error) {
           return errorResponse(400, error instanceof Error ? error.message : "invalid manifest body");
         }
-        return rpcResponse(await stub.putPackManifest(packId, bytes));
+        return rpcResponse(await stub.putPackManifest(authority, packId, bytes));
       }
       if (objectInventoryMatch !== null && request.method === "POST") {
-        const body = await readJsonBody(
-          request,
-          MAX_OBJECT_INVENTORY_REQUEST_BYTES,
-          "object inventory request",
-        );
+        const body = await readJsonBody(request, MAX_OBJECT_INVENTORY_REQUEST_BYTES, "object inventory request");
         if (body instanceof Response) return body;
-        return rpcResponse(await stub.inventoryObjects(body));
+        return rpcResponse(await stub.inventoryObjects(authority, body));
       }
       if (packCatalogMatch !== null && request.method === "GET") {
         const after = url.searchParams.get("after") ?? "0";
@@ -86,14 +126,12 @@ export default {
           return errorResponse(400, "invalid pack cursor");
         }
         const throughValue = url.searchParams.get("through");
-        if (
-          throughValue !== null &&
-          (!/^(0|[1-9][0-9]*)$/.test(throughValue) || !Number.isSafeInteger(Number(throughValue)))
-        ) {
+        if (throughValue !== null && (!/^(0|[1-9][0-9]*)$/.test(throughValue) || !Number.isSafeInteger(Number(throughValue)))) {
           return errorResponse(400, "invalid pack high-water");
         }
         return rpcResponse(
           await stub.listInstalledPacks(
+            authority,
             url.searchParams.get("incarnation"),
             Number(after),
             throughValue === null ? undefined : Number(throughValue),
@@ -103,71 +141,60 @@ export default {
       if (packMatch?.[3] === "manifest" && request.method === "GET") {
         if (packId === undefined) throw new Error("pack route did not capture an ID");
         return binaryRpcResponse(
-          await stub.getInstalledPackManifest(packId, url.searchParams.get("incarnation")),
-        );
-      }
-      if (chunkMatch !== null && request.method === "PUT") {
-        if (packId === undefined) throw new Error("chunk route did not capture a pack ID");
-        if (!/^(0|[1-9][0-9]*)$/.test(chunkMatch[3])) {
-          return errorResponse(400, "invalid chunk position");
-        }
-        const position = Number(chunkMatch[3]);
-        if (!Number.isSafeInteger(position)) return errorResponse(400, "invalid chunk position");
-        let bytes: Uint8Array;
-        try {
-          bytes = await readBoundedBody(request, MAX_CHUNK_BYTES, "chunk");
-        } catch (error) {
-          return errorResponse(400, error instanceof Error ? error.message : "invalid chunk body");
-        }
-        return rpcResponse(await stub.putPackChunk(packId, position, bytes));
-      }
-      if (chunkMatch !== null && request.method === "GET") {
-        if (packId === undefined) throw new Error("chunk route did not capture a pack ID");
-        if (!/^(0|[1-9][0-9]*)$/.test(chunkMatch[3])) {
-          return errorResponse(400, "invalid chunk position");
-        }
-        const position = Number(chunkMatch[3]);
-        if (!Number.isSafeInteger(position)) return errorResponse(400, "invalid chunk position");
-        return binaryRpcResponse(
-          await stub.getInstalledPackChunk(
+          await stub.getInstalledPackManifest(
+            authority,
             packId,
-            position,
             url.searchParams.get("incarnation"),
           ),
         );
       }
+      if (chunkMatch !== null) {
+        if (packId === undefined) throw new Error("chunk route did not capture a pack ID");
+        if (!/^(0|[1-9][0-9]*)$/.test(chunkMatch[3]) || !Number.isSafeInteger(Number(chunkMatch[3]))) {
+          return errorResponse(400, "invalid chunk position");
+        }
+        const position = Number(chunkMatch[3]);
+        if (request.method === "PUT") {
+          let bytes: Uint8Array;
+          try {
+            bytes = await readBoundedBody(request, MAX_CHUNK_BYTES, "chunk");
+          } catch (error) {
+            return errorResponse(400, error instanceof Error ? error.message : "invalid chunk body");
+          }
+          return rpcResponse(await stub.putPackChunk(authority, packId, position, bytes));
+        }
+        if (request.method === "GET") {
+          return binaryRpcResponse(
+            await stub.getInstalledPackChunk(
+              authority,
+              packId,
+              position,
+              url.searchParams.get("incarnation"),
+            ),
+          );
+        }
+      }
       if (packMatch?.[3] === "install" && request.method === "POST") {
         if (packId === undefined) throw new Error("pack route did not capture an ID");
-        return rpcResponse(await stub.installPack(packId));
-      }
-      if (initializeMatch !== null && request.method === "POST") {
-        return rpcResponse(
-          await stub.initializeRepository(url.searchParams.get("incarnation")),
-        );
+        return rpcResponse(await stub.installPack(authority, packId));
       }
       if (headMatch !== null && request.method === "GET") {
-        return rpcResponse(await stub.getHeads(url.searchParams.get("incarnation")));
+        return rpcResponse(await stub.getHeads(authority, url.searchParams.get("incarnation")));
       }
       if (headMatch !== null && request.method === "POST") {
-        const decoded = await readJsonBody(request, MAX_HEAD_REQUEST_BYTES, "head request");
-        if (decoded instanceof Response) return decoded;
-        const body = decoded;
-        return rpcResponse(await stub.transactHeads(body));
+        const body = await readJsonBody(request, MAX_HEAD_REQUEST_BYTES, "head request");
+        if (body instanceof Response) return body;
+        return rpcResponse(await stub.transactHeads(authority, body));
       }
       if (projectionMatch !== null && request.method === "GET") {
         const after = url.searchParams.get("after") ?? "0";
         const throughValue = url.searchParams.get("through");
-        if (
-          !/^(0|[1-9][0-9]*)$/.test(after) ||
-          !Number.isSafeInteger(Number(after)) ||
-          (throughValue !== null &&
-            (!/^(0|[1-9][0-9]*)$/.test(throughValue) ||
-              !Number.isSafeInteger(Number(throughValue))))
-        ) {
+        if (!/^(0|[1-9][0-9]*)$/.test(after) || !Number.isSafeInteger(Number(after)) || (throughValue !== null && (!/^(0|[1-9][0-9]*)$/.test(throughValue) || !Number.isSafeInteger(Number(throughValue))))) {
           return errorResponse(400, "invalid projection cursor");
         }
         return rpcResponse(
           await stub.getProjection(
+            authority,
             url.searchParams.get("incarnation"),
             Number(after),
             throughValue === null ? undefined : Number(throughValue),
@@ -175,49 +202,35 @@ export default {
         );
       }
       if (hiddenPolicyMatch !== null && request.method === "POST") {
-        const body = await readJsonBody(
-          request,
-          MAX_PROJECTION_REQUEST_BYTES,
-          "hidden policy request",
-        );
+        const body = await readJsonBody(request, MAX_PROJECTION_REQUEST_BYTES, "hidden policy request");
         if (body instanceof Response) return body;
-        return rpcResponse(await stub.mutateHiddenPolicy(body));
+        return rpcResponse(await stub.mutateHiddenPolicy(authority, body));
       }
       if (projectionPushMatch !== null && request.method === "POST") {
-        const body = await readJsonBody(
-          request,
-          MAX_PROJECTION_REQUEST_BYTES,
-          "projection push request",
-        );
+        const body = await readJsonBody(request, MAX_PROJECTION_REQUEST_BYTES, "projection push request");
         if (body instanceof Response) return body;
-        return rpcResponse(await stub.beginProjectionPush(body));
+        return rpcResponse(await stub.beginProjectionPush(authority, body));
       }
-      if (
-        projectionPushActionMatch?.[3] === "replay" &&
-        request.method === "GET"
-      ) {
+      if (projectionPushActionMatch?.[3] === "replay" && request.method === "GET") {
         return rpcResponse(
           await stub.getProjectionPushReplay(
+            authority,
             projectionPushActionMatch[2],
             url.searchParams.get("incarnation"),
           ),
         );
       }
       if (projectionPushActionMatch !== null && request.method === "POST") {
-        const body = await readJsonBody(
-          request,
-          MAX_PROJECTION_REQUEST_BYTES,
-          "projection push request",
-        );
+        const body = await readJsonBody(request, MAX_PROJECTION_REQUEST_BYTES, "projection push request");
         if (body instanceof Response) return body;
         const batchId = projectionPushActionMatch[2];
         switch (projectionPushActionMatch[3]) {
           case "claim":
-            return rpcResponse(await stub.claimProjectionPush(batchId, body));
+            return rpcResponse(await stub.claimProjectionPush(authority, batchId, body));
           case "confirm":
-            return rpcResponse(await stub.confirmProjectionPush(batchId, body));
+            return rpcResponse(await stub.confirmProjectionPush(authority, batchId, body));
           case "recover":
-            return rpcResponse(await stub.recoverProjectionPush(batchId, body));
+            return rpcResponse(await stub.recoverProjectionPush(authority, batchId, body));
         }
       }
       return errorResponse(404, "not found");
@@ -225,35 +238,19 @@ export default {
       console.error("repository Durable Object failed", error);
       return errorResponse(500, "repository storage failed");
     }
-  },
-} satisfies ExportedHandler<Env>;
+}
 
 function errorResponse(status: number, message: string): Response {
   return Response.json({ error: message }, { status });
 }
 
-async function tokenMatches(provided: string, expected: string): Promise<boolean> {
-  const encoder = new TextEncoder();
-  const [providedHash, expectedHash] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(provided)),
-    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
-  ]);
-  return crypto.subtle.timingSafeEqual(providedHash, expectedHash);
-}
-
 function rpcResponse(result: { ok: boolean; error?: string; status?: number }): Response {
-  if (!result.ok) {
-    return errorResponse(result.status ?? 400, result.error ?? "repository request failed");
-  }
+  if (!result.ok) return errorResponse(result.status ?? 400, result.error ?? "request failed");
   const { ok: _, status: __, ...body } = result;
   return Response.json(body);
 }
 
-async function readJsonBody(
-  request: Request,
-  limit: number,
-  label: string,
-): Promise<unknown | Response> {
+async function readJsonBody(request: Request, limit: number, label: string): Promise<unknown | Response> {
   let bytes: Uint8Array;
   try {
     bytes = await readBoundedBody(request, limit, label);
@@ -261,23 +258,18 @@ async function readJsonBody(
     return errorResponse(400, error instanceof Error ? error.message : `invalid ${label}`);
   }
   try {
-    return JSON.parse(
-      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
-    );
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
   } catch {
     return errorResponse(400, `${label} must be valid JSON`);
   }
 }
 
-function binaryRpcResponse(result: {
-  ok: boolean;
-  error?: string;
-  status?: number;
-  bytes?: ArrayBuffer;
-}): Response {
-  if (!result.ok) {
-    return errorResponse(result.status ?? 400, result.error ?? "repository request failed");
-  }
+function binaryRpcResponse(result: { ok: boolean; error?: string; status?: number; bytes?: ArrayBuffer }): Response {
+  if (!result.ok) return errorResponse(result.status ?? 400, result.error ?? "repository request failed");
   if (result.bytes === undefined) throw new Error("binary repository response is missing bytes");
   return new Response(result.bytes, { headers: { "content-type": "application/octet-stream" } });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

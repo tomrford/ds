@@ -1,13 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
+import { RepositoryAuthority } from "./control_plane";
 import { HeadStore } from "./head_store";
-import { Kernel } from "./kernel";
+import { Kernel, equalBytes, exactBuffer } from "./kernel";
 import { PackStore } from "./pack_store";
 import { ProjectionStore } from "./projection_store";
 import { initializeSchema } from "./schema";
 
-export interface Env {
-  REPOSITORIES: DurableObjectNamespace<Repository>;
-  DEVSPACE_TOKEN: string;
+interface AuthorityRow extends Record<string, SqlStorageValue> {
+  incarnation: ArrayBuffer;
+  user_id: string | null;
+  repository_id: string | null;
+  retired: number;
 }
 
 export class Repository extends DurableObject<Env> {
@@ -18,23 +21,25 @@ export class Repository extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const sql = this.ctx.storage.sql;
-    initializeSchema(sql);
+    this.ctx.blockConcurrencyWhile(async () =>
+      this.ctx.storage.transactionSync(() => initializeSchema(sql)),
+    );
     const kernel = new Kernel();
     this.heads = new HeadStore(this.ctx, sql, kernel);
     this.packs = new PackStore(this.ctx, sql, kernel, this.heads);
     this.projection = new ProjectionStore(this.ctx, sql, kernel);
   }
 
-  putPackManifest(packId: string, bytes: Uint8Array) {
-    return this.packs.putPackManifest(packId, bytes);
+  putPackManifest(authority: RepositoryAuthority, packId: string, bytes: Uint8Array) {
+    return this.withAuthority(authority, () => this.packs.putPackManifest(packId, bytes));
   }
 
-  putPackChunk(packId: string, position: number, bytes: Uint8Array) {
-    return this.packs.putPackChunk(packId, position, bytes);
+  putPackChunk(authority: RepositoryAuthority, packId: string, position: number, bytes: Uint8Array) {
+    return this.withAuthority(authority, () => this.packs.putPackChunk(packId, position, bytes));
   }
 
-  installPack(packId: string) {
-    return this.packs.installPack(packId);
+  installPack(authority: RepositoryAuthority, packId: string) {
+    return this.withAuthority(authority, () => this.packs.installPack(packId));
   }
 
   countObjects() {
@@ -45,59 +50,155 @@ export class Repository extends DurableObject<Env> {
     return this.packs.countInstalledPacks();
   }
 
-  inventoryObjects(value: unknown) {
-    return this.packs.inventoryObjects(value);
+  inventoryObjects(authority: RepositoryAuthority, value: unknown) {
+    return this.withAuthority(authority, () => this.packs.inventoryObjects(value));
   }
 
-  initializeRepository(incarnationValue: unknown) {
-    return this.heads.initialize(incarnationValue);
+  initializeRepository(authority: RepositoryAuthority) {
+    return this.heads.initialize(authority);
   }
 
-  getHeads(incarnationValue: unknown) {
-    return this.heads.get(incarnationValue);
+  retireRepository(authority: RepositoryAuthority) {
+    try {
+      return this.ctx.storage.transactionSync(() => {
+        const state = this.ctx.storage.sql
+          .exec<AuthorityRow>(
+            `SELECT incarnation, user_id, repository_id, retired
+             FROM repository_state WHERE singleton = 1`,
+          )
+          .toArray()[0];
+        if (state === undefined) {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO repository_state
+             (singleton, incarnation, user_id, repository_id, retired, cursor,
+              receipt_count, receipt_head_count)
+             VALUES (1, ?, ?, ?, 1, 0, 0, 0)`,
+            exactBuffer(hexBytes(authority.incarnation)),
+            authority.userId,
+            authority.repositoryId,
+          );
+          return { ok: true as const, retired: true };
+        }
+        this.requireAuthority(authority, true);
+        if (state.retired === 0) {
+          const changed = this.ctx.storage.sql
+            .exec<{ singleton: number }>(
+              `UPDATE repository_state SET retired = 1
+               WHERE singleton = 1 AND retired = 0 RETURNING singleton`,
+            )
+            .toArray();
+          if (changed.length !== 1) {
+            throw new Error("repository retirement did not change exactly one active state row");
+          }
+        }
+        return { ok: true as const, retired: true };
+      });
+    } catch (error) {
+      return authorityFailure(error);
+    }
   }
 
-  transactHeads(value: unknown) {
-    return this.heads.transact(value);
+  getHeads(authority: RepositoryAuthority, incarnationValue: unknown) {
+    return this.withAuthority(authority, () => this.heads.get(incarnationValue));
   }
 
-  listInstalledPacks(incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
-    return this.packs.listInstalledPacks(incarnationValue, afterValue, throughValue);
+  transactHeads(authority: RepositoryAuthority, value: unknown) {
+    return this.withAuthority(authority, () => this.heads.transact(value));
   }
 
-  getInstalledPackManifest(packId: string, incarnationValue: unknown) {
-    return this.packs.getInstalledPackManifest(packId, incarnationValue);
+  listInstalledPacks(authority: RepositoryAuthority, incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
+    return this.withAuthority(authority, () =>
+      this.packs.listInstalledPacks(incarnationValue, afterValue, throughValue),
+    );
   }
 
-  getInstalledPackChunk(packId: string, position: number, incarnationValue: unknown) {
-    return this.packs.getInstalledPackChunk(packId, position, incarnationValue);
+  getInstalledPackManifest(authority: RepositoryAuthority, packId: string, incarnationValue: unknown) {
+    return this.withAuthority(authority, () =>
+      this.packs.getInstalledPackManifest(packId, incarnationValue),
+    );
   }
 
-  getProjection(incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
-    return this.projection.get(incarnationValue, afterValue, throughValue);
+  getInstalledPackChunk(authority: RepositoryAuthority, packId: string, position: number, incarnationValue: unknown) {
+    return this.withAuthority(authority, () =>
+      this.packs.getInstalledPackChunk(packId, position, incarnationValue),
+    );
   }
 
-  mutateHiddenPolicy(value: unknown) {
-    return this.projection.mutatePolicy(value);
+  getProjection(authority: RepositoryAuthority, incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
+    return this.withAuthority(authority, () =>
+      this.projection.get(incarnationValue, afterValue, throughValue),
+    );
   }
 
-  beginProjectionPush(value: unknown) {
-    return this.projection.begin(value);
+  mutateHiddenPolicy(authority: RepositoryAuthority, value: unknown) {
+    return this.withAuthority(authority, () => this.projection.mutatePolicy(value));
   }
 
-  claimProjectionPush(batchId: unknown, value: unknown) {
-    return this.projection.claim(batchId, value);
+  beginProjectionPush(authority: RepositoryAuthority, value: unknown) {
+    return this.withAuthority(authority, () => this.projection.begin(value, authority.machineId));
   }
 
-  getProjectionPushReplay(batchId: unknown, incarnationValue: unknown) {
-    return this.projection.replay(batchId, incarnationValue);
+  claimProjectionPush(authority: RepositoryAuthority, batchId: unknown, value: unknown) {
+    return this.withAuthority(authority, () =>
+      this.projection.claim(batchId, value, authority.machineId),
+    );
   }
 
-  confirmProjectionPush(batchId: unknown, value: unknown) {
-    return this.projection.confirm(batchId, value);
+  getProjectionPushReplay(authority: RepositoryAuthority, batchId: unknown, incarnationValue: unknown) {
+    return this.withAuthority(authority, () => this.projection.replay(batchId, incarnationValue));
   }
 
-  recoverProjectionPush(batchId: unknown, value: unknown) {
-    return this.projection.recover(batchId, value);
+  confirmProjectionPush(authority: RepositoryAuthority, batchId: unknown, value: unknown) {
+    return this.withAuthority(authority, () =>
+      this.projection.confirm(batchId, value, authority.machineId),
+    );
   }
+
+  recoverProjectionPush(authority: RepositoryAuthority, batchId: unknown, value: unknown) {
+    return this.withAuthority(authority, () =>
+      this.projection.recover(batchId, value, authority.machineId),
+    );
+  }
+
+  private withAuthority<T>(authority: RepositoryAuthority, operation: () => T) {
+    try {
+      this.requireAuthority(authority, false);
+    } catch (error) {
+      return authorityFailure(error);
+    }
+    return operation();
+  }
+
+  private requireAuthority(authority: RepositoryAuthority, allowRetired: boolean) {
+    const state = this.ctx.storage.sql
+      .exec<AuthorityRow>(
+        `SELECT incarnation, user_id, repository_id, retired
+         FROM repository_state WHERE singleton = 1`,
+      )
+      .toArray()[0];
+    if (
+      state === undefined ||
+      state.user_id !== authority.userId ||
+      state.repository_id !== authority.repositoryId ||
+      !equalBytes(new Uint8Array(state.incarnation), hexBytes(authority.incarnation)) ||
+      (!allowRetired && state.retired !== 0)
+    ) {
+      throw new Error("repository authority is stale");
+    }
+  }
+}
+
+function authorityFailure(error: unknown) {
+  return {
+    ok: false as const,
+    status: 409,
+    error: error instanceof Error ? error.message : "repository authority is stale",
+  };
+}
+
+function hexBytes(value: string): Uint8Array {
+  if (!/^[0-9a-f]{32}$/.test(value)) throw new Error("repository authority is invalid");
+  return Uint8Array.from({ length: 16 }, (_, index) =>
+    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
+  );
 }

@@ -6,6 +6,7 @@ import {
   decodeIncarnation,
 } from "./head_protocol";
 import { KIND, KIND_BY_NUMBER, Kernel, equalBytes, exactBuffer, toHex } from "./kernel";
+import { RepositoryAuthority } from "./control_plane";
 
 interface RepositoryStateRow extends Record<string, SqlStorageValue> {
   incarnation: ArrayBuffer;
@@ -54,10 +55,10 @@ export class HeadStore {
     private readonly kernel: Kernel,
   ) {}
 
-  initialize(incarnationValue: unknown) {
+  initialize(authority: RepositoryAuthority) {
     let incarnation: ArrayBuffer;
     try {
-      incarnation = exactBuffer(decodeIncarnation(incarnationValue));
+      incarnation = exactBuffer(decodeIncarnation(authority.incarnation));
     } catch (error) {
       return failure(error, 400);
     }
@@ -66,12 +67,29 @@ export class HeadStore {
         const state = this.repositoryState();
         if (state === undefined) {
           this.sql.exec(
-            "INSERT INTO repository_state VALUES (1, ?, 0, 0, 0)",
+            `INSERT INTO repository_state
+             (singleton, incarnation, user_id, repository_id, retired, cursor,
+              receipt_count, receipt_head_count)
+             VALUES (1, ?, ?, ?, 0, 0, 0, 0)`,
             incarnation,
+            authority.userId,
+            authority.repositoryId,
           );
           return { ok: true as const, initialized: true, cursor: 0, heads: [] as string[] };
         }
         this.requireIncarnation(state, incarnation);
+        const identity = this.sql
+          .exec<{ user_id: string | null; repository_id: string | null; retired: number }>(
+            "SELECT user_id, repository_id, retired FROM repository_state WHERE singleton = 1",
+          )
+          .one();
+        if (
+          identity.user_id !== authority.userId ||
+          identity.repository_id !== authority.repositoryId ||
+          identity.retired !== 0
+        ) {
+          throw new HeadTransactionError("repository authority does not match", 409);
+        }
         return {
           ok: true as const,
           initialized: false,

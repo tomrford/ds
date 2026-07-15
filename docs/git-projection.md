@@ -90,16 +90,9 @@ the unchanged batch, reads the replay payload, performs the exact lease push
 from the rebuilt sidecar and finalises it from the observed remote value. It
 scans every blob in both the remote and rebuilt sidecar for both private values.
 
-Run the live test with:
-
-```sh
-nix develop -c pnpm build:wasm
-nix develop -c pnpm exec wrangler dev --port 8787 --var DEVSPACE_TOKEN:dev-token
-DEVSPACE_URL=http://127.0.0.1:8787 \
-DEVSPACE_TOKEN=dev-token \
-  nix develop -c cargo test -p devspace-machine \
-    --test projection_live -- --ignored --nocapture
-```
+The live probe accepts the shared development credential with machine IDs `11`
+repeated 16 times and `22` repeated 16 times. It remains a manual deployment
+probe because its repository authority and Git remote are supplied explicitly.
 
 ## Budgets and benchmarks
 
@@ -112,21 +105,21 @@ production quotas.
 
 The projection path does not run during warm repository open. The release-only
 comparison remains inside the 2 times budget; 3 current local runs measure
-1.300, 1.297 and 1.297 times stock jj. The complete command benchmark remains
-open because this repository still has no command runner. The required gate is
-a representative warm command at no more than 2 times local jj with the
-network disabled and zero cloud requests.
+1.300, 1.297 and 1.297 times stock jj. The embedded jj command runner currently
+serves bare-repository `log`; it does not yet connect command execution to the
+projection journal.
 
-The dry-run Worker bundle is 244.31 KiB uncompressed and 75.55 KiB compressed.
-The validation Wasm is 163,051 bytes and remains below its 200 KiB build gate.
+The dry-run Worker bundle is 270.78 KiB uncompressed and 80.67 KiB compressed.
+The validation Wasm is 142,859 bytes and remains below its 200 KiB build gate.
 
 ## Current limitations
 
-- Authentication is one shared bearer token. The fencing protocol establishes
-  stale-owner mechanics, not cryptographic machine identity.
+- The authenticated machine-ID header binds projection ownership and fencing
+  callbacks to the configured machine. A payload cannot claim another machine
+  ID.
 - The live test omits the first callback at the protocol boundary; it does not
-  launch and hard-kill a separate CLI process because the command runner
-  does not exist.
+  launch and hard-kill a separate CLI process because the projection journal
+  is not connected to the command runner.
 - Fetch-side hidden-lineage lifting, remote identity and production Git
   credential handling are specified in [`git-fetch.md`](git-fetch.md) and
   [`git-push.md`](git-push.md) but not yet implemented. The per-commit hidden

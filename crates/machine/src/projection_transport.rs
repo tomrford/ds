@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 
+use crate::MachineConfig;
 use crate::sync_engine::TransportError;
 
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -138,24 +139,30 @@ pub struct ProjectionSnapshot {
 pub struct ProjectionTransport {
     client: reqwest::Client,
     repository_url: String,
-    authorization: String,
+    authorization: reqwest::header::HeaderValue,
+    machine_id: String,
     incarnation: String,
 }
 
 impl ProjectionTransport {
     pub fn new(
-        base_url: &str,
+        config: &MachineConfig,
         repository: &str,
-        token: &str,
         incarnation: [u8; 16],
     ) -> Result<Self, TransportError> {
+        let mut authorization = reqwest::header::HeaderValue::from_str(&format!(
+            "Bearer {}",
+            config.shared_secret().expose()
+        ))?;
+        authorization.set_sensitive(true);
         Ok(Self {
             client: reqwest::Client::builder().build()?,
             repository_url: format!(
                 "{}/repositories/{repository}",
-                base_url.trim_end_matches('/')
+                config.base_url().trim_end_matches('/')
             ),
-            authorization: format!("Bearer {token}"),
+            authorization,
+            machine_id: config.machine_id().as_str().to_owned(),
             incarnation: hex(&incarnation),
         })
     }
@@ -341,6 +348,8 @@ impl ProjectionTransport {
     ) -> Result<reqwest::Response, TransportError> {
         let response = request
             .header(reqwest::header::AUTHORIZATION, &self.authorization)
+            .header("x-devspace-machine-id", &self.machine_id)
+            .header("x-devspace-incarnation", &self.incarnation)
             .send()
             .await?;
         let status = response.status();

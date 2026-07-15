@@ -4,10 +4,10 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   plugins: [
     cloudflareTest({
-      miniflare: {
-        bindings: { DEVSPACE_TOKEN: "test-token" },
-      },
       wrangler: { configPath: "./wrangler.jsonc" },
+      miniflare: {
+        bindings: { DEVSPACE_SHARED_SECRET: crypto.randomUUID() },
+      },
     }),
   ],
 });

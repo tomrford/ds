@@ -107,6 +107,9 @@ export function initializeSchema(sql: SqlStorage) {
     CREATE TABLE IF NOT EXISTS repository_state (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
       incarnation BLOB NOT NULL,
+      user_id TEXT,
+      repository_id TEXT,
+      retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
       cursor INTEGER NOT NULL CHECK (cursor >= 0),
       receipt_count INTEGER NOT NULL CHECK (receipt_count >= 0),
       receipt_head_count INTEGER NOT NULL CHECK (receipt_head_count >= 0)
@@ -140,6 +143,8 @@ export function initializeSchema(sql: SqlStorage) {
       PRIMARY KEY (kind, id)
     ) WITHOUT ROWID;
   `);
+
+  migrateRepositoryAuthority(sql);
 
   sql.exec(`
     CREATE TABLE IF NOT EXISTS projection_meta (
@@ -210,4 +215,27 @@ export function initializeSchema(sql: SqlStorage) {
       batch_id BLOB PRIMARY KEY
     ) WITHOUT ROWID;
   `);
+}
+
+function migrateRepositoryAuthority(sql: SqlStorage) {
+  sql.exec(`
+    CREATE TABLE IF NOT EXISTS _sql_schema_migrations (
+      id INTEGER PRIMARY KEY,
+      applied_at_ms INTEGER NOT NULL
+    );
+  `);
+  const columns = new Set(
+    sql
+      .exec<{ name: string }>("PRAGMA table_info(repository_state)")
+      .toArray()
+      .map((column) => column.name),
+  );
+  if (!columns.has("user_id")) sql.exec("ALTER TABLE repository_state ADD COLUMN user_id TEXT");
+  if (!columns.has("repository_id")) {
+    sql.exec("ALTER TABLE repository_state ADD COLUMN repository_id TEXT");
+  }
+  if (!columns.has("retired")) {
+    sql.exec("ALTER TABLE repository_state ADD COLUMN retired INTEGER NOT NULL DEFAULT 0");
+  }
+  sql.exec("INSERT OR IGNORE INTO _sql_schema_migrations VALUES (2, ?)", Date.now());
 }

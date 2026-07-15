@@ -1,28 +1,19 @@
 //! Live machine-to-Worker convergence over HTTP.
 //!
-//! Run against `wrangler dev` (or a deployed Worker):
-//!
-//! ```sh
-//! wrangler dev --port 8787 --var DEVSPACE_TOKEN:dev-token &
-//! DEVSPACE_URL=http://127.0.0.1:8787 DEVSPACE_TOKEN=dev-token \
-//!   cargo test -p devspace-machine --test cloud_live -- --ignored --nocapture
-//! ```
-//!
-//! Each run uses a fresh repository name, so a persistent Worker keeps old
-//! test repositories around; `wrangler dev` state is disposable.
+//! This manual probe requires an explicitly supplied live repository authority.
 
-use std::collections::BTreeSet;
-use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use blake2::{Blake2b512, Digest as _};
-use devspace_machine::{HttpTransport, MachineRepository, MachineSyncStore, SyncEngine};
+use devspace_machine::{
+    HttpTransport, MachineConfig, MachineId, MachineRepository, MachineSyncStore, SharedSecret,
+    SyncEngine,
+};
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
 use jj_lib::ref_name::{RefName, RemoteRefSymbol};
 use jj_lib::repo::Repo as _;
 use jj_lib::settings::UserSettings;
+use std::collections::BTreeSet;
+use std::fs;
 
 fn settings() -> UserSettings {
     let mut config = StackedConfig::with_defaults();
@@ -59,18 +50,28 @@ async fn offline_machine(path: &std::path::Path, name: &str) -> MachineRepositor
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "live cloud test; needs DEVSPACE_URL and DEVSPACE_TOKEN"]
+#[ignore = "requires live Worker credentials and repository authority"]
 async fn two_machines_converge_through_a_live_worker() {
     let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
-    let token = std::env::var("DEVSPACE_TOKEN").expect("set DEVSPACE_TOKEN");
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let repository_name = format!("sync-live-{nanos:x}-{:x}", std::process::id());
-    let incarnation: [u8; 16] = Blake2b512::digest(repository_name.as_bytes())[..16]
-        .try_into()
-        .unwrap();
+    let shared_secret =
+        std::env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
+    let repository_id =
+        std::env::var("DEVSPACE_REPOSITORY_ID").expect("set DEVSPACE_REPOSITORY_ID");
+    let incarnation = parse_incarnation(
+        &std::env::var("DEVSPACE_INCARNATION").expect("set DEVSPACE_INCARNATION"),
+    );
+    let first_config = MachineConfig::new(
+        &base_url,
+        MachineId::parse("11".repeat(16)).unwrap(),
+        SharedSecret::new(&shared_secret).unwrap(),
+    )
+    .unwrap();
+    let second_config = MachineConfig::new(
+        &base_url,
+        MachineId::parse("22".repeat(16)).unwrap(),
+        SharedSecret::new(&shared_secret).unwrap(),
+    )
+    .unwrap();
 
     let temp = tempfile::tempdir().unwrap();
     let mut left = offline_machine(&temp.path().join("left-repo"), "left").await;
@@ -81,11 +82,10 @@ async fn two_machines_converge_through_a_live_worker() {
     let right_state = MachineSyncStore::open(temp.path().join("right-machine/sync")).unwrap();
 
     let mut left_transport =
-        HttpTransport::new(&base_url, &repository_name, &token, incarnation).unwrap();
+        HttpTransport::new(&first_config, &repository_id, incarnation).unwrap();
     let mut right_transport =
-        HttpTransport::new(&base_url, &repository_name, &token, incarnation).unwrap();
-    left_transport.initialize().await.unwrap();
-    left_transport.initialize().await.unwrap();
+        HttpTransport::new(&second_config, &repository_id, incarnation).unwrap();
+    left_transport.probe_access().await.unwrap();
 
     SyncEngine::new(
         &mut left,
@@ -133,4 +133,16 @@ async fn two_machines_converge_through_a_live_worker() {
         .get(origin)
         .map(|remote| remote.bookmarks.len());
     assert_eq!(bookmarks, Some(2));
+}
+
+fn parse_incarnation(value: &str) -> [u8; 16] {
+    assert_eq!(
+        value.len(),
+        32,
+        "DEVSPACE_INCARNATION must be 32 hex characters"
+    );
+    std::array::from_fn(|index| {
+        u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .expect("DEVSPACE_INCARNATION must be lowercase hex")
+    })
 }

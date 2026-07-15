@@ -397,12 +397,13 @@ export class ProjectionStore {
     }
   }
 
-  begin(value: unknown) {
+  begin(value: unknown, authenticatedMachineId: string) {
     let request: BeginProjectionBatchRequest;
     try {
       request = decodeBeginProjectionBatch(value);
+      requireAuthenticatedMachine(request.machineId, authenticatedMachineId);
     } catch (error) {
-      return failure(error, 400);
+      return requestFailure(error);
     }
     const incarnation = exactBuffer(request.incarnation);
     const batchId = exactBuffer(request.batchId);
@@ -542,14 +543,15 @@ export class ProjectionStore {
     }
   }
 
-  claim(batchIdValue: unknown, value: unknown) {
+  claim(batchIdValue: unknown, value: unknown, authenticatedMachineId: string) {
     let batchId: ArrayBuffer;
     let request: ReturnType<typeof decodeClaimProjectionBatch>;
     try {
       batchId = exactBuffer(decodeBatchId(batchIdValue));
       request = decodeClaimProjectionBatch(value);
+      requireAuthenticatedMachine(request.machineId, authenticatedMachineId);
     } catch (error) {
-      return failure(error, 400);
+      return requestFailure(error);
     }
     try {
       return this.ctx.storage.transactionSync(() => {
@@ -573,8 +575,8 @@ export class ProjectionStore {
     }
   }
 
-  confirm(batchIdValue: unknown, value: unknown) {
-    return this.withFence(batchIdValue, value, decodeProjectionFence, (batchId, request) => {
+  confirm(batchIdValue: unknown, value: unknown, authenticatedMachineId: string) {
+    return this.withFence(batchIdValue, value, decodeProjectionFence, authenticatedMachineId, (batchId, request) => {
       const replay = this.replayFinished(batchId, request);
       if (replay !== undefined) return replay;
       this.requireFence(batchId, request);
@@ -588,8 +590,8 @@ export class ProjectionStore {
     });
   }
 
-  recover(batchIdValue: unknown, value: unknown) {
-    return this.withFence(batchIdValue, value, decodeRecoverProjectionBatch, (batchId, request) => {
+  recover(batchIdValue: unknown, value: unknown, authenticatedMachineId: string) {
+    return this.withFence(batchIdValue, value, decodeRecoverProjectionBatch, authenticatedMachineId, (batchId, request) => {
       const replay = this.replayFinished(batchId, request);
       if (replay !== undefined) return replay;
       this.requireFence(batchId, request);
@@ -636,6 +638,7 @@ export class ProjectionStore {
     batchIdValue: unknown,
     value: unknown,
     decode: (value: unknown) => T,
+    authenticatedMachineId: string,
     operation: (batchId: ArrayBuffer, request: T) => unknown,
   ) {
     let batchId: ArrayBuffer;
@@ -643,8 +646,9 @@ export class ProjectionStore {
     try {
       batchId = exactBuffer(decodeBatchId(batchIdValue));
       request = decode(value);
+      requireAuthenticatedMachine(request.machineId, authenticatedMachineId);
     } catch (error) {
-      return failure(error, 400);
+      return requestFailure(error);
     }
     try {
       return this.ctx.storage.transactionSync(() => {
@@ -974,4 +978,14 @@ function failure(error: unknown, status: number) {
     status,
     error: error instanceof Error ? error.message : "projection request failed",
   };
+}
+
+function requestFailure(error: unknown) {
+  return failure(error, error instanceof ProjectionStoreError ? error.status : 400);
+}
+
+function requireAuthenticatedMachine(machineId: Uint8Array, authenticatedMachineId: string) {
+  if (toHex(machineId) !== authenticatedMachineId) {
+    throw new ProjectionStoreError("projection machine does not match authenticated machine", 403);
+  }
 }

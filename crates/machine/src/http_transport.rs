@@ -10,7 +10,7 @@ use crate::sync_engine::{
     CloudHeads, DownloadedPack, HeadTransactionResult, PackCatalogEntry, PackCatalogPage,
     SyncTransport, TransportError,
 };
-use crate::{MAX_CHUNK_BYTES, ObjectKind, PackManifest, PendingHeadTransaction};
+use crate::{MAX_CHUNK_BYTES, MachineConfig, ObjectKind, PackManifest, PendingHeadTransaction};
 
 const MAX_JSON_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
@@ -18,7 +18,8 @@ const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
 pub struct HttpTransport {
     client: reqwest::Client,
     repository_url: String,
-    authorization: String,
+    authorization: reqwest::header::HeaderValue,
+    machine_id: String,
     incarnation: String,
 }
 
@@ -68,30 +69,34 @@ struct InventoryObject {
 
 impl HttpTransport {
     pub fn new(
-        base_url: &str,
+        config: &MachineConfig,
         repository: &str,
-        token: &str,
         incarnation: [u8; 16],
     ) -> Result<Self, TransportError> {
+        let mut authorization = reqwest::header::HeaderValue::from_str(&format!(
+            "Bearer {}",
+            config.shared_secret().expose()
+        ))?;
+        authorization.set_sensitive(true);
         Ok(Self {
             client: reqwest::Client::builder().build()?,
             repository_url: format!(
                 "{}/repositories/{repository}",
-                base_url.trim_end_matches('/')
+                config.base_url().trim_end_matches('/')
             ),
-            authorization: format!("Bearer {token}"),
+            authorization,
+            machine_id: config.machine_id().as_str().to_owned(),
             incarnation: hex_bytes(&incarnation),
         })
     }
 
-    /// Initializes the repository Durable Object with this transport's
-    /// incarnation. Repeating the same initialization is safe.
-    pub async fn initialize(&self) -> Result<(), TransportError> {
+    /// Probes whether this machine can read the repository's current heads.
+    pub async fn probe_access(&self) -> Result<(), TransportError> {
         let url = format!(
-            "{}/initialize?incarnation={}",
+            "{}/heads?incarnation={}",
             self.repository_url, self.incarnation
         );
-        let response = self.send(self.client.post(url)).await?;
+        let response = self.send(self.client.get(url)).await?;
         read_json::<HeadsResponse>(response).await?;
         Ok(())
     }
@@ -102,6 +107,8 @@ impl HttpTransport {
     ) -> Result<reqwest::Response, TransportError> {
         let response = request
             .header(reqwest::header::AUTHORIZATION, &self.authorization)
+            .header("x-devspace-machine-id", &self.machine_id)
+            .header("x-devspace-incarnation", &self.incarnation)
             .send()
             .await?;
         let status = response.status();

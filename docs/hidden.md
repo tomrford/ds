@@ -131,5 +131,5 @@ remotes do not.
   fixtures exist; entries are exact paths, so no glob semantics are planned.
 - The spike-era repository-scoped policy routes and epoch tables in the cloud
   journal predate this model and are retired by the fetch/lift work.
-- Hidden-path labeling in conflict surfaces needs a CLI design once the
-  command runner exists.
+- Hidden-path labeling in conflict surfaces needs a CLI design; the current
+  embedded runner exposes only bare-repository `log`.

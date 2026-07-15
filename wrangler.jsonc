@@ -3,6 +3,9 @@
   "name": "devspace",
   "main": "src/worker.ts",
   "compatibility_date": "2026-07-09",
+  "vars": {
+    "DEVSPACE_DEVELOPMENT_USER_ID": "development-user"
+  },
   "observability": {
     "enabled": true
   },
@@ -11,6 +14,10 @@
       {
         "name": "REPOSITORIES",
         "class_name": "Repository"
+      },
+      {
+        "name": "CONTROL_PLANE",
+        "class_name": "ControlPlane"
       }
     ]
   },
@@ -18,6 +25,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["Repository"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["ControlPlane"]
     }
   ],
   "rules": [

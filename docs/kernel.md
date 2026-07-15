@@ -35,11 +35,13 @@ uses `panic = "abort"`. Checked conversion replaces panic-catching at the
 protobuf boundary, so malformed object bytes return an error. The optimized
 module has no imports, and the build rejects modules larger than 200 KiB.
 
-One SQLite-backed `Repository` Durable Object owns each repository name. It
+One SQLite-backed `Repository` Durable Object owns each opaque repository ID. It
 quarantines bounded pack manifests and chunks, then runs the Wasm validator
 before inserting immutable object bytes and their references in one synchronous
-install transaction. The Worker applies authentication, repository name
-validation and endpoint-specific request bounds before each RPC call.
+install transaction. The Worker authenticates a typed machine principal and
+resolves the current repository incarnation through the control-plane Durable Object before each
+typed RPC. The repository object independently rechecks the user, repository ID
+and incarnation before reading or mutating state.
 
 ## Verification
 

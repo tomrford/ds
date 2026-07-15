@@ -1,20 +1,13 @@
 //! Live projection recovery across a real bare Git remote and Worker journal.
 //!
-//! Run against `wrangler dev` with the same environment as `cloud_live`.
+//! This manual probe requires an explicitly supplied live repository authority.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::Path;
-use std::process::Command;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use blake2::{Blake2b512, Digest as _};
 use devspace_kernel::hidden::{HiddenPath, HiddenPathSet};
 use devspace_machine::{
     CommitMapping, ExactPathFilter, ExportMappings, GitProjection, HttpTransport, ImportMappings,
-    MachineRepository, PackOptions, ProjectionObservation, ProjectionState, ProjectionTransport,
-    ProjectionUpdate, SyncTransport, build_packs,
+    MachineConfig, MachineId, MachineRepository, PackOptions, ProjectionObservation,
+    ProjectionState, ProjectionTransport, ProjectionUpdate, SharedSecret, SyncTransport,
+    build_packs,
 };
 use jj_lib::backend::{
     ChangeId, Commit as BackendCommit, CommitId, CopyId, MillisSinceEpoch, Signature, Timestamp,
@@ -27,6 +20,11 @@ use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use std::sync::Arc;
 
 fn settings() -> UserSettings {
     let mut config = StackedConfig::with_defaults();
@@ -131,21 +129,31 @@ async fn write_private_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "live projection test; needs DEVSPACE_URL and DEVSPACE_TOKEN"]
+#[ignore = "requires live Worker credentials, repository authority, and Git remote"]
 async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
     let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
-    let token = std::env::var("DEVSPACE_TOKEN").expect("set DEVSPACE_TOKEN");
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let repository_name = format!("projection-live-{nanos:x}-{:x}", std::process::id());
-    let incarnation: [u8; 16] = Blake2b512::digest(repository_name.as_bytes())[..16]
-        .try_into()
-        .unwrap();
+    let shared_secret =
+        std::env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
+    let repository_id =
+        std::env::var("DEVSPACE_REPOSITORY_ID").expect("set DEVSPACE_REPOSITORY_ID");
+    let incarnation = parse_incarnation(
+        &std::env::var("DEVSPACE_INCARNATION").expect("set DEVSPACE_INCARNATION"),
+    );
     let first_machine = [0x11; 16];
     let recovery_machine = [0x22; 16];
     let batch_id = [0x33; 16];
+    let first_config = MachineConfig::new(
+        &base_url,
+        MachineId::parse("11".repeat(16)).unwrap(),
+        SharedSecret::new(&shared_secret).unwrap(),
+    )
+    .unwrap();
+    let recovery_config = MachineConfig::new(
+        &base_url,
+        MachineId::parse("22".repeat(16)).unwrap(),
+        SharedSecret::new(&shared_secret).unwrap(),
+    )
+    .unwrap();
 
     let temp = tempfile::tempdir().unwrap();
     let settings = settings();
@@ -153,10 +161,9 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
         .await
         .unwrap();
     let (private_head, hidden_values) = write_private_history(first.repo().store()).await;
-    let mut cloud = HttpTransport::new(&base_url, &repository_name, &token, incarnation).unwrap();
-    cloud.initialize().await.unwrap();
-    let journal =
-        ProjectionTransport::new(&base_url, &repository_name, &token, incarnation).unwrap();
+    let mut cloud = HttpTransport::new(&first_config, &repository_id, incarnation).unwrap();
+    cloud.probe_access().await.unwrap();
+    let journal = ProjectionTransport::new(&first_config, &repository_id, incarnation).unwrap();
     assert_eq!(
         journal
             .mutate_hidden_path("secrets/.env", true)
@@ -285,8 +292,7 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
     drop(projection);
     drop(first);
 
-    let recovery =
-        ProjectionTransport::new(&base_url, &repository_name, &token, incarnation).unwrap();
+    let recovery = ProjectionTransport::new(&recovery_config, &repository_id, incarnation).unwrap();
     let claimed = recovery
         .claim_push(batch_id, recovery_machine)
         .await
@@ -307,7 +313,7 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
         .await
         .unwrap();
     let mut second_cloud =
-        HttpTransport::new(&base_url, &repository_name, &token, incarnation).unwrap();
+        HttpTransport::new(&recovery_config, &repository_id, incarnation).unwrap();
     let catalog = second_cloud.list_packs(0, None).await.unwrap();
     for entry in catalog.packs {
         let pack = second_cloud.download_pack(entry.id).await.unwrap();
@@ -498,6 +504,18 @@ fn git_command(args: &[&str], git_dir: Option<&Path>) -> Command {
 fn parse_git_oid(value: &str) -> [u8; 20] {
     let value = value.trim();
     std::array::from_fn(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap())
+}
+
+fn parse_incarnation(value: &str) -> [u8; 16] {
+    assert_eq!(
+        value.len(),
+        32,
+        "DEVSPACE_INCARNATION must be 32 hex characters"
+    );
+    std::array::from_fn(|index| {
+        u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .expect("DEVSPACE_INCARNATION must be lowercase hex")
+    })
 }
 
 fn assert_hidden_bytes_absent(git_dir: &Path, hidden_values: &[Vec<u8>]) {

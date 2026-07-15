@@ -30,6 +30,32 @@ The current integration tests prove that initialization writes jj's literal
 store type names, a native operation survives a full reload, and a Git-backed
 repository is rejected before jj attempts to load it.
 
+## Machine-store catalog
+
+One `MachineStore` owns the platform data root, the local repository catalog
+and native repository locations. macOS uses
+`~/Library/Application Support/devspace`, Linux uses the XDG data directory and
+Windows uses the local application-data directory.
+`DEVSPACE_MACHINE_STORE_DIR` exists only for deterministic bring-up and tests.
+
+The versioned JSON catalog binds a validated tenant-visible name to a 64-digit
+opaque repository ID and a 32-digit incarnation. Native repositories live under
+paths derived from both opaque values, never from the tenant-visible name. A
+single machine-local file lock serializes readers and writers. Mutations reread
+the catalog while holding that lock, sync a new temporary file, atomically
+replace the catalog and, on Unix, sync the root directory entry. A crashed
+temporary file is ignored. Conflicting name reuse, reuse of an ID under another
+name and stale incarnations fail closed.
+
+The library exposes registration, incarnation-checked materialization,
+repository open and incarnation-checked catalog removal. Materialization uses
+an opaque per-identity lock, initializes in a temporary sibling and atomically
+publishes only a complete native repository. Catalog removal never prunes native
+repository data. Protected machine configuration stores the Worker URL, shared
+development credential and machine ID in an atomic private file. Repository
+creation adds the separate durable journal described below. Cloud first-use and
+import remain outside this local boundary.
+
 ## Object closure
 
 The sync input is derived from the stock operation-head store, not from the
@@ -185,13 +211,53 @@ builds a real repository pack, installs it into a fresh stock repository,
 retries it idempotently and only then reconciles its operation head. Corrupt
 download bytes are rejected without changing the stock head store.
 
+## Cloud identity and repository directory
+
+The stateless HTTP auth adapter compares a shared development credential using
+SHA-256 and Workers Web Crypto's timing-safe equality. It maps every valid
+request to one fixed server-side development user and a validated machine ID
+header. Callers cannot supply a user ID. The credential is a Worker secret,
+never a source or `wrangler.jsonc` value, and the Worker keeps no mutable
+request identity in global state.
+
+Repository names are tenant-local directory entries. An authenticated create
+request carries a 128-bit idempotency key. The control plane reserves the name,
+assigns a Cloudflare-generated opaque Durable Object ID and random 128-bit
+incarnation, initializes that repository object, then activates the record. A
+retry with the same key and name resumes or returns the same result. Reusing the
+key for another name fails. Activation is a compare-and-set transition from
+provisional to active; a receipt whose repository is retiring or deleted can
+never reactivate it.
+
+`ds repo new <name>` writes its name, control-plane target, machine ID and
+random 128-bit key to the machine-store creation journal before sending that
+request. A lost response reuses the recorded key. Once a response is available,
+the command durably records its opaque repository ID and incarnation before
+catalog registration, then atomically publishes an empty stock repository. A
+completed receipt remains available for retries; a catalog entry without that
+receipt is never adopted as the result of a new create request.
+
+Deletion first blocks new authorization and retires the repository object. It
+then frees the tenant-local name. Recreating the name produces a different ID
+and incarnation. The control plane rejects another user's ID and every retired
+or stale incarnation without revealing whether another tenant owns it. A
+delete retry resumes a retiring row. Repository creation also recovers up to 64
+retiring rows for that user, including provisional rows older than 24 hours,
+and installs a retired Repository Durable Object tombstone even when
+initialization never completed.
+
+The Worker creates a typed `{ userId, machineId }` principal before calling the
+control plane. Directory and repository authorization accept only that
+principal and never inspect caller-supplied user IDs. The repository Durable
+Object also checks the authenticated user, machine-derived authority, opaque ID
+and incarnation before access. Synthetic principals test cross-user isolation
+below the development-only HTTP adapter.
+
 ## Cloud operation heads
 
-The repository Durable Object is initialized once with a 128-bit incarnation
-through an authenticated initialize POST; repository creation policy belongs
-to the future control plane. Repeating the same initialization is safe; a
-different incarnation is rejected. Head reads and writes require the matching
-incarnation.
+The control-plane creation saga initializes the repository Durable Object once
+with its identity and incarnation. Head reads and writes require that current
+authority and matching request incarnation.
 
 An authenticated head transaction carries one new operation head, the exact
 set of heads observed by the client and a 128-bit idempotency key. The request
@@ -336,14 +402,13 @@ objects directly or contact one another.
 ## Live Worker transport
 
 `HttpTransport` implements the same transport contract over the Worker's HTTP
-protocol: bearer authentication, incarnation-scoped inventory and catalog,
-manifest and chunk routes, and the JSON head transaction. The ignored `cloud_live` test
-runs the two-machine convergence flow against a real Worker — `wrangler dev`
-or a deployment — via `DEVSPACE_URL` and `DEVSPACE_TOKEN`, so
-heads-carrying manifests, pack installation, chunk reconstruction and head
-transactions cross the Rust/TypeScript boundary rather than a test fake. The
-in-repo fault matrix stays on the deterministic fake; the live test is the
-cross-language proof.
+protocol: shared-secret authentication with a distinct machine ID, repository
+authority,
+incarnation-scoped inventory and catalog, manifest and chunk routes, and the
+JSON head transaction. The ignored `cloud_live` cross-language probe contains
+the two-machine flow. It remains a manual deployment probe because it requires
+explicit Worker credentials and repository authority. The in-repo fault matrix
+is the hermetic convergence proof.
 
 ## Exact cloud rebuild
 
@@ -393,9 +458,19 @@ work. A network-denied run and a call-graph check confirmed zero cloud
 requests. The archived report is
 [`archive/probe-warm-command.md`](archive/probe-warm-command.md).
 
-The command runner must therefore open the bare machine repository directly,
-as the probe did. Wrapping it in a temporary jj workspace, as the stock CLI
-requires, adds an order of magnitude of avoidable work.
+The `ds` command runner resolves `ds -R <name> log` through the machine-store
+catalog and opens the resulting bare repository directly through a custom jj
+workspace loader. Its in-memory working-copy sentinel has no selected checkout,
+so jj skips snapshotting and `@` is unavailable. The runner accepts only
+repo-targeted `log` at this boundary and rejects commands that mutate or depend
+on a working copy. The read-only loader prunes ancestor operation heads in
+memory and requires exactly one remaining head; sync reconciles genuinely
+divergent heads before command execution. Bare roots with jj config markers are
+rejected, and raw native paths are not product-facing identities. A missing
+local name fails without a cloud request because clone-on-first-use does not
+exist yet. The local read constructs no Devspace
+sync transport or HTTP client. Normal jj workspaces, including explicit `-R`
+workspace paths, continue through jj's stock loader.
 
 ## Open verification
 
@@ -421,6 +496,13 @@ measurement before the affected surface hardens.
 - Untested asserted behavior: receipt expiry and quota enforcement, SQLite
   part-splitting above 1 MiB values, catalog pagination beyond one page,
   no-clobber mismatch on existing native objects, and the 4,096-head bounds.
-- One shared bearer token authorizes every route, so any token holder can
-  initialize any repository name and claim its incarnation. Repository-scoped
-  authorization is control-plane work.
+- Before dogfooding, replace the shared-secret HTTP adapter with real
+  multi-user authentication and independently revocable machine credentials.
+  Typed principals, repository authorization and transport semantics remain
+  behind that boundary.
+- Retiring-row recovery is request-driven. Delete retries resume their exact
+  retirement, and later repository creates recover a bounded batch, but there
+  is no scheduled maintenance trigger for an otherwise idle tenant.
+- Repository-creation receipts are retained indefinitely. Receipt expiry
+  cannot be added without defining how a retry preserves the original
+  repository result.
