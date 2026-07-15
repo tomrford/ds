@@ -157,6 +157,15 @@ export function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
   return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index]);
 }
 
+export function compareBytes(left: Uint8Array, right: Uint8Array): number {
+  const shared = Math.min(left.byteLength, right.byteLength);
+  for (let index = 0; index < shared; index += 1) {
+    const difference = left[index] - right[index];
+    if (difference !== 0) return difference;
+  }
+  return left.byteLength - right.byteLength;
+}
+
 export function exactBuffer(bytes: Uint8Array): ArrayBuffer {
   return new Uint8Array(bytes).buffer;
 }

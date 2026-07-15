@@ -251,6 +251,11 @@ impl PackManifest {
                 maximum: MAX_PACK_BYTES,
             });
         }
+        if self.objects.is_empty() {
+            return Err(PackManifestError::InvalidEncoding {
+                reason: "manifest must contain at least one object",
+            });
+        }
         manifest_count("operation heads", self.operation_heads.len())?;
         manifest_count("objects", self.objects.len())?;
         manifest_count("chunks", self.chunks.len())?;
@@ -520,6 +525,53 @@ mod tests {
         assert_eq!(
             hex(id),
             "606591ef0c95a0b8ab99b4ccc8cfd34f05e143f82cf4e7ff0766183d21f0fce42456f1d602deaaef70fcaed78de2ca8cee73a055853d7aff1409c7a26b185733"
+        );
+        assert_eq!(PackManifest::decode(&manifest.encode()).unwrap(), manifest);
+    }
+
+    #[test]
+    fn heads_manifest_matches_the_worker_protocol_vector() {
+        let manifest = PackManifest::new(
+            64 * 1024,
+            80 * 1024,
+            [0x77; 64],
+            vec![[0x11; 64], [0x22; 64]],
+            vec![
+                ObjectEntry {
+                    key: ObjectKey {
+                        kind: ObjectKind::File,
+                        id: [0x33; 64],
+                    },
+                    offset: 0,
+                    length: 40 * 1024,
+                },
+                ObjectEntry {
+                    key: ObjectKey {
+                        kind: ObjectKind::Tree,
+                        id: [0x44; 64],
+                    },
+                    offset: 40 * 1024,
+                    length: 40 * 1024,
+                },
+            ],
+            vec![
+                ChunkEntry {
+                    offset: 0,
+                    length: 64 * 1024,
+                    hash: [0x55; 64],
+                },
+                ChunkEntry {
+                    offset: 64 * 1024,
+                    length: 16 * 1024,
+                    hash: [0x66; 64],
+                },
+            ],
+        )
+        .unwrap();
+        let id: ObjectId = Blake2b512::digest(manifest.encode()).into();
+        assert_eq!(
+            hex(id),
+            "f1bf19025a446aefff8403fb0fdee17ff43382ecc8d5df0d398f24a741025c06faa832335491098ab8a285fce47d49d13510b94a7d009e4cefa3061a892ce52a"
         );
         assert_eq!(PackManifest::decode(&manifest.encode()).unwrap(), manifest);
     }

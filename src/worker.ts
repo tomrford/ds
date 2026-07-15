@@ -5,6 +5,7 @@ import { Kernel, equalBytes, exactBuffer, fromHex, toHex } from "./kernel";
 import {
   MAX_CHUNK_BYTES,
   MAX_MANIFEST_BYTES,
+  MAX_OBJECT_BYTES,
   PackManifest,
   concatParts,
   decodeManifest,
@@ -12,11 +13,9 @@ import {
   splitParts,
 } from "./pack_protocol";
 
-const MAX_OBJECT_BYTES = 1024 * 1024;
 const REPOSITORY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const PACK_ID_PATTERN = /^[0-9a-f]{128}$/;
 const PACK_CATALOG_PAGE = 256;
-const PACK_CATALOG_MIGRATION_BATCH = 256;
 
 interface Env {
   REPOSITORIES: DurableObjectNamespace<Repository>;
@@ -173,7 +172,6 @@ export class Repository extends DurableObject<Env> {
         PRIMARY KEY (pack_id, position)
       ) WITHOUT ROWID;
     `);
-    this.backfillInstalledPackCatalog();
     this.heads = new HeadStore(this.ctx, this.kernel);
   }
 
@@ -355,13 +353,6 @@ export class Repository extends DurableObject<Env> {
   listInstalledPacks(incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
     const state = this.heads.get(incarnationValue);
     if (!state.ok) return state;
-    if (!this.backfillInstalledPackCatalog()) {
-      return {
-        ok: false as const,
-        status: 503,
-        error: "installed pack catalog migration is incomplete; retry",
-      };
-    }
     if (typeof afterValue !== "number" || !Number.isSafeInteger(afterValue) || afterValue < 0) {
       return { ok: false as const, status: 400, error: "pack cursor must be a non-negative integer" };
     }
@@ -764,32 +755,6 @@ export class Repository extends DurableObject<Env> {
       .one().sequence;
   }
 
-  private backfillInstalledPackCatalog(): boolean {
-    const missing = this.ctx.storage.sql
-      .exec<{ pack_id: ArrayBuffer }>(
-        `SELECT installed.pack_id FROM installed_packs AS installed
-         LEFT JOIN installed_pack_catalog AS catalog ON catalog.pack_id = installed.pack_id
-         WHERE catalog.pack_id IS NULL ORDER BY installed.pack_id LIMIT ?`,
-        PACK_CATALOG_MIGRATION_BATCH + 1,
-      )
-      .toArray();
-    if (missing.length === 0) return true;
-    const batch = missing.slice(0, PACK_CATALOG_MIGRATION_BATCH);
-    this.ctx.storage.transactionSync(() => {
-      let sequence = this.installedPackHighWater();
-      for (const row of batch) {
-        sequence += 1;
-        if (!Number.isSafeInteger(sequence)) throw new Error("installed pack sequence exhausted");
-        this.ctx.storage.sql.exec(
-          "INSERT OR IGNORE INTO installed_pack_catalog VALUES (?, ?)",
-          row.pack_id,
-          sequence,
-        );
-      }
-    });
-    return missing.length <= PACK_CATALOG_MIGRATION_BATCH;
-  }
-
   private manifestParts(id: ArrayBuffer): Uint8Array[] {
     return this.ctx.storage.sql
       .exec<BytesRow>(
@@ -859,7 +824,13 @@ export default {
     );
     const headMatch = /^\/repositories\/([^/]+)\/heads$/.exec(url.pathname);
     const packCatalogMatch = /^\/repositories\/([^/]+)\/packs$/.exec(url.pathname);
-    const repository = chunkMatch?.[1] ?? packMatch?.[1] ?? headMatch?.[1] ?? packCatalogMatch?.[1];
+    const initializeMatch = /^\/repositories\/([^/]+)\/initialize$/.exec(url.pathname);
+    const repository =
+      chunkMatch?.[1] ??
+      packMatch?.[1] ??
+      headMatch?.[1] ??
+      packCatalogMatch?.[1] ??
+      initializeMatch?.[1];
     const packId = chunkMatch?.[2] ?? packMatch?.[2];
     if (repository === undefined) return errorResponse(404, "not found");
     if (!REPOSITORY_PATTERN.test(repository)) return errorResponse(400, "invalid repository name");
@@ -938,6 +909,11 @@ export default {
       if (packMatch?.[3] === "install" && request.method === "POST") {
         if (packId === undefined) throw new Error("pack route did not capture an ID");
         return rpcResponse(await stub.installPack(packId));
+      }
+      if (initializeMatch !== null && request.method === "POST") {
+        return rpcResponse(
+          await stub.initializeRepository(url.searchParams.get("incarnation")),
+        );
       }
       if (headMatch !== null && request.method === "GET") {
         return rpcResponse(await stub.getHeads(url.searchParams.get("incarnation")));

@@ -1,4 +1,4 @@
-import { equalBytes } from "./kernel";
+import { compareBytes, equalBytes } from "./kernel";
 
 const MANIFEST_MAGIC = new Uint8Array([0x44, 0x53, 0x50, 0x4b]);
 const MANIFEST_VERSION = 1;
@@ -57,6 +57,7 @@ export function decodeManifest(bytes: Uint8Array): PackManifest {
     throw new Error("manifest chunk size is outside the canonical range");
   }
   if (headCount > MAX_PACK_HEADS) throw new Error("manifest has too many operation heads");
+  if (objectCount === 0) throw new Error("manifest must contain at least one object");
   if (objectCount > MAX_PACK_OBJECTS) throw new Error("manifest has too many objects");
   if (chunkCount > MAX_PACK_CHUNKS) throw new Error("manifest has too many chunks");
   if (packLength > MAX_PACK_BYTES) throw new Error("manifest pack exceeds the byte limit");
@@ -145,14 +146,6 @@ function requireStrictOrder<T>(
 
 function compareObjects(left: ManifestObject, right: ManifestObject): number {
   return left.kind - right.kind || compareBytes(left.id, right.id);
-}
-
-function compareBytes(left: Uint8Array, right: Uint8Array): number {
-  for (let index = 0; index < left.byteLength; index += 1) {
-    const difference = left[index] - right[index];
-    if (difference !== 0) return difference;
-  }
-  return left.byteLength - right.byteLength;
 }
 
 function validateRanges(

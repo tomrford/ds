@@ -1,4 +1,4 @@
-import { fromHex } from "./kernel";
+import { compareBytes, fromHex } from "./kernel";
 
 export const MAX_OPERATION_HEADS = 4_096;
 export const MAX_OBSERVED_HEADS = MAX_OPERATION_HEADS;
@@ -26,6 +26,9 @@ export function decodeHeadTransaction(value: unknown): HeadTransactionRequest {
   const incarnation = decodeIncarnation(value.incarnation);
   const idempotencyKey = decodeIdempotencyKey(value.idempotencyKey);
   const newHead = decodeHead(value.newHead, "newHead");
+  if (newHead.every((byte) => byte === 0)) {
+    throw new Error("newHead must not be the implicit zero operation");
+  }
   if (!Array.isArray(value.observedHeads)) throw new Error("observedHeads must be an array");
   if (value.observedHeads.length > MAX_OBSERVED_HEADS) {
     throw new Error(`observedHeads exceeds the ${MAX_OBSERVED_HEADS}-head limit`);
@@ -76,14 +79,6 @@ function decodeShortHex(value: string): Uint8Array {
   return Uint8Array.from({ length: 16 }, (_, index) =>
     Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
   );
-}
-
-function compareBytes(left: Uint8Array, right: Uint8Array): number {
-  for (let index = 0; index < left.byteLength; index += 1) {
-    const difference = left[index] - right[index];
-    if (difference !== 0) return difference;
-  }
-  return left.byteLength - right.byteLength;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

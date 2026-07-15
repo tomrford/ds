@@ -5,7 +5,7 @@ import {
   decodeHeadTransaction,
   decodeIncarnation,
 } from "./head_protocol";
-import { KIND, Kernel, equalBytes, exactBuffer, toHex } from "./kernel";
+import { KIND, KIND_BY_NUMBER, Kernel, equalBytes, exactBuffer, toHex } from "./kernel";
 
 interface RepositoryStateRow extends Record<string, SqlStorageValue> {
   incarnation: ArrayBuffer;
@@ -455,5 +455,5 @@ function failure(error: unknown, status: number) {
 }
 
 function objectLabel(kind: number): string {
-  return ["file", "symlink", "tree", "commit", "view", "operation"][kind] ?? `kind ${kind}`;
+  return KIND_BY_NUMBER[kind] ?? `kind ${kind}`;
 }

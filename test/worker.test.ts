@@ -12,6 +12,8 @@ const helloId =
 const helloPackId =
   "606591ef0c95a0b8ab99b4ccc8cfd34f05e143f82cf4e7ff0766183d21f0fce42456f1d602deaaef70fcaed78de2ca8cee73a055853d7aff1409c7a26b185733";
 const hello = new TextEncoder().encode("hello");
+const headsPackId =
+  "f1bf19025a446aefff8403fb0fdee17ff43382ecc8d5df0d398f24a741025c06faa832335491098ab8a285fce47d49d13510b94a7d009e4cefa3061a892ce52a";
 const zeroId = "00".repeat(64);
 
 describe("validation kernel", () => {
@@ -143,6 +145,20 @@ describe("pack installation", () => {
     expect(await stub.countInstalledPacks()).toBe(0);
   });
 
+  it("accepts the frozen heads-carrying multi-chunk manifest vector", async () => {
+    const kernel = new Kernel();
+    const manifest = headsManifest();
+    expect(toHex(kernel.hash([manifest]))).toBe(headsPackId);
+    expect(decodeManifest(manifest)).toMatchObject({
+      chunkBytes: 64 * 1024,
+      packLength: 80 * 1024,
+    });
+    expect(decodeManifest(manifest).operationHeads).toHaveLength(2);
+    const response = await putManifest("heads-vector", headsPackId, manifest);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ inserted: true, installed: false });
+  });
+
   it("rejects noncanonical manifests before quarantine", async () => {
     const manifest = helloManifest();
     manifest[6] = 1;
@@ -199,6 +215,17 @@ describe("pack installation", () => {
 describe("cloud operation heads", () => {
   const incarnation = "11".repeat(16);
   const otherIncarnation = "22".repeat(16);
+
+  it("initializes a repository over HTTP idempotently", async () => {
+    const incarnation = "ab".repeat(16);
+    const first = await initialize("http-init", incarnation);
+    expect(first).toEqual({ status: 200, body: { initialized: true, cursor: 0, heads: [] } });
+    const replay = await initialize("http-init", incarnation);
+    expect(replay).toEqual({ status: 200, body: { initialized: false, cursor: 0, heads: [] } });
+    const conflict = await initialize("http-init", "cd".repeat(16));
+    expect(conflict.status).toBe(409);
+    expect(conflict.body).toEqual({ error: "repository incarnation does not match" });
+  });
 
   it("preserves unseen concurrent heads and replays the exact idempotent result", async () => {
     const repository = "head-convergence";
@@ -502,6 +529,16 @@ async function headTransaction(
   return postHeads(repository, headRequest(incarnation, idempotencyKey, newHead, observedHeads));
 }
 
+async function initialize(repository: string, incarnation: string) {
+  const response = await exports.default.fetch(
+    new Request(
+      `https://example.com/repositories/${repository}/initialize?incarnation=${incarnation}`,
+      { method: "POST", headers: authorization },
+    ),
+  );
+  return { status: response.status, body: await response.json() };
+}
+
 async function postHeads(repository: string, body: unknown) {
   return postRawHeads(repository, JSON.stringify(body));
 }
@@ -596,6 +633,40 @@ function helloManifest(): Uint8Array {
   view.setUint32(192, 5, true);
   bytes.set(id, 200);
   return bytes;
+}
+
+// Mirrors heads_manifest_matches_the_worker_protocol_vector in
+// crates/machine/src/pack_manifest.rs byte for byte.
+function headsManifest(): Uint8Array {
+  const manifest = new Uint8Array(96 + 2 * 64 + 2 * 88 + 2 * 80);
+  const view = new DataView(manifest.buffer);
+  manifest.set(new TextEncoder().encode("DSPK"));
+  view.setUint16(4, 1, true);
+  view.setUint32(8, 64 * 1024, true);
+  view.setUint32(12, 2, true);
+  view.setUint32(16, 2, true);
+  view.setUint32(20, 2, true);
+  view.setBigUint64(24, BigInt(80 * 1024), true);
+  manifest.set(new Uint8Array(64).fill(0x77), 32);
+  manifest.set(new Uint8Array(64).fill(0x11), 96);
+  manifest.set(new Uint8Array(64).fill(0x22), 160);
+  const objects = 96 + 2 * 64;
+  manifest[objects] = KIND.file;
+  manifest.set(new Uint8Array(64).fill(0x33), objects + 8);
+  view.setBigUint64(objects + 72, 0n, true);
+  view.setBigUint64(objects + 80, BigInt(40 * 1024), true);
+  manifest[objects + 88] = KIND.tree;
+  manifest.set(new Uint8Array(64).fill(0x44), objects + 96);
+  view.setBigUint64(objects + 160, BigInt(40 * 1024), true);
+  view.setBigUint64(objects + 168, BigInt(40 * 1024), true);
+  const chunks = objects + 2 * 88;
+  view.setBigUint64(chunks, 0n, true);
+  view.setUint32(chunks + 8, 64 * 1024, true);
+  manifest.set(new Uint8Array(64).fill(0x55), chunks + 16);
+  view.setBigUint64(chunks + 80, BigInt(64 * 1024), true);
+  view.setUint32(chunks + 88, 16 * 1024, true);
+  manifest.set(new Uint8Array(64).fill(0x66), chunks + 96);
+  return manifest;
 }
 
 function singleObjectPack(kind: number, objectBytes: Uint8Array) {
