@@ -49,11 +49,12 @@ pub use projection_transport::{
     ProjectionReplay, ProjectionSnapshot, ProjectionState, ProjectionTransport, ProjectionUpdate,
 };
 pub use sync_engine::{
-    CloudHeads, DownloadedPack, HeadTransactionResult, PackCatalogEntry, PackCatalogPage,
-    SyncEngine, SyncEngineError, SyncTransport, TransportError,
+    CloudHeads, DownloadedPack, HeadTransactionResult, MAX_OBJECT_INVENTORY_KEYS, PackCatalogEntry,
+    PackCatalogPage, PackGcError, SyncEngine, SyncEngineError, SyncTransport, TransportError,
 };
 pub use sync_state::{
-    MachineSyncLock, MachineSyncStore, PendingHeadTransaction, SyncState, SyncStateError,
+    MachineSyncLock, MachineSyncStore, PendingHead, PendingHeadBatch, PendingHeadTransaction,
+    SyncState, SyncStateError,
 };
 
 /// A native jj repository in a machine store.

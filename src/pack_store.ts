@@ -9,7 +9,9 @@ import {
   decodeManifest,
   splitParts,
 } from "./pack_protocol";
+import { decodeObjectInventory, InventoryObject } from "./object_protocol";
 const PACK_CATALOG_PAGE = 256;
+const INVENTORY_SQL_OBJECTS = 32;
 
 interface UploadRow extends Record<string, SqlStorageValue> {
   manifest_length: number;
@@ -221,6 +223,48 @@ export class PackStore {
     return this.sql
       .exec<{ count: number }>("SELECT count(*) AS count FROM installed_packs")
       .one().count;
+  }
+
+  /**
+   * Returns the installed subset of one bounded, canonical candidate set.
+   *
+   * Installed objects are immutable and content-addressed, so an affirmative
+   * answer remains safe if another pack installs concurrently. A stale
+   * negative only causes an idempotent re-upload.
+   */
+  inventoryObjects(value: unknown) {
+    let request;
+    try {
+      request = decodeObjectInventory(value);
+    } catch (error) {
+      return {
+        ok: false as const,
+        status: 400,
+        error: error instanceof Error ? error.message : "object inventory request failed",
+      };
+    }
+    const state = this.heads.get(toHex(request.incarnation));
+    if (!state.ok) return state;
+
+    const installed: InventoryObject[] = [];
+    for (let offset = 0; offset < request.objects.length; offset += INVENTORY_SQL_OBJECTS) {
+      const candidates = request.objects.slice(offset, offset + INVENTORY_SQL_OBJECTS);
+      const predicate = candidates.map(() => "(kind = ? AND id = ?)").join(" OR ");
+      const bindings = candidates.flatMap((object) => [object.kind, exactBuffer(object.id)]);
+      installed.push(
+        ...this.sql
+          .exec<{ kind: number; id: ArrayBuffer }>(
+            `SELECT kind, id FROM objects WHERE ${predicate} ORDER BY kind, id`,
+            ...bindings,
+          )
+          .toArray()
+          .map((row) => ({ kind: row.kind, id: new Uint8Array(row.id) })),
+      );
+    }
+    return {
+      ok: true as const,
+      objects: installed.map((object) => ({ kind: object.kind, id: toHex(object.id) })),
+    };
   }
 
   listInstalledPacks(incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {

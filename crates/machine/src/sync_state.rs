@@ -10,9 +10,11 @@ use crate::ObjectId;
 
 const STATE_MAGIC: &[u8; 4] = b"DSSS";
 const OUTBOX_MAGIC: &[u8; 4] = b"DSOB";
-const FORMAT_VERSION: u16 = 1;
+const STATE_FORMAT_VERSION: u16 = 1;
+const OUTBOX_FORMAT_VERSION: u16 = 2;
 const STATE_HEADER_BYTES: usize = 32;
-const OUTBOX_HEADER_BYTES: usize = 96;
+const OUTBOX_HEADER_BYTES: usize = 32;
+const OUTBOX_ENTRY_FIXED_BYTES: usize = 80;
 const MAX_SYNC_HEADS: usize = 4_096;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -27,6 +29,91 @@ pub struct PendingHeadTransaction {
     pub idempotency_key: [u8; 16],
     pub new_head: ObjectId,
     pub observed_heads: BTreeSet<ObjectId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingHead {
+    pub idempotency_key: [u8; 16],
+    pub new_head: ObjectId,
+    observed_mask: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingHeadBatch {
+    pub entries: Vec<PendingHead>,
+    pub observed_heads: BTreeSet<ObjectId>,
+}
+
+impl PendingHeadBatch {
+    pub fn from_transactions(
+        transactions: Vec<PendingHeadTransaction>,
+    ) -> Result<Self, SyncStateError> {
+        if transactions.is_empty() {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "transaction batch is empty",
+            });
+        }
+        require_head_count(transactions.len())?;
+        let observed_heads = transactions
+            .iter()
+            .flat_map(|transaction| transaction.observed_heads.iter().copied())
+            .collect::<BTreeSet<_>>();
+        require_head_count(observed_heads.len())?;
+        let entries = transactions
+            .into_iter()
+            .map(|transaction| PendingHead {
+                idempotency_key: transaction.idempotency_key,
+                new_head: transaction.new_head,
+                observed_mask: encode_observed_mask(&observed_heads, &transaction.observed_heads),
+            })
+            .collect();
+        let batch = Self {
+            entries,
+            observed_heads,
+        };
+        validate_outbox(&batch)?;
+        Ok(batch)
+    }
+
+    pub fn first_transaction(&self) -> Option<PendingHeadTransaction> {
+        (!self.entries.is_empty()).then(|| self.transaction(0))
+    }
+
+    pub(crate) fn remove_first(&mut self) -> Result<(), SyncStateError> {
+        if self.entries.is_empty() {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "transaction batch is empty",
+            });
+        }
+        self.entries.remove(0);
+        if self.entries.is_empty() {
+            self.observed_heads.clear();
+            return Ok(());
+        }
+        let transactions = (0..self.entries.len())
+            .map(|index| self.transaction(index))
+            .collect();
+        *self = Self::from_transactions(transactions)?;
+        Ok(())
+    }
+
+    fn transaction(&self, index: usize) -> PendingHeadTransaction {
+        let entry = &self.entries[index];
+        let observed_heads = self
+            .observed_heads
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask_contains(&entry.observed_mask, *index))
+            .map(|(_, head)| *head)
+            .collect();
+        PendingHeadTransaction {
+            idempotency_key: entry.idempotency_key,
+            new_head: entry.new_head,
+            observed_heads,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -82,7 +169,7 @@ impl MachineSyncStore {
         require_head_count(state.accepted_heads.len())?;
         let mut bytes = Vec::with_capacity(STATE_HEADER_BYTES + state.accepted_heads.len() * 64);
         bytes.extend_from_slice(STATE_MAGIC);
-        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&STATE_FORMAT_VERSION.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes.extend_from_slice(&state.cloud_cursor.to_le_bytes());
         bytes.extend_from_slice(&state.catalog_sequence.to_le_bytes());
@@ -94,9 +181,14 @@ impl MachineSyncStore {
         atomic_write(&self.directory, "state", &bytes)
     }
 
-    pub fn load_outbox(&self) -> Result<Option<PendingHeadTransaction>, SyncStateError> {
+    pub fn load_outbox(&self) -> Result<Option<PendingHeadBatch>, SyncStateError> {
         let path = self.directory.join("outbox");
-        match read_bounded(&path, OUTBOX_HEADER_BYTES + MAX_SYNC_HEADS * 64) {
+        match read_bounded(
+            &path,
+            OUTBOX_HEADER_BYTES
+                + MAX_SYNC_HEADS
+                    * (OUTBOX_ENTRY_FIXED_BYTES + observed_mask_bytes(MAX_SYNC_HEADS) + 64),
+        ) {
             Ok(bytes) => decode_outbox(&bytes).map(Some),
             Err(SyncStateError::Read { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
@@ -107,16 +199,25 @@ impl MachineSyncStore {
         }
     }
 
-    pub fn save_outbox(&self, pending: &PendingHeadTransaction) -> Result<(), SyncStateError> {
-        require_head_count(pending.observed_heads.len())?;
-        let mut bytes = Vec::with_capacity(OUTBOX_HEADER_BYTES + pending.observed_heads.len() * 64);
+    pub fn save_outbox(&self, pending: &PendingHeadBatch) -> Result<(), SyncStateError> {
+        validate_outbox(pending)?;
+        let mask_bytes = observed_mask_bytes(pending.observed_heads.len());
+        let mut bytes = Vec::with_capacity(
+            OUTBOX_HEADER_BYTES
+                + pending.entries.len() * (OUTBOX_ENTRY_FIXED_BYTES + mask_bytes)
+                + pending.observed_heads.len() * 64,
+        );
         bytes.extend_from_slice(OUTBOX_MAGIC);
-        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&OUTBOX_FORMAT_VERSION.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&pending.idempotency_key);
-        bytes.extend_from_slice(&pending.new_head);
+        bytes.extend_from_slice(&(pending.entries.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&(pending.observed_heads.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+        for entry in &pending.entries {
+            bytes.extend_from_slice(&entry.idempotency_key);
+            bytes.extend_from_slice(&entry.new_head);
+            bytes.extend_from_slice(&entry.observed_mask);
+        }
         for head in &pending.observed_heads {
             bytes.extend_from_slice(head);
         }
@@ -136,7 +237,13 @@ impl MachineSyncStore {
 }
 
 fn decode_state(bytes: &[u8]) -> Result<SyncState, SyncStateError> {
-    require_header(bytes, STATE_MAGIC, STATE_HEADER_BYTES, "state")?;
+    require_header(
+        bytes,
+        STATE_MAGIC,
+        STATE_FORMAT_VERSION,
+        STATE_HEADER_BYTES,
+        "state",
+    )?;
     let count = read_u32(bytes, 24) as usize;
     require_zero(&bytes[28..32], "state reserved bytes")?;
     let heads = decode_heads(bytes, STATE_HEADER_BYTES, count, "state")?;
@@ -147,20 +254,172 @@ fn decode_state(bytes: &[u8]) -> Result<SyncState, SyncStateError> {
     })
 }
 
-fn decode_outbox(bytes: &[u8]) -> Result<PendingHeadTransaction, SyncStateError> {
-    require_header(bytes, OUTBOX_MAGIC, OUTBOX_HEADER_BYTES, "outbox")?;
-    let count = read_u32(bytes, 88) as usize;
-    require_zero(&bytes[92..96], "outbox reserved bytes")?;
-    Ok(PendingHeadTransaction {
-        idempotency_key: bytes[8..24].try_into().unwrap(),
-        new_head: bytes[24..88].try_into().unwrap(),
-        observed_heads: decode_heads(bytes, OUTBOX_HEADER_BYTES, count, "outbox")?,
-    })
+fn decode_outbox(bytes: &[u8]) -> Result<PendingHeadBatch, SyncStateError> {
+    require_header(
+        bytes,
+        OUTBOX_MAGIC,
+        OUTBOX_FORMAT_VERSION,
+        OUTBOX_HEADER_BYTES,
+        "outbox",
+    )?;
+    let entry_count = read_u32(bytes, 8) as usize;
+    let observed_count = read_u32(bytes, 12) as usize;
+    require_head_count(entry_count)?;
+    require_head_count(observed_count)?;
+    if entry_count == 0 {
+        return Err(SyncStateError::Invalid {
+            object: "outbox",
+            reason: "transaction batch is empty",
+        });
+    }
+    require_zero(&bytes[16..32], "outbox reserved bytes")?;
+    let mask_bytes = observed_mask_bytes(observed_count);
+    let entry_bytes = OUTBOX_ENTRY_FIXED_BYTES + mask_bytes;
+    let entries_end = OUTBOX_HEADER_BYTES
+        .checked_add(entry_count * entry_bytes)
+        .ok_or(SyncStateError::Invalid {
+            object: "outbox",
+            reason: "transaction count overflows",
+        })?;
+    let expected = entries_end
+        .checked_add(observed_count * 64)
+        .ok_or(SyncStateError::Invalid {
+            object: "outbox",
+            reason: "observed head count overflows",
+        })?;
+    if bytes.len() != expected {
+        return Err(SyncStateError::Invalid {
+            object: "outbox",
+            reason: "length does not match counts",
+        });
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    let mut idempotency_keys = BTreeSet::new();
+    let mut new_heads = BTreeSet::new();
+    for bytes in bytes[OUTBOX_HEADER_BYTES..entries_end].chunks_exact(entry_bytes) {
+        let entry = PendingHead {
+            idempotency_key: bytes[..16].try_into().unwrap(),
+            new_head: bytes[16..80].try_into().unwrap(),
+            observed_mask: bytes[80..].to_vec(),
+        };
+        if entry.new_head == [0; 64] {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "new head is the implicit zero operation",
+            });
+        }
+        if !idempotency_keys.insert(entry.idempotency_key) {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "idempotency keys are not unique",
+            });
+        }
+        if !new_heads.insert(entry.new_head) {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "new heads are not unique",
+            });
+        }
+        entries.push(entry);
+    }
+    let batch = PendingHeadBatch {
+        entries,
+        observed_heads: decode_heads(bytes, entries_end, observed_count, "outbox")?,
+    };
+    validate_outbox(&batch)?;
+    Ok(batch)
+}
+
+fn validate_outbox(pending: &PendingHeadBatch) -> Result<(), SyncStateError> {
+    require_head_count(pending.entries.len())?;
+    require_head_count(pending.observed_heads.len())?;
+    if pending.entries.is_empty() {
+        return Err(SyncStateError::Invalid {
+            object: "outbox",
+            reason: "transaction batch is empty",
+        });
+    }
+    let mask_bytes = observed_mask_bytes(pending.observed_heads.len());
+    let mut idempotency_keys = BTreeSet::new();
+    let mut new_heads = BTreeSet::new();
+    for entry in &pending.entries {
+        if entry.new_head == [0; 64] {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "new head is the implicit zero operation",
+            });
+        }
+        if !new_heads.insert(entry.new_head) {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "new heads are not unique",
+            });
+        }
+        if !idempotency_keys.insert(entry.idempotency_key) {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "idempotency keys are not unique",
+            });
+        }
+        if entry.observed_mask.len() != mask_bytes {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "observed mask length does not match head count",
+            });
+        }
+        let remainder = pending.observed_heads.len() % 8;
+        if remainder != 0
+            && entry
+                .observed_mask
+                .last()
+                .is_some_and(|byte| byte & !((1_u8 << remainder) - 1) != 0)
+        {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "observed mask has noncanonical trailing bits",
+            });
+        }
+    }
+    for index in 0..pending.observed_heads.len() {
+        if !pending
+            .entries
+            .iter()
+            .any(|entry| mask_contains(&entry.observed_mask, index))
+        {
+            return Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "observed head table contains an unused entry",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn observed_mask_bytes(head_count: usize) -> usize {
+    head_count.div_ceil(8)
+}
+
+fn encode_observed_mask(
+    all_heads: &BTreeSet<ObjectId>,
+    observed_heads: &BTreeSet<ObjectId>,
+) -> Vec<u8> {
+    let mut mask = vec![0; observed_mask_bytes(all_heads.len())];
+    for (index, head) in all_heads.iter().enumerate() {
+        if observed_heads.contains(head) {
+            mask[index / 8] |= 1 << (index % 8);
+        }
+    }
+    mask
+}
+
+fn mask_contains(mask: &[u8], index: usize) -> bool {
+    mask[index / 8] & (1 << (index % 8)) != 0
 }
 
 fn require_header(
     bytes: &[u8],
     magic: &[u8; 4],
+    version: u16,
     header_bytes: usize,
     object: &'static str,
 ) -> Result<(), SyncStateError> {
@@ -176,7 +435,7 @@ fn require_header(
             reason: "magic does not match",
         });
     }
-    if u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != FORMAT_VERSION {
+    if u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != version {
         return Err(SyncStateError::Invalid {
             object,
             reason: "version is unsupported",
@@ -367,11 +626,19 @@ mod tests {
             catalog_sequence: 12,
             accepted_heads: BTreeSet::from([[1; 64], [2; 64]]),
         };
-        let pending = PendingHeadTransaction {
-            idempotency_key: [3; 16],
-            new_head: [4; 64],
-            observed_heads: BTreeSet::from([[1; 64], [2; 64]]),
-        };
+        let pending = PendingHeadBatch::from_transactions(vec![
+            PendingHeadTransaction {
+                idempotency_key: [3; 16],
+                new_head: [4; 64],
+                observed_heads: BTreeSet::from([[1; 64], [2; 64]]),
+            },
+            PendingHeadTransaction {
+                idempotency_key: [5; 16],
+                new_head: [6; 64],
+                observed_heads: BTreeSet::from([[2; 64]]),
+            },
+        ])
+        .unwrap();
         store.save_state(&state).unwrap();
         store.save_outbox(&pending).unwrap();
 
@@ -396,22 +663,55 @@ mod tests {
             })
         ));
 
-        let pending = PendingHeadTransaction {
-            idempotency_key: [3; 16],
-            new_head: [4; 64],
-            observed_heads: BTreeSet::from([[1; 64], [2; 64]]),
-        };
+        let pending = PendingHeadBatch::from_transactions(vec![
+            PendingHeadTransaction {
+                idempotency_key: [3; 16],
+                new_head: [4; 64],
+                observed_heads: BTreeSet::from([[1; 64], [2; 64]]),
+            },
+            PendingHeadTransaction {
+                idempotency_key: [5; 16],
+                new_head: [6; 64],
+                observed_heads: BTreeSet::from([[2; 64]]),
+            },
+        ])
+        .unwrap();
         store.save_outbox(&pending).unwrap();
         let path = store.directory().join("outbox");
         let mut bytes = fs::read(&path).unwrap();
-        bytes[OUTBOX_HEADER_BYTES..OUTBOX_HEADER_BYTES + 64].fill(2);
-        bytes[OUTBOX_HEADER_BYTES + 64..].fill(1);
+        let entry_bytes = OUTBOX_ENTRY_FIXED_BYTES + 1;
+        bytes[OUTBOX_HEADER_BYTES + entry_bytes + 16..OUTBOX_HEADER_BYTES + 2 * entry_bytes - 1]
+            .fill(4);
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            store.load_outbox(),
+            Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "new heads are not unique"
+            })
+        ));
+
+        store.save_outbox(&pending).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[OUTBOX_HEADER_BYTES + OUTBOX_ENTRY_FIXED_BYTES] |= 0x80;
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            store.load_outbox(),
+            Err(SyncStateError::Invalid {
+                object: "outbox",
+                reason: "observed mask has noncanonical trailing bits"
+            })
+        ));
+
+        store.save_outbox(&pending).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[OUTBOX_HEADER_BYTES + OUTBOX_ENTRY_FIXED_BYTES] &= !1;
         fs::write(path, bytes).unwrap();
         assert!(matches!(
             store.load_outbox(),
             Err(SyncStateError::Invalid {
                 object: "outbox",
-                reason: "heads are not sorted"
+                reason: "observed head table contains an unused entry"
             })
         ));
     }

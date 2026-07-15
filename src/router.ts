@@ -5,6 +5,7 @@ import {
   readBoundedBody,
 } from "./pack_protocol";
 import { MAX_PROJECTION_REQUEST_BYTES } from "./projection_protocol";
+import { MAX_OBJECT_INVENTORY_REQUEST_BYTES } from "./object_protocol";
 import { Env } from "./repository";
 
 const REPOSITORY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
@@ -36,6 +37,9 @@ export default {
         url.pathname,
       );
     const packCatalogMatch = /^\/repositories\/([^/]+)\/packs$/.exec(url.pathname);
+    const objectInventoryMatch = /^\/repositories\/([^/]+)\/objects\/inventory$/.exec(
+      url.pathname,
+    );
     const initializeMatch = /^\/repositories\/([^/]+)\/initialize$/.exec(url.pathname);
     const repository =
       chunkMatch?.[1] ??
@@ -46,6 +50,7 @@ export default {
       projectionPushMatch?.[1] ??
       projectionPushActionMatch?.[1] ??
       packCatalogMatch?.[1] ??
+      objectInventoryMatch?.[1] ??
       initializeMatch?.[1];
     const packId = chunkMatch?.[2] ?? packMatch?.[2];
     if (repository === undefined) return errorResponse(404, "not found");
@@ -65,6 +70,15 @@ export default {
           return errorResponse(400, error instanceof Error ? error.message : "invalid manifest body");
         }
         return rpcResponse(await stub.putPackManifest(packId, bytes));
+      }
+      if (objectInventoryMatch !== null && request.method === "POST") {
+        const body = await readJsonBody(
+          request,
+          MAX_OBJECT_INVENTORY_REQUEST_BYTES,
+          "object inventory request",
+        );
+        if (body instanceof Response) return body;
+        return rpcResponse(await stub.inventoryObjects(body));
       }
       if (packCatalogMatch !== null && request.method === "GET") {
         const after = url.searchParams.get("after") ?? "0";

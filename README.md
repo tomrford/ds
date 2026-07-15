@@ -29,7 +29,9 @@ and transactions use `/repositories/:repository/heads`, and an authenticated
 POST on `/repositories/:repository/initialize` assigns the incarnation. An
 incarnation-scoped, paginated GET on `/repositories/:repository/packs` lists
 installed logical packs; their exact manifests and chunks are downloadable
-from the same pack routes.
+from the same pack routes. A bounded POST on
+`/repositories/:repository/objects/inventory` returns the installed subset of
+the machine's sorted candidate object keys for that incarnation.
 
 ## Current boundary
 
@@ -62,10 +64,13 @@ do not replace jj's operation-head store.
 
 The native sync engine uses that sidecar around one transport contract. It
 replays pending head work first, installs new cloud packs, asks stock jj to
-reconcile, uploads the newly discovered local closure, and persists the exact
-head request before sending it. `HttpTransport` implements that contract over
-the Worker protocol; the ignored `cloud_live` test converges 2 machines
-through a real Worker via `DEVSPACE_URL` and `DEVSPACE_TOKEN`.
+reconcile, negotiates and uploads only cloud-missing objects, and persists an
+ordered transaction batch for every unaccepted local head before sending it.
+Each transaction observes only pre-batch cloud heads in its own ancestry, so
+publishing one sibling does not remove another. Accepted batches trigger
+bounded, manifest-first local pack cleanup. `HttpTransport` implements that
+contract over the Worker protocol; the ignored `cloud_live` test converges 2
+machines through a real Worker via `DEVSPACE_URL` and `DEVSPACE_TOKEN`.
 
 Deleting a fully synchronized machine copy and its sync sidecar is recoverable:
 a fresh stock repository downloads the cloud catalog, installs canonical

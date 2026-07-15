@@ -4,13 +4,13 @@ use std::collections::BTreeSet;
 
 use serde::Deserialize;
 
-use crate::object_closure::ObjectId;
+use crate::object_closure::{ObjectId, ObjectKey};
 use crate::pack_manifest::MAX_MANIFEST_BYTES;
 use crate::sync_engine::{
     CloudHeads, DownloadedPack, HeadTransactionResult, PackCatalogEntry, PackCatalogPage,
     SyncTransport, TransportError,
 };
-use crate::{MAX_CHUNK_BYTES, PackManifest, PendingHeadTransaction};
+use crate::{MAX_CHUNK_BYTES, ObjectKind, PackManifest, PendingHeadTransaction};
 
 const MAX_JSON_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
@@ -23,12 +23,14 @@ pub struct HttpTransport {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HeadsResponse {
     cursor: u64,
     heads: Vec<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CatalogResponse {
     packs: Vec<CatalogEntry>,
     #[serde(rename = "nextAfter")]
@@ -39,14 +41,29 @@ struct CatalogResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CatalogEntry {
     sequence: u64,
     id: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InventoryResponse {
+    objects: Vec<InventoryObject>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InventoryObject {
+    kind: u8,
+    id: String,
 }
 
 impl HttpTransport {
@@ -138,6 +155,39 @@ async fn read_json<T: serde::de::DeserializeOwned>(
 }
 
 impl SyncTransport for HttpTransport {
+    async fn inventory_objects(
+        &mut self,
+        candidates: &[ObjectKey],
+    ) -> Result<BTreeSet<ObjectKey>, TransportError> {
+        let url = format!("{}/objects/inventory", self.repository_url);
+        let body = serde_json::json!({
+            "incarnation": self.incarnation,
+            "objects": candidates
+                .iter()
+                .map(|object| serde_json::json!({
+                    "kind": object.kind as u8,
+                    "id": hex_bytes(&object.id),
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let response = self.send(self.client.post(url).json(&body)).await?;
+        let response = read_json::<InventoryResponse>(response).await?;
+        let mut objects = BTreeSet::new();
+        let mut previous = None;
+        for object in response.objects {
+            let key = ObjectKey {
+                kind: parse_object_kind(object.kind)?,
+                id: parse_object_id(&object.id)?,
+            };
+            if previous.is_some_and(|previous| previous >= key) {
+                return Err("cloud object inventory is not strictly sorted and unique".into());
+            }
+            previous = Some(key);
+            objects.insert(key);
+        }
+        Ok(objects)
+    }
+
     async fn list_packs(
         &mut self,
         after: u64,
@@ -268,8 +318,12 @@ fn parse_heads(response: HeadsResponse) -> Result<CloudHeads, TransportError> {
 }
 
 fn parse_object_id(value: &str) -> Result<ObjectId, TransportError> {
-    if value.len() != 128 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("cloud ID must be 128 hex characters, got {value:?}").into());
+    if value.len() != 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(format!("cloud ID must be 128 lowercase hex characters, got {value:?}").into());
     }
     let mut id = [0; 64];
     for (index, byte) in id.iter_mut().enumerate() {
@@ -277,6 +331,18 @@ fn parse_object_id(value: &str) -> Result<ObjectId, TransportError> {
             .map_err(|error| format!("invalid cloud ID {value:?}: {error}"))?;
     }
     Ok(id)
+}
+
+fn parse_object_kind(value: u8) -> Result<ObjectKind, TransportError> {
+    match value {
+        0 => Ok(ObjectKind::File),
+        1 => Ok(ObjectKind::Symlink),
+        2 => Ok(ObjectKind::Tree),
+        3 => Ok(ObjectKind::Commit),
+        4 => Ok(ObjectKind::View),
+        5 => Ok(ObjectKind::Operation),
+        _ => Err(format!("cloud object kind must be from 0 through 5, got {value}").into()),
+    }
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {

@@ -4,6 +4,10 @@ import { describe, expect, it } from "vitest";
 import jjGolden from "../crates/kernel/tests/jj_golden.txt?raw";
 import { MAX_HEAD_REQUEST_BYTES, MAX_OBSERVED_HEADS } from "../src/head_protocol";
 import { KIND, Kernel, isKindName, toHex } from "../src/kernel";
+import {
+  MAX_OBJECT_INVENTORY_KEYS,
+  MAX_OBJECT_INVENTORY_REQUEST_BYTES,
+} from "../src/object_protocol";
 import { MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, decodeManifest } from "../src/pack_protocol";
 
 const authorization = { authorization: "Bearer test-token" };
@@ -459,6 +463,95 @@ describe("cloud pack download", () => {
     const missing = await fetchPackChunk(repository, "00".repeat(64), 0, incarnation);
     expect(missing.status).toBe(404);
     expect(await missing.json()).toEqual({ error: "installed pack chunk does not exist" });
+  });
+});
+
+describe("cloud object inventory", () => {
+  const incarnation = "34".repeat(16);
+
+  it("returns the installed subset of a bounded canonical candidate set", async () => {
+    const repository = "object-inventory";
+    await env.REPOSITORIES.getByName(repository).initializeRepository(incarnation);
+    expect(await installObject(repository, KIND.file, hello)).toBe(helloId);
+    const missingFile = "ff".repeat(64);
+    const missingOperation = "01".repeat(64);
+
+    expect(
+      await objectInventory(repository, {
+        incarnation,
+        objects: [
+          { kind: KIND.file, id: helloId },
+          { kind: KIND.file, id: missingFile },
+          { kind: KIND.operation, id: missingOperation },
+        ],
+      }),
+    ).toEqual({
+      status: 200,
+      body: { objects: [{ kind: KIND.file, id: helloId }] },
+    });
+    expect(
+      await objectInventory(repository, {
+        incarnation: "35".repeat(16),
+        objects: [{ kind: KIND.file, id: helloId }],
+      }),
+    ).toEqual({
+      status: 409,
+      body: { error: "repository incarnation does not match" },
+    });
+  });
+
+  it("rejects noncanonical, oversized and inexact inventory requests", async () => {
+    const repository = "object-inventory-validation";
+    const stub = env.REPOSITORIES.getByName(repository);
+    await stub.initializeRepository(incarnation);
+    expect(
+      await objectInventory(repository, {
+        incarnation,
+        objects: [{ kind: KIND.operation, id: "01".repeat(64) }],
+        unexpected: true,
+      }),
+    ).toEqual({
+      status: 400,
+      body: {
+        error: "object inventory request fields must be exactly incarnation, objects",
+      },
+    });
+    expect(
+      await objectInventory(repository, {
+        incarnation,
+        objects: [
+          { kind: KIND.operation, id: "02".repeat(64) },
+          { kind: KIND.operation, id: "01".repeat(64) },
+        ],
+      }),
+    ).toEqual({
+      status: 400,
+      body: { error: "objects must be strictly sorted and unique" },
+    });
+    expect(
+      await stub.inventoryObjects({
+        incarnation,
+        objects: Array.from({ length: MAX_OBJECT_INVENTORY_KEYS + 1 }, (_, index) => ({
+          kind: KIND.file,
+          id: index.toString(16).padStart(128, "0"),
+        })),
+      }),
+    ).toMatchObject({
+      ok: false,
+      status: 400,
+      error: `objects exceeds the ${MAX_OBJECT_INVENTORY_KEYS}-object limit`,
+    });
+    expect(
+      await objectInventoryRaw(
+        repository,
+        new TextEncoder().encode("x".repeat(MAX_OBJECT_INVENTORY_REQUEST_BYTES + 1)),
+      ),
+    ).toEqual({
+      status: 400,
+      body: {
+        error: `object inventory request exceeds ${MAX_OBJECT_INVENTORY_REQUEST_BYTES} byte limit`,
+      },
+    });
   });
 });
 
@@ -1174,6 +1267,21 @@ async function getHeads(repository: string, incarnation: string) {
       `https://example.com/repositories/${repository}/heads?incarnation=${incarnation}`,
       { headers: authorization },
     ),
+  );
+  return { status: response.status, body: await response.json() };
+}
+
+async function objectInventory(repository: string, body: unknown) {
+  return objectInventoryRaw(repository, new TextEncoder().encode(JSON.stringify(body)));
+}
+
+async function objectInventoryRaw(repository: string, body: Uint8Array) {
+  const response = await exports.default.fetch(
+    new Request(`https://example.com/repositories/${repository}/objects/inventory`, {
+      method: "POST",
+      headers: { ...authorization, "content-type": "application/json" },
+      body,
+    }),
   );
   return { status: response.status, body: await response.json() };
 }

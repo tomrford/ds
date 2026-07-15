@@ -4,9 +4,9 @@ use std::fs;
 use std::rc::Rc;
 
 use devspace_machine::{
-    CloudHeads, DownloadedPack, MachineRepository, MachineSyncStore, ObjectId, PackCatalogEntry,
-    PackCatalogPage, PackOptions, PendingHeadTransaction, SyncEngine, SyncTransport,
-    TransportError,
+    CloudHeads, DownloadedPack, MachineRepository, MachineSyncStore, ObjectId, ObjectKey,
+    PackCatalogEntry, PackCatalogPage, PackManifest, PackOptions, PendingHeadBatch,
+    PendingHeadTransaction, SyncEngine, SyncTransport, TransportError,
 };
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
@@ -60,8 +60,10 @@ enum FaultBoundary {
     UploadManifest,
     UploadChunk,
     Install,
+    InventoryResponse,
     HeadRequest,
     HeadResponse,
+    SecondHeadRequest,
 }
 
 #[derive(Default)]
@@ -96,6 +98,11 @@ struct FakeTransport {
     cloud: Rc<RefCell<FakeCloud>>,
     fault: Option<FaultBoundary>,
     list_calls: usize,
+    inventory_calls: usize,
+    upload_manifest_calls: usize,
+    head_request_calls: usize,
+    concurrent_repository: Option<std::sync::Arc<jj_lib::repo::ReadonlyRepo>>,
+    injected_heads: Vec<ObjectId>,
 }
 
 impl FakeTransport {
@@ -104,7 +111,20 @@ impl FakeTransport {
             cloud,
             fault,
             list_calls: 0,
+            inventory_calls: 0,
+            upload_manifest_calls: 0,
+            head_request_calls: 0,
+            concurrent_repository: None,
+            injected_heads: Vec::new(),
         }
+    }
+
+    fn with_concurrent_operations(
+        mut self,
+        repository: std::sync::Arc<jj_lib::repo::ReadonlyRepo>,
+    ) -> Self {
+        self.concurrent_repository = Some(repository);
+        self
     }
 
     fn maybe_fail(&mut self, boundary: FaultBoundary) -> Result<(), TransportError> {
@@ -118,6 +138,49 @@ impl FakeTransport {
 }
 
 impl SyncTransport for FakeTransport {
+    async fn inventory_objects(
+        &mut self,
+        candidates: &[ObjectKey],
+    ) -> Result<BTreeSet<ObjectKey>, TransportError> {
+        self.inventory_calls += 1;
+        if let Some(repository) = self.concurrent_repository.take() {
+            let root = repository.store().root_commit_id().clone();
+            let mut left = repository.start_transaction();
+            let mut right = repository.start_transaction();
+            for (transaction, name) in [
+                (&mut left, "concurrent-left"),
+                (&mut right, "concurrent-right"),
+            ] {
+                transaction.repo_mut().set_remote_bookmark(
+                    RemoteRefSymbol {
+                        name: RefName::new(name),
+                        remote: "origin".as_ref(),
+                    },
+                    RemoteRef {
+                        target: RefTarget::normal(root.clone()),
+                        state: RemoteRefState::New,
+                    },
+                );
+            }
+            let left = left.commit("concurrent left").await?;
+            let right = right.commit("concurrent right").await?;
+            self.injected_heads = vec![
+                left.op_id().as_bytes().try_into().unwrap(),
+                right.op_id().as_bytes().try_into().unwrap(),
+            ];
+            self.injected_heads.sort_unstable();
+        }
+        assert!(candidates.windows(2).all(|keys| keys[0] < keys[1]));
+        let installed = installed_object_keys(&self.cloud.borrow());
+        let response = candidates
+            .iter()
+            .filter(|key| installed.contains(key))
+            .copied()
+            .collect();
+        self.maybe_fail(FaultBoundary::InventoryResponse)?;
+        Ok(response)
+    }
+
     async fn list_packs(
         &mut self,
         after: u64,
@@ -166,6 +229,7 @@ impl SyncTransport for FakeTransport {
     }
 
     async fn upload_manifest(&mut self, id: ObjectId, bytes: &[u8]) -> Result<(), TransportError> {
+        self.upload_manifest_calls += 1;
         let mut cloud = self.cloud.borrow_mut();
         let upload = cloud.uploads.entry(id).or_default();
         if let Some(existing) = &upload.manifest {
@@ -235,7 +299,12 @@ impl SyncTransport for FakeTransport {
         &mut self,
         pending: &PendingHeadTransaction,
     ) -> Result<CloudHeads, TransportError> {
+        self.head_request_calls += 1;
         self.maybe_fail(FaultBoundary::HeadRequest)?;
+        if self.fault == Some(FaultBoundary::SecondHeadRequest) && self.head_request_calls == 2 {
+            self.fault = None;
+            return Err(std::io::Error::other("lost second head request").into());
+        }
         let replay = self
             .cloud
             .borrow()
@@ -288,6 +357,21 @@ impl SyncTransport for FakeTransport {
     }
 }
 
+fn installed_object_keys(cloud: &FakeCloud) -> BTreeSet<ObjectKey> {
+    cloud
+        .installed
+        .iter()
+        .flat_map(|pack| {
+            PackManifest::decode(&pack.manifest)
+                .unwrap()
+                .objects()
+                .iter()
+                .map(|object| object.key)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 async fn operation_is_ancestor(
     op_store: &std::sync::Arc<dyn jj_lib::op_store::OpStore>,
     descendant: ObjectId,
@@ -327,6 +411,10 @@ async fn run_until_success(
     panic!("one-shot fault did not recover");
 }
 
+fn pending_batch(transaction: PendingHeadTransaction) -> PendingHeadBatch {
+    PendingHeadBatch::from_transactions(vec![transaction]).unwrap()
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn two_offline_machines_converge_across_every_remote_retry_boundary() {
     for boundary in [
@@ -335,6 +423,7 @@ async fn two_offline_machines_converge_across_every_remote_retry_boundary() {
         FaultBoundary::UploadManifest,
         FaultBoundary::UploadChunk,
         FaultBoundary::Install,
+        FaultBoundary::InventoryResponse,
         FaultBoundary::HeadRequest,
         FaultBoundary::HeadResponse,
     ] {
@@ -358,7 +447,7 @@ async fn two_offline_machines_converge_across_every_remote_retry_boundary() {
         )
         .await;
         let pending = cloud.borrow().receipts.values().next().unwrap().0.clone();
-        left_state.save_outbox(&pending).unwrap();
+        left_state.save_outbox(&pending_batch(pending)).unwrap();
         let mut clear_retry = FakeTransport::new(cloud.clone(), None);
         run_until_success(
             &mut left,
@@ -400,7 +489,224 @@ async fn two_offline_machines_converge_across_every_remote_retry_boundary() {
         );
         assert!(left_state.load_outbox().unwrap().is_none());
         assert!(right_state.load_outbox().unwrap().is_none());
+        assert!(
+            fs::read_dir(temp.path().join("left-packs"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(
+            fs::read_dir(temp.path().join("right-packs"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unchanged_closure_outbox_replay_uploads_zero_objects_and_collects_local_packs() {
+    let temp = tempfile::tempdir().unwrap();
+    let machine = temp.path().join("machine");
+    fs::create_dir(&machine).unwrap();
+    let repository_path = machine.join("repo");
+    let mut repository = offline_machine(&repository_path, "operation-0").await;
+    for index in 1..32 {
+        commit_offline_operation(&repository, &format!("operation-{index}")).await;
+        drop(repository);
+        repository = MachineRepository::open(&repository_path, &settings())
+            .await
+            .unwrap();
+    }
+    let state_store = MachineSyncStore::open(machine.join("sync")).unwrap();
+    let packs = machine.join("packs");
+    let cloud = Rc::new(RefCell::new(
+        FakeCloud::new(&temp.path().join("cloud-objects")).await,
+    ));
+
+    let mut first = FakeTransport::new(cloud.clone(), None);
+    run_until_success(&mut repository, &state_store, &packs, &mut first).await;
+    let object_count = installed_object_keys(&cloud.borrow()).len();
+    assert!(object_count >= 64);
+    let transaction = cloud.borrow().receipts.values().next().unwrap().0.clone();
+    state_store
+        .save_outbox(&pending_batch(transaction))
+        .unwrap();
+
+    let mut replay = FakeTransport::new(cloud.clone(), None);
+    SyncEngine::new(&mut repository, &state_store, &packs, &mut replay)
+        .with_pack_options(PackOptions {
+            pack_objects: 1,
+            ..PackOptions::default()
+        })
+        .run()
+        .await
+        .unwrap();
+
+    assert!(replay.inventory_calls > 0);
+    assert_eq!(replay.upload_manifest_calls, 0);
+    assert!(state_store.load_outbox().unwrap().is_none());
+    assert!(fs::read_dir(packs).unwrap().next().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_divergent_local_heads_publish_as_siblings_in_one_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let machine = temp.path().join("machine");
+    fs::create_dir(&machine).unwrap();
+    let mut repository = offline_machine(&machine.join("repo"), "base").await;
+    let state_store = MachineSyncStore::open(machine.join("sync")).unwrap();
+    let packs = machine.join("packs");
+    let cloud = Rc::new(RefCell::new(
+        FakeCloud::new(&temp.path().join("cloud-objects")).await,
+    ));
+    let mut transport = FakeTransport::new(cloud.clone(), None)
+        .with_concurrent_operations(repository.repo().clone());
+
+    let state = SyncEngine::new(&mut repository, &state_store, &packs, &mut transport)
+        .with_pack_options(PackOptions {
+            pack_objects: 1,
+            ..PackOptions::default()
+        })
+        .run()
+        .await
+        .unwrap();
+
+    let expected = transport
+        .injected_heads
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected.len(), 2);
+    assert_eq!(cloud.borrow().heads, expected);
+    assert_eq!(state.accepted_heads, expected);
+    assert_eq!(state.cloud_cursor, 2);
+    assert!(
+        cloud
+            .borrow()
+            .receipts
+            .values()
+            .all(|(request, _)| request.observed_heads.is_empty())
+    );
+    assert!(state_store.load_outbox().unwrap().is_none());
+    assert!(fs::read_dir(packs).unwrap().next().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_concurrent_heads_observe_only_their_proven_cloud_ancestors() {
+    let temp = tempfile::tempdir().unwrap();
+    let cloud = Rc::new(RefCell::new(
+        FakeCloud::new(&temp.path().join("cloud-objects")).await,
+    ));
+
+    let remote_machine = temp.path().join("remote-machine");
+    fs::create_dir(&remote_machine).unwrap();
+    let mut remote = offline_machine(&remote_machine.join("repo"), "remote").await;
+    let remote_state = MachineSyncStore::open(remote_machine.join("sync")).unwrap();
+    let mut remote_transport = FakeTransport::new(cloud.clone(), None);
+    run_until_success(
+        &mut remote,
+        &remote_state,
+        &remote_machine.join("packs"),
+        &mut remote_transport,
+    )
+    .await;
+    let observed = cloud.borrow().heads.clone();
+    assert_eq!(observed.len(), 1);
+
+    let local_machine = temp.path().join("local-machine");
+    fs::create_dir(&local_machine).unwrap();
+    let mut local = offline_machine(&local_machine.join("repo"), "local").await;
+    let local_state = MachineSyncStore::open(local_machine.join("sync")).unwrap();
+    let packs = local_machine.join("packs");
+    let mut transport =
+        FakeTransport::new(cloud.clone(), None).with_concurrent_operations(local.repo().clone());
+    let state = SyncEngine::new(&mut local, &local_state, &packs, &mut transport)
+        .with_pack_options(PackOptions {
+            pack_objects: 1,
+            ..PackOptions::default()
+        })
+        .run()
+        .await
+        .unwrap();
+
+    let injected = transport
+        .injected_heads
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(injected.len(), 2);
+    assert!(injected.is_subset(&cloud.borrow().heads));
+    assert_eq!(cloud.borrow().heads.len(), 3);
+    assert_eq!(state.accepted_heads, cloud.borrow().heads);
+    let mut transactions = cloud
+        .borrow()
+        .receipts
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    transactions.sort_unstable_by_key(|(_, response)| response.cursor);
+    let new_transactions = &transactions[1..];
+    let ancestry_covering = new_transactions
+        .iter()
+        .find(|(request, _)| request.observed_heads == observed)
+        .unwrap();
+    assert!(!injected.contains(&ancestry_covering.0.new_head));
+    assert!(
+        new_transactions
+            .iter()
+            .filter(|(request, _)| injected.contains(&request.new_head))
+            .all(|(request, _)| request.observed_heads.is_empty())
+    );
+    assert!(local_state.load_outbox().unwrap().is_none());
+    assert!(fs::read_dir(packs).unwrap().next().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn crash_between_divergent_head_transactions_replays_the_remaining_sibling() {
+    let temp = tempfile::tempdir().unwrap();
+    let machine = temp.path().join("machine");
+    fs::create_dir(&machine).unwrap();
+    let mut repository = offline_machine(&machine.join("repo"), "base").await;
+    let state_store = MachineSyncStore::open(machine.join("sync")).unwrap();
+    let packs = machine.join("packs");
+    let cloud = Rc::new(RefCell::new(
+        FakeCloud::new(&temp.path().join("cloud-objects")).await,
+    ));
+    let mut interrupted = FakeTransport::new(cloud.clone(), Some(FaultBoundary::SecondHeadRequest))
+        .with_concurrent_operations(repository.repo().clone());
+
+    let error = SyncEngine::new(&mut repository, &state_store, &packs, &mut interrupted)
+        .with_pack_options(PackOptions {
+            pack_objects: 1,
+            ..PackOptions::default()
+        })
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        devspace_machine::SyncEngineError::Transport(_)
+    ));
+    let expected = interrupted
+        .injected_heads
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(cloud.borrow().heads.len(), 1);
+    let queued = state_store.load_outbox().unwrap().unwrap();
+    assert_eq!(queued.entries.len(), 1);
+
+    let mut replay = FakeTransport::new(cloud.clone(), None);
+    let state = SyncEngine::new(&mut repository, &state_store, &packs, &mut replay)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(cloud.borrow().heads, expected);
+    assert_eq!(state.accepted_heads, expected);
+    assert_eq!(state.cloud_cursor, 2);
+    assert!(state_store.load_outbox().unwrap().is_none());
+    assert!(fs::read_dir(packs).unwrap().next().is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -504,7 +810,10 @@ async fn command_boundaries_recover_work_with_no_outbox_or_daemon() {
     drop(engine);
 
     let queued = state_store.load_outbox().unwrap().unwrap();
-    assert_eq!(queued.new_head.as_slice(), first_operation.as_bytes());
+    assert_eq!(
+        queued.entries[0].new_head.as_slice(),
+        first_operation.as_bytes()
+    );
     assert_eq!(cloud.borrow().cursor, 0);
     assert!(cloud.borrow().heads.is_empty());
 
@@ -520,14 +829,17 @@ async fn command_boundaries_recover_work_with_no_outbox_or_daemon() {
     let (replayed_request, replayed_response) = cloud
         .borrow()
         .receipts
-        .get(&queued.idempotency_key)
+        .get(&queued.entries[0].idempotency_key)
         .cloned()
         .unwrap();
-    assert_eq!(replayed_request, queued);
+    assert_eq!(replayed_request, queued.first_transaction().unwrap());
     assert_eq!(replayed_response.cursor, 1);
     assert_eq!(replayed_response.heads, state.accepted_heads);
     assert_eq!(state.cloud_cursor, 1);
-    assert_eq!(state.accepted_heads, BTreeSet::from([queued.new_head]));
+    assert_eq!(
+        state.accepted_heads,
+        BTreeSet::from([queued.entries[0].new_head])
+    );
     assert_eq!(state_store.load_state().unwrap(), state);
     assert_eq!(cloud.borrow().heads, state.accepted_heads);
     assert!(state_store.load_outbox().unwrap().is_none());

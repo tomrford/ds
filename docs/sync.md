@@ -132,6 +132,27 @@ early-install rejection, retry idempotency, transaction rollback after a later
 object fails validation, cross-pack references and eviction between quarantine
 and installation.
 
+## Cloud object inventory
+
+An authenticated POST to
+`/repositories/:repository/objects/inventory` carries the repository
+incarnation and at most 4,096 strictly sorted, unique object keys. The response
+contains the sorted subset already installed in the Durable Object. Large
+closures are split into independent bounded requests by the machine; the
+endpoint never enumerates objects the machine did not ask about.
+
+The response is authoritative for its incarnation. Installed objects are
+content-addressed, immutable and protected by no-clobber checks, so a positive
+answer remains valid across concurrent installs. A concurrent install can make
+a negative answer stale, but the consequence is only an idempotent re-upload.
+A lost response likewise leaves the next pass free to repeat negotiation or
+upload the same immutable bytes.
+
+The Worker decoder requires exact JSON fields, lowercase IDs, canonical key
+ordering and the request byte limit before querying storage. The native HTTP
+decoder applies the same ordering, kind, ID and exact-field checks to the
+response and rejects any returned key outside the request page.
+
 ## Cloud download and native installation
 
 Each installed pack receives an append-only repository-local sequence. An
@@ -244,18 +265,21 @@ keeps the exposed repository aligned with the durable stock head store.
 
 `MachineSyncStore` owns a machine-local sidecar, separate from every stock jj
 store. One file records the last accepted cloud cursor and head set plus the
-installed pack-catalog frontier. A second file records the exact pending head
-transaction: its idempotency key, new head and observed heads. Both formats are
-strict, versioned, bounded to 4,096 heads and reject noncanonical ordering.
+installed pack-catalog frontier. A second file records an ordered batch of
+pending head transactions: each idempotency key and new head plus one shared
+pre-batch cloud-head table and a per-entry subset bitmap. The bitmap keeps the
+4,096 by 4,096 worst case bounded to about 2.6 MiB rather than repeating full
+IDs. Both formats are strict, versioned, bounded to 4,096 heads and reject
+noncanonical ordering and trailing bitmap bits.
 
 The sidecar requires an existing machine-store parent; creating it syncs both
 that parent and the new directory. Writes use a synced temporary file, atomic
 rename and directory sync. Removing the outbox, including a retry after an
-ambiguous removal failure, is also followed by a directory sync. The sync engine will
-hold the sidecar's process lock, write the outbox before sending a head
-transaction, persist the accepted result before clearing it, and repair and
-replay an existing outbox before deriving new work. Missing state starts at the zero
-frontier; malformed state fails closed.
+ambiguous removal failure, is also followed by a directory sync. The sync
+engine holds the sidecar's process lock, writes the complete batch before
+sending its first transaction, persists each accepted result before removing
+that entry, and repairs and replays an existing batch before deriving new work.
+Missing state starts at the zero frontier; malformed state fails closed.
 
 The tests reopen the sidecar to prove cursor, frontier and exact request
 survival, prove outbox clearing is idempotent, and reject truncated or
@@ -264,22 +288,43 @@ noncanonical files.
 ## Native sync engine and fault matrix
 
 One generic engine owns the command or daemon sync pass behind the
-machine-local process lock. It first reuploads the complete closure for an
-existing outbox and replays that exact request, then pages and
-installs cloud packs under one catalog high-water, reads cloud heads, and asks
-stock jj to resolve all local and cloud operation heads. It then discovers the
-remaining local closure, builds and uploads deterministic packs, durably writes
-the exact head request, sends it, persists the returned cursor and heads, and
-only then clears the outbox.
+machine-local process lock. It first negotiates and reuploads any cloud-missing
+objects needed by an existing outbox, drains that exact batch and finishes the
+pass. Otherwise it pages and installs cloud packs under one catalog high-water,
+reads cloud heads, and asks stock jj to resolve all local and cloud operation
+heads. It discovers the remaining local closure, negotiates its installed
+object subset in 4,096-key pages, and builds and uploads only the missing
+objects. The engine rereads the stock head set after upload and repeats this
+snapshot at most 4 times when a concurrent local operation changes it.
+
+Every unaccepted head in the final snapshot gets one transaction. The engine
+walks its local operation ancestry and includes only pre-batch cloud heads
+proven to be its ancestors. Siblings are absent from that table, so sequential
+transactions cannot remove one another; a stale concurrent head also never
+claims a cloud head outside its ancestry. One shared ordered head table plus
+per-entry bitmaps keeps the outbox compact. The whole batch is durable before
+the first request. Each accepted cursor and head set is persisted before that
+entry is removed, so a crash between sibling transactions resumes with the
+exact remaining suffix.
+
+After a batch is fully accepted, or a pass finds no head work, the engine
+removes at most 256 local pack directories. It deletes and syncs the manifest
+first, then removes bounded chunk files, syncs the pack directory, removes it
+and syncs the pack root. A crash can therefore leave only a manifest-less
+directory, which cannot be reused as a valid immutable pack and is eligible for
+the next cleanup pass. Cloud-installed packs remain the rebuild authority.
 
 The transport boundary matches the Worker protocol but remains independent of
 HTTP. Its head authority enforces the same observed-head ancestry rule. A
 deterministic fault transport uses one-object packs and one-pack catalog pages,
-and exercises catalog listing, pack download, lost responses after manifest
-upload, chunk upload, pack install and head mutation, plus failure before the
-head mutation. Re-presenting an already accepted request from the outbox proves
-that a crash before outbox clearing replays the receipt without advancing the
-cloud cursor again.
+and exercises catalog listing, pack download, a lost inventory response, lost
+responses after manifest upload, chunk upload, pack install and head mutation,
+plus failure before the head mutation. Re-presenting an already accepted
+request from the outbox proves that a crash before outbox clearing replays the
+receipt without advancing the cloud cursor again. Separate tests prove an
+unchanged 64-object closure uploads no objects, concurrent divergent local
+heads remain cloud siblings, a crash between their transactions preserves both,
+and manifest-first pack cleanup recovers after an injected fault.
 
 For every boundary, 2 stock repositories create different offline operations.
 The first uploads, the second downloads and merges through jj before uploading
@@ -291,8 +336,8 @@ objects directly or contact one another.
 ## Live Worker transport
 
 `HttpTransport` implements the same transport contract over the Worker's HTTP
-protocol: bearer authentication, incarnation-scoped catalog, manifest and
-chunk routes, and the JSON head transaction. The ignored `cloud_live` test
+protocol: bearer authentication, incarnation-scoped inventory and catalog,
+manifest and chunk routes, and the JSON head transaction. The ignored `cloud_live` test
 runs the two-machine convergence flow against a real Worker — `wrangler dev`
 or a deployment — via `DEVSPACE_URL` and `DEVSPACE_TOKEN`, so
 heads-carrying manifests, pack installation, chunk reconstruction and head
@@ -305,7 +350,7 @@ cross-language proof.
 The rebuild test synchronizes a stock repository, records its operation ID,
 view and complete canonical object-key set, then deletes the entire machine
 copy: native repository, sync sidecar and local packs. A newly initialized
-stock repository starts with no cursor or inventory, downloads every logical
+stock repository starts with no cursor, downloads every logical
 cloud pack and authoritative head through the same engine, and reconstructs
 the exact operation ID, view and object set. Its rebuilt cursor and catalog
 frontier match the cloud and no outbox remains.
@@ -353,12 +398,6 @@ location.
 Known limits carried forward deliberately; each needs a decision or a
 measurement before the affected surface hardens.
 
-- The engine packs against an empty cloud inventory: no endpoint reports which
-  objects the cloud already holds, so every new operation re-uploads its full
-  reachable closure and every sync appends a full-closure pack to the catalog.
-  Idempotent installation keeps this correct, but upload bandwidth and rebuild
-  download cost scale with repository size times sync count. An inventory or
-  negotiation step is the next protocol decision.
 - Worker pack installation verifies and validates an entire pack inside one
   synchronous Durable Object transaction; a full 64 MiB, 65,536-object pack
   may exceed Durable Object CPU budgets. Bounded staged installation is the
@@ -372,9 +411,6 @@ measurement before the affected surface hardens.
 - Untested asserted behavior: receipt expiry and quota enforcement, SQLite
   part-splitting above 1 MiB values, catalog pagination beyond one page,
   no-clobber mismatch on existing native objects, and the 4,096-head bounds.
-- The engine requires exactly one local head after reconciliation, so a
-  concurrent local jj operation during a sync pass fails that pass; the next
-  pass picks it up.
 - One shared bearer token authorizes every route, so any token holder can
   initialize any repository name and claim its incarnation. Repository-scoped
   authorization is control-plane work.

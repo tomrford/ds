@@ -41,6 +41,12 @@ impl MachineRepository {
         &self,
         accepted_operation_heads: &BTreeSet<ObjectId>,
     ) -> Result<ObjectClosure, ObjectClosureError> {
+        let operation_heads = self.current_operation_heads().await?;
+        self.object_closure_from_heads(operation_heads, accepted_operation_heads)
+    }
+
+    /// Reads the canonical ordered head set directly from jj's stock store.
+    pub async fn current_operation_heads(&self) -> Result<Vec<ObjectId>, ObjectClosureError> {
         let mut operation_heads = self
             .repo()
             .op_heads_store()
@@ -51,8 +57,7 @@ impl MachineRepository {
             .collect::<Result<Vec<_>, _>>()?;
         operation_heads.sort_unstable();
         operation_heads.dedup();
-
-        self.object_closure_from_heads(operation_heads, accepted_operation_heads)
+        Ok(operation_heads)
     }
 
     /// Validates and discovers canonical objects reachable from the supplied

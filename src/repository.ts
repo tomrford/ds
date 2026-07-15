@@ -45,6 +45,10 @@ export class Repository extends DurableObject<Env> {
     return this.packs.countInstalledPacks();
   }
 
+  inventoryObjects(value: unknown) {
+    return this.packs.inventoryObjects(value);
+  }
+
   initializeRepository(incarnationValue: unknown) {
     return this.heads.initialize(incarnationValue);
   }
