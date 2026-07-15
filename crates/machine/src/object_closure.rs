@@ -4,6 +4,7 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 use devspace_kernel::{ObjectKind, RawHasher, ValidationError, validate};
+use jj_lib::backend::CommitId;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_heads_store::OpHeadsStoreError;
 use jj_lib::repo::Repo as _;
@@ -64,18 +65,45 @@ impl MachineRepository {
         operation_heads.sort_unstable();
         operation_heads.dedup();
 
-        let root_commit = object_id(
-            "root commit",
-            self.repo().store().root_commit_id().as_bytes(),
-        )?;
-        let mut pending = operation_heads
+        let pending = operation_heads
             .iter()
             .copied()
             .map(|id| ObjectKey {
                 kind: ObjectKind::Operation,
                 id,
             })
-            .collect::<BTreeSet<_>>();
+            .collect();
+        self.discover_object_closure(operation_heads, pending, accepted_operation_heads)
+    }
+
+    /// Discovers canonical commit, tree and leaf objects needed to make public
+    /// projection shadows durable even when no operation references them.
+    pub fn commit_closure(
+        &self,
+        commit_heads: &[CommitId],
+    ) -> Result<ObjectClosure, ObjectClosureError> {
+        let pending = commit_heads
+            .iter()
+            .map(|id| {
+                Ok(ObjectKey {
+                    kind: ObjectKind::Commit,
+                    id: object_id("commit", id.as_bytes())?,
+                })
+            })
+            .collect::<Result<BTreeSet<_>, ObjectClosureError>>()?;
+        self.discover_object_closure(Vec::new(), pending, &BTreeSet::new())
+    }
+
+    fn discover_object_closure(
+        &self,
+        operation_heads: Vec<ObjectId>,
+        mut pending: BTreeSet<ObjectKey>,
+        accepted_operation_heads: &BTreeSet<ObjectId>,
+    ) -> Result<ObjectClosure, ObjectClosureError> {
+        let root_commit = object_id(
+            "root commit",
+            self.repo().store().root_commit_id().as_bytes(),
+        )?;
         let mut visited = BTreeSet::new();
         let mut objects = Vec::new();
 

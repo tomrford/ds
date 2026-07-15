@@ -1,8 +1,10 @@
+mod git_projection;
 mod http_transport;
 mod install;
 mod object_closure;
 mod pack;
 mod pack_manifest;
+mod projection_transport;
 #[cfg(test)]
 mod reconciliation_tests;
 mod sync_engine;
@@ -26,6 +28,10 @@ use jj_lib::simple_op_store::SimpleOpStore;
 use thiserror::Error;
 
 pub use devspace_kernel::ObjectKind;
+pub use git_projection::{
+    CommitMapping, ExactPathFilter, ExportMappings, ExportResult, GitProjection, ImportMappings,
+    ImportResult, ProjectionError,
+};
 pub use http_transport::HttpTransport;
 pub use install::{InstalledPack, PackInstallError};
 pub use object_closure::{
@@ -37,6 +43,11 @@ pub use pack::{
     MIN_PACK_BYTES, PackBuildError, PackMetrics, PackOptions, build_packs,
 };
 pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
+pub use projection_transport::{
+    HiddenPolicyResult, PendingProjectionBatch, PendingProjectionRef, ProjectionBatchResult,
+    ProjectionClaimResult, ProjectionCursor, ProjectionMapping, ProjectionObservation,
+    ProjectionReplay, ProjectionSnapshot, ProjectionState, ProjectionTransport, ProjectionUpdate,
+};
 pub use sync_engine::{
     CloudHeads, DownloadedPack, HeadTransactionResult, PackCatalogEntry, PackCatalogPage,
     SyncEngine, SyncEngineError, SyncTransport, TransportError,

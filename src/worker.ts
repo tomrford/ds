@@ -12,6 +12,8 @@ import {
   readBoundedBody,
   splitParts,
 } from "./pack_protocol";
+import { MAX_PROJECTION_REQUEST_BYTES } from "./projection_protocol";
+import { ProjectionStore } from "./projection_store";
 
 const REPOSITORY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const PACK_ID_PATTERN = /^[0-9a-f]{128}$/;
@@ -66,6 +68,7 @@ class PackValidationError extends Error {}
 export class Repository extends DurableObject<Env> {
   private kernel = new Kernel();
   private heads: HeadStore;
+  private projection: ProjectionStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -173,6 +176,7 @@ export class Repository extends DurableObject<Env> {
       ) WITHOUT ROWID;
     `);
     this.heads = new HeadStore(this.ctx, this.kernel);
+    this.projection = new ProjectionStore(this.ctx, this.kernel);
   }
 
   putPackManifest(packId: string, bytes: Uint8Array) {
@@ -348,6 +352,34 @@ export class Repository extends DurableObject<Env> {
 
   transactHeads(value: unknown) {
     return this.heads.transact(value);
+  }
+
+  getProjection(incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
+    return this.projection.get(incarnationValue, afterValue, throughValue);
+  }
+
+  mutateHiddenPolicy(value: unknown) {
+    return this.projection.mutatePolicy(value);
+  }
+
+  beginProjectionPush(value: unknown) {
+    return this.projection.begin(value);
+  }
+
+  claimProjectionPush(batchId: unknown, value: unknown) {
+    return this.projection.claim(batchId, value);
+  }
+
+  getProjectionPushReplay(batchId: unknown, incarnationValue: unknown) {
+    return this.projection.replay(batchId, incarnationValue);
+  }
+
+  confirmProjectionPush(batchId: unknown, value: unknown) {
+    return this.projection.confirm(batchId, value);
+  }
+
+  recoverProjectionPush(batchId: unknown, value: unknown) {
+    return this.projection.recover(batchId, value);
   }
 
   listInstalledPacks(incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
@@ -823,12 +855,23 @@ export default {
       url.pathname,
     );
     const headMatch = /^\/repositories\/([^/]+)\/heads$/.exec(url.pathname);
+    const projectionMatch = /^\/repositories\/([^/]+)\/projection$/.exec(url.pathname);
+    const hiddenPolicyMatch = /^\/repositories\/([^/]+)\/hidden-policy$/.exec(url.pathname);
+    const projectionPushMatch = /^\/repositories\/([^/]+)\/git\/pushes$/.exec(url.pathname);
+    const projectionPushActionMatch =
+      /^\/repositories\/([^/]+)\/git\/pushes\/([^/]+)\/(claim|confirm|recover|replay)$/.exec(
+        url.pathname,
+      );
     const packCatalogMatch = /^\/repositories\/([^/]+)\/packs$/.exec(url.pathname);
     const initializeMatch = /^\/repositories\/([^/]+)\/initialize$/.exec(url.pathname);
     const repository =
       chunkMatch?.[1] ??
       packMatch?.[1] ??
       headMatch?.[1] ??
+      projectionMatch?.[1] ??
+      hiddenPolicyMatch?.[1] ??
+      projectionPushMatch?.[1] ??
+      projectionPushActionMatch?.[1] ??
       packCatalogMatch?.[1] ??
       initializeMatch?.[1];
     const packId = chunkMatch?.[2] ?? packMatch?.[2];
@@ -919,19 +962,76 @@ export default {
         return rpcResponse(await stub.getHeads(url.searchParams.get("incarnation")));
       }
       if (headMatch !== null && request.method === "POST") {
-        let bytes: Uint8Array;
-        try {
-          bytes = await readBoundedBody(request, MAX_HEAD_REQUEST_BYTES, "head request");
-        } catch (error) {
-          return errorResponse(400, error instanceof Error ? error.message : "invalid head request");
-        }
-        let body: unknown;
-        try {
-          body = JSON.parse(new TextDecoder().decode(bytes));
-        } catch {
-          return errorResponse(400, "head request must be valid JSON");
-        }
+        const decoded = await readJsonBody(request, MAX_HEAD_REQUEST_BYTES, "head request");
+        if (decoded instanceof Response) return decoded;
+        const body = decoded;
         return rpcResponse(await stub.transactHeads(body));
+      }
+      if (projectionMatch !== null && request.method === "GET") {
+        const after = url.searchParams.get("after") ?? "0";
+        const throughValue = url.searchParams.get("through");
+        if (
+          !/^(0|[1-9][0-9]*)$/.test(after) ||
+          !Number.isSafeInteger(Number(after)) ||
+          (throughValue !== null &&
+            (!/^(0|[1-9][0-9]*)$/.test(throughValue) ||
+              !Number.isSafeInteger(Number(throughValue))))
+        ) {
+          return errorResponse(400, "invalid projection cursor");
+        }
+        return rpcResponse(
+          await stub.getProjection(
+            url.searchParams.get("incarnation"),
+            Number(after),
+            throughValue === null ? undefined : Number(throughValue),
+          ),
+        );
+      }
+      if (hiddenPolicyMatch !== null && request.method === "POST") {
+        const body = await readJsonBody(
+          request,
+          MAX_PROJECTION_REQUEST_BYTES,
+          "hidden policy request",
+        );
+        if (body instanceof Response) return body;
+        return rpcResponse(await stub.mutateHiddenPolicy(body));
+      }
+      if (projectionPushMatch !== null && request.method === "POST") {
+        const body = await readJsonBody(
+          request,
+          MAX_PROJECTION_REQUEST_BYTES,
+          "projection push request",
+        );
+        if (body instanceof Response) return body;
+        return rpcResponse(await stub.beginProjectionPush(body));
+      }
+      if (
+        projectionPushActionMatch?.[3] === "replay" &&
+        request.method === "GET"
+      ) {
+        return rpcResponse(
+          await stub.getProjectionPushReplay(
+            projectionPushActionMatch[2],
+            url.searchParams.get("incarnation"),
+          ),
+        );
+      }
+      if (projectionPushActionMatch !== null && request.method === "POST") {
+        const body = await readJsonBody(
+          request,
+          MAX_PROJECTION_REQUEST_BYTES,
+          "projection push request",
+        );
+        if (body instanceof Response) return body;
+        const batchId = projectionPushActionMatch[2];
+        switch (projectionPushActionMatch[3]) {
+          case "claim":
+            return rpcResponse(await stub.claimProjectionPush(batchId, body));
+          case "confirm":
+            return rpcResponse(await stub.confirmProjectionPush(batchId, body));
+          case "recover":
+            return rpcResponse(await stub.recoverProjectionPush(batchId, body));
+        }
       }
       return errorResponse(404, "not found");
     } catch (error) {
@@ -947,6 +1047,26 @@ function rpcResponse(result: { ok: boolean; error?: string; status?: number }): 
   }
   const { ok: _, status: __, ...body } = result;
   return Response.json(body);
+}
+
+async function readJsonBody(
+  request: Request,
+  limit: number,
+  label: string,
+): Promise<unknown | Response> {
+  let bytes: Uint8Array;
+  try {
+    bytes = await readBoundedBody(request, limit, label);
+  } catch (error) {
+    return errorResponse(400, error instanceof Error ? error.message : `invalid ${label}`);
+  }
+  try {
+    return JSON.parse(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
+    );
+  } catch {
+    return errorResponse(400, `${label} must be valid JSON`);
+  }
 }
 
 function binaryRpcResponse(result: {

@@ -462,6 +462,510 @@ describe("cloud pack download", () => {
   });
 });
 
+describe("Git projection journal", () => {
+  const incarnation = "55".repeat(16);
+  const firstMachine = "66".repeat(16);
+  const recoveryMachine = "77".repeat(16);
+
+  it("recovers an evicted post-push batch under a new fencing token", async () => {
+    const repository = "projection-recovery";
+    const batchId = "81".repeat(16);
+    const gitOid = "91".repeat(20);
+    await initializeProjectionRepository(repository, incarnation);
+    const [canonicalCommitId, publicCommitId] = await installProjectionCommits(repository);
+
+    expect(
+      await projectionRequest(repository, "hidden-policy", {
+        incarnation,
+        path: "secrets/.env",
+        hidden: true,
+      }),
+    ).toEqual({ status: 200, body: { changed: true, policyEpoch: 1 } });
+    expect(
+      await projectionRequest(repository, "hidden-policy", {
+        incarnation,
+        path: "secrets/.env",
+        hidden: true,
+      }),
+    ).toEqual({ status: 200, body: { changed: false, policyEpoch: 1 } });
+
+    const begin = projectionBatch(
+      incarnation,
+      batchId,
+      firstMachine,
+      1,
+      projectionUpdate("main", null, gitOid, canonicalCommitId, publicCommitId),
+    );
+    expect(await projectionRequest(repository, "git/pushes", begin)).toEqual({
+      status: 200,
+      body: { pending: true, fence: 1 },
+    });
+    expect(await getProjection(repository, incarnation)).toEqual({
+      status: 200,
+      body: {
+        policyEpoch: 1,
+        hiddenPaths: ["secrets/.env"],
+        activationCursor: 0,
+        cursors: [],
+        mappings: [],
+        nextAfter: 0,
+        through: 0,
+        hasMore: false,
+        pending: [
+          {
+            batchId,
+            remote: "origin",
+            policyEpoch: 1,
+            ownerMachine: firstMachine,
+            fence: 1,
+            refs: [
+              {
+                bookmark: "main",
+                expectedOldOid: null,
+                proposedGitOid: gitOid,
+              },
+            ],
+          },
+        ],
+      },
+    });
+    expect(
+      await projectionRequest(repository, "hidden-policy", {
+        incarnation,
+        path: "another-secret",
+        hidden: true,
+      }),
+    ).toEqual({
+      status: 409,
+      body: { error: "hidden policy cannot change while a push is pending" },
+    });
+
+    await evictDurableObject(env.REPOSITORIES.getByName(repository));
+    expect(
+      await projectionRequest(repository, `git/pushes/${batchId}/claim`, {
+        incarnation,
+        machineId: recoveryMachine,
+      }),
+    ).toEqual({ status: 200, body: { fence: 2, previousFence: 1 } });
+    expect(await getProjectionReplay(repository, batchId, incarnation)).toEqual({
+      status: 200,
+      body: {
+        batchId,
+        remote: "origin",
+        policyEpoch: 1,
+        ownerMachine: recoveryMachine,
+        fence: 2,
+        updates: begin.updates,
+      },
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${batchId}/recover`, {
+        incarnation,
+        machineId: recoveryMachine,
+        fence: 2,
+        observations: [{ bookmark: "main", liveOid: null }],
+      }),
+    ).toEqual({
+      status: 409,
+      body: {
+        error:
+          "claimed projection batch still matches its expected refs; replay the exact push before recovery",
+      },
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+        incarnation,
+        machineId: firstMachine,
+        fence: 1,
+      }),
+    ).toEqual({
+      status: 409,
+      body: { error: "projection owner or fencing token is stale" },
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+        incarnation,
+        machineId: recoveryMachine,
+        fence: 2,
+      }),
+    ).toEqual({
+      status: 409,
+      body: { error: "claimed projection batch requires observed remote state recovery" },
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${batchId}/recover`, {
+        incarnation,
+        machineId: recoveryMachine,
+        fence: 2,
+        observations: [{ bookmark: "main", liveOid: gitOid }],
+      }),
+    ).toEqual({
+      status: 200,
+      body: { pending: false, fence: 2, outcome: "accepted" },
+    });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 1,
+      pending: [],
+      cursors: [
+        {
+          remote: "origin",
+          bookmark: "main",
+          gitOid,
+          canonicalCommitId,
+          publicCommitId,
+          policyEpoch: 1,
+          activationSequence: 1,
+        },
+      ],
+    });
+    expect(await projectionRequest(repository, "git/pushes", begin)).toEqual({
+      status: 200,
+      body: { pending: false, fence: 2, outcome: "accepted" },
+    });
+    expect(
+      await projectionRequest(repository, "git/pushes", {
+        ...begin,
+        remote: "different",
+      }),
+    ).toEqual({
+      status: 409,
+      body: { error: "projection batch ID was already used for a different request" },
+    });
+
+    const deletionBatch = "8a".repeat(16);
+    expect(
+      await projectionRequest(repository, "git/pushes", {
+        incarnation,
+        batchId: deletionBatch,
+        machineId: firstMachine,
+        remote: "origin",
+        policyEpoch: 1,
+        updates: [
+          { bookmark: "main", expectedOldOid: gitOid, states: [], proposedState: null },
+        ],
+      }),
+    ).toEqual({ status: 200, body: { pending: true, fence: 3 } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${deletionBatch}/claim`, {
+        incarnation,
+        machineId: recoveryMachine,
+      }),
+    ).toEqual({ status: 200, body: { fence: 4, previousFence: 3 } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${deletionBatch}/recover`, {
+        incarnation,
+        machineId: recoveryMachine,
+        fence: 4,
+        observations: [{ bookmark: "main", liveOid: null }],
+      }),
+    ).toEqual({
+      status: 200,
+      body: { pending: false, fence: 4, outcome: "accepted" },
+    });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({ cursors: [] });
+  });
+
+  it("aborts an unapplied batch and retains mixed remote outcomes", async () => {
+    const repository = "projection-classify";
+    await initializeProjectionRepository(repository, incarnation);
+    const [canonicalCommitId, publicCommitId] = await installProjectionCommits(repository);
+    const firstBatch = "82".repeat(16);
+    const firstGitOid = "92".repeat(20);
+    const secondGitOid = "93".repeat(20);
+    const begin = projectionBatch(
+      incarnation,
+      firstBatch,
+      firstMachine,
+      0,
+      projectionUpdate("a", null, firstGitOid, canonicalCommitId, publicCommitId),
+      projectionUpdate("B", null, secondGitOid, canonicalCommitId, publicCommitId),
+    );
+    expect((await projectionRequest(repository, "git/pushes", begin)).status).toBe(200);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/pushes",
+        projectionBatch(
+          incarnation,
+          "83".repeat(16),
+          recoveryMachine,
+          0,
+          projectionUpdate("a", null, firstGitOid, canonicalCommitId, publicCommitId),
+        ),
+      ),
+    ).toEqual({
+      status: 409,
+      body: { error: "another push already owns origin/a" },
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${firstBatch}/recover`, {
+        incarnation,
+        machineId: firstMachine,
+        fence: 1,
+        observations: [
+          { bookmark: "a", liveOid: null },
+          { bookmark: "B", liveOid: null },
+        ],
+      }),
+    ).toEqual({
+      status: 200,
+      body: { pending: false, fence: 1, outcome: "aborted" },
+    });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 0,
+      cursors: [],
+      pending: [],
+    });
+
+    const mixedBatch = "84".repeat(16);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/pushes",
+        projectionBatch(
+          incarnation,
+          mixedBatch,
+          firstMachine,
+          0,
+          projectionUpdate("a", null, firstGitOid, canonicalCommitId, publicCommitId),
+          projectionUpdate("B", null, secondGitOid, canonicalCommitId, publicCommitId),
+        ),
+      ),
+    ).toEqual({ status: 200, body: { pending: true, fence: 2 } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${mixedBatch}/recover`, {
+        incarnation,
+        machineId: firstMachine,
+        fence: 2,
+        observations: [
+          { bookmark: "a", liveOid: firstGitOid },
+          { bookmark: "B", liveOid: null },
+        ],
+      }),
+    ).toEqual({
+      status: 409,
+      body: {
+        error: "remote refs are mixed or ambiguous; projection batch remains quarantined",
+      },
+    });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 0,
+      cursors: [],
+      pending: [{ batchId: mixedBatch, fence: 2 }],
+    });
+  });
+
+  it("requires durable commits and immutable Git receipts", async () => {
+    const repository = "projection-receipts";
+    await initializeProjectionRepository(repository, incarnation);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/pushes",
+        projectionBatch(
+          incarnation,
+          "80".repeat(16),
+          firstMachine,
+          0,
+          projectionUpdate("zero", null, "00".repeat(20), "a1".repeat(64), "a2".repeat(64)),
+        ),
+      ),
+    ).toEqual({ status: 400, body: { error: "gitOid must not be zero" } });
+    expect(
+      await projectionRequest(repository, "git/pushes", {
+        incarnation,
+        batchId: "8b".repeat(16),
+        machineId: firstMachine,
+        remote: "origin",
+        policyEpoch: 0,
+        updates: [
+          {
+            bookmark: "delete",
+            expectedOldOid: null,
+            states: [
+              {
+                gitOid: "97".repeat(20),
+                canonicalCommitId: "a1".repeat(64),
+                publicCommitId: "a2".repeat(64),
+              },
+            ],
+            proposedState: null,
+          },
+        ],
+      }),
+    ).toEqual({
+      status: 400,
+      body: { error: "updates[0].states must be empty for a deletion" },
+    });
+    const missing = projectionBatch(
+      incarnation,
+      "85".repeat(16),
+      firstMachine,
+      0,
+      projectionUpdate("main", null, "94".repeat(20), "a1".repeat(64), "a2".repeat(64)),
+    );
+    expect(await projectionRequest(repository, "git/pushes", missing)).toEqual({
+      status: 409,
+      body: { error: `canonical commit ${"a1".repeat(64)} is not cloud durable` },
+    });
+
+    const missingTreeId = "a3".repeat(64);
+    const incompleteCommitId = await installObject(
+      repository,
+      KIND.commit,
+      canonicalProjectionCommit(fromHex(missingTreeId), 9),
+    );
+    expect(
+      await projectionRequest(
+        repository,
+        "git/pushes",
+        projectionBatch(
+          incarnation,
+          "88".repeat(16),
+          firstMachine,
+          0,
+          projectionUpdate(
+            "incomplete",
+            null,
+            "96".repeat(20),
+            incompleteCommitId,
+            incompleteCommitId,
+          ),
+        ),
+      ),
+    ).toEqual({
+      status: 409,
+      body: {
+        error: `canonical commit ${incompleteCommitId} closure is missing tree ${missingTreeId}`,
+      },
+    });
+
+    const [canonicalCommitId, publicCommitId, otherPublicCommitId] =
+      await installProjectionCommits(repository, 3);
+    const gitOid = "95".repeat(20);
+    const firstBatch = "86".repeat(16);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/pushes",
+        projectionBatch(
+          incarnation,
+          firstBatch,
+          firstMachine,
+          0,
+          projectionUpdate("main", null, gitOid, canonicalCommitId, publicCommitId),
+        ),
+      ),
+    ).toEqual({ status: 200, body: { pending: true, fence: 1 } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${firstBatch}/confirm`, {
+        incarnation,
+        machineId: firstMachine,
+        fence: 1,
+      }),
+    ).toEqual({
+      status: 200,
+      body: { pending: false, fence: 1, outcome: "accepted" },
+    });
+    expect(
+      await projectionRequest(
+        repository,
+        "git/pushes",
+        projectionBatch(
+          incarnation,
+          "87".repeat(16),
+          firstMachine,
+          0,
+          projectionUpdate("other", null, gitOid, canonicalCommitId, otherPublicCommitId),
+        ),
+      ),
+    ).toEqual({
+      status: 409,
+      body: { error: `Git object ${gitOid} already has a different immutable receipt` },
+    });
+  });
+
+  it("pages accepted mapping history under a fixed activation high-water", async () => {
+    const repository = "projection-pages";
+    await initializeProjectionRepository(repository, incarnation);
+    const [canonicalCommitId, publicCommitId] = await installProjectionCommits(repository);
+    const batchId = "89".repeat(16);
+    const states = Array.from({ length: 257 }, (_, index) => ({
+      gitOid: (index + 1).toString(16).padStart(40, "0"),
+      canonicalCommitId,
+      publicCommitId,
+    }));
+    expect(
+      await projectionRequest(repository, "git/pushes", {
+        incarnation,
+        batchId,
+        machineId: firstMachine,
+        remote: "origin",
+        policyEpoch: 0,
+        updates: [
+          {
+            bookmark: "main",
+            expectedOldOid: null,
+            states,
+            proposedState: 256,
+          },
+        ],
+      }),
+    ).toEqual({ status: 200, body: { pending: true, fence: 1 } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+        incarnation,
+        machineId: firstMachine,
+        fence: 1,
+      }),
+    ).toEqual({
+      status: 200,
+      body: { pending: false, fence: 1, outcome: "accepted" },
+    });
+    const first = await getProjection(repository, incarnation);
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({
+      activationCursor: 257,
+      nextAfter: 256,
+      through: 257,
+      hasMore: true,
+    });
+    expect((first.body as { mappings: unknown[] }).mappings).toHaveLength(256);
+    const second = await getProjection(repository, incarnation, 256, 257);
+    expect(second.body).toMatchObject({ nextAfter: 257, through: 257, hasMore: false });
+    expect((second.body as { mappings: unknown[] }).mappings).toHaveLength(1);
+  });
+
+  it("rejects noncanonical projection text before Durable Object state", async () => {
+    const repository = "projection-text";
+    await initializeProjectionRepository(repository, incarnation);
+    const prefix = new TextEncoder().encode(
+      `{"incarnation":"${incarnation}","path":"bad`,
+    );
+    const suffix = new TextEncoder().encode(`","hidden":true}`);
+    expect(
+      await projectionRawRequest(
+        repository,
+        "hidden-policy",
+        concat(prefix, new Uint8Array([0xff]), suffix),
+      ),
+    ).toEqual({
+      status: 400,
+      body: { error: "hidden policy request must be valid JSON" },
+    });
+    expect(
+      await projectionRequest(repository, "hidden-policy", {
+        incarnation,
+        path: "bad\ud800",
+        hidden: true,
+      }),
+    ).toEqual({
+      status: 400,
+      body: { error: "path must be a non-empty string without control characters" },
+    });
+  });
+});
+
 async function putManifest(repository: string, packId: string, bytes: Uint8Array) {
   return exports.default.fetch(
     new Request(`https://example.com/repositories/${repository}/packs/${packId}/manifest`, {
@@ -470,6 +974,115 @@ async function putManifest(repository: string, packId: string, bytes: Uint8Array
       body: bytes,
     }),
   );
+}
+
+async function initializeProjectionRepository(repository: string, incarnation: string) {
+  expect(await initialize(repository, incarnation)).toEqual({
+    status: 200,
+    body: { initialized: true, cursor: 0, heads: [] },
+  });
+}
+
+async function installProjectionCommits(repository: string, count = 2): Promise<string[]> {
+  const fileId = await installObject(
+    repository,
+    KIND.file,
+    new TextEncoder().encode("projection fixture\n"),
+  );
+  const treeId = await installObject(
+    repository,
+    KIND.tree,
+    treeWithFiles([["visible.txt", fromHex(fileId)]]),
+  );
+  const ids: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    ids.push(
+      await installObject(
+        repository,
+        KIND.commit,
+        canonicalProjectionCommit(fromHex(treeId), index + 1),
+      ),
+    );
+  }
+  return ids;
+}
+
+function canonicalProjectionCommit(rootTreeId: Uint8Array, seed: number): Uint8Array {
+  const signature = field(3, new Uint8Array());
+  return concat(
+    field(1, new Uint8Array(64)),
+    field(3, rootTreeId),
+    field(4, new Uint8Array(16).fill(seed)),
+    field(5, new TextEncoder().encode(`projection ${seed}`)),
+    field(6, signature),
+    field(7, signature),
+  );
+}
+
+function projectionUpdate(
+  bookmark: string,
+  expectedOldOid: string | null,
+  gitOid: string,
+  canonicalCommitId: string,
+  publicCommitId: string,
+) {
+  return {
+    bookmark,
+    expectedOldOid,
+    states: [{ gitOid, canonicalCommitId, publicCommitId }],
+    proposedState: 0,
+  };
+}
+
+function projectionBatch(
+  incarnation: string,
+  batchId: string,
+  machineId: string,
+  policyEpoch: number,
+  ...updates: ReturnType<typeof projectionUpdate>[]
+) {
+  return { incarnation, batchId, machineId, remote: "origin", policyEpoch, updates };
+}
+
+async function projectionRequest(repository: string, path: string, body: unknown) {
+  return projectionRawRequest(repository, path, new TextEncoder().encode(JSON.stringify(body)));
+}
+
+async function projectionRawRequest(repository: string, path: string, body: Uint8Array) {
+  const response = await exports.default.fetch(
+    new Request(`https://example.com/repositories/${repository}/${path}`, {
+      method: "POST",
+      headers: { ...authorization, "content-type": "application/json" },
+      body,
+    }),
+  );
+  return { status: response.status, body: await response.json() };
+}
+
+async function getProjection(
+  repository: string,
+  incarnation: string,
+  after = 0,
+  through?: number,
+) {
+  const highWater = through === undefined ? "" : `&through=${through}`;
+  const response = await exports.default.fetch(
+    new Request(
+      `https://example.com/repositories/${repository}/projection?incarnation=${incarnation}&after=${after}${highWater}`,
+      { headers: authorization },
+    ),
+  );
+  return { status: response.status, body: await response.json() };
+}
+
+async function getProjectionReplay(repository: string, batchId: string, incarnation: string) {
+  const response = await exports.default.fetch(
+    new Request(
+      `https://example.com/repositories/${repository}/git/pushes/${batchId}/replay?incarnation=${incarnation}`,
+      { headers: authorization },
+    ),
+  );
+  return { status: response.status, body: await response.json() };
 }
 
 async function putChunk(repository: string, packId: string, position: number, bytes: Uint8Array) {
@@ -504,7 +1117,8 @@ async function installOperation(
 
 async function installObject(repository: string, kind: number, bytes: Uint8Array): Promise<string> {
   const fixture = singleObjectPack(kind, bytes);
-  expect((await putManifest(repository, fixture.id, fixture.manifest)).status).toBe(200);
+  const manifestResponse = await putManifest(repository, fixture.id, fixture.manifest);
+  expect(manifestResponse.status, JSON.stringify(await manifestResponse.clone().json())).toBe(200);
   expect((await putChunk(repository, fixture.id, 0, bytes)).status).toBe(200);
   expect((await install(repository, fixture.id)).status).toBe(200);
   return fixture.objectId;

@@ -2,8 +2,10 @@
 
 This repository is a clean implementation of the v3 architecture. The
 validation kernel stays independent of `jj-lib`, compiles to small WebAssembly
-and runs inside a Cloudflare Durable Object. Phase 2 adds a local machine store
-using jj's stock simple backend, operation store and operation-head store.
+and runs inside a Cloudflare Durable Object. The machine store uses jj's stock
+simple backend, operation store and operation-head store. A rebuildable Git
+sidecar projects public history while the Durable Object owns its policy and
+recovery journal.
 
 The v2 checkout is an oracle for wire-format compatibility and fixtures. It is
 not a source dependency.
@@ -45,8 +47,8 @@ only the exact heads observed by that client.
 The native machine crate initializes and reloads stock jj repositories. It
 rejects repositories whose backend, operation store, operation-head store,
 index or submodule-store type differs from the jj 0.42 defaults. Git projection
-and sync state will live beside this native repository, not inside replacement
-jj stores. The same crate discovers deterministic raw-object closures from all
+and sync state live beside this native repository, not inside replacement jj
+stores. The same crate discovers deterministic raw-object closures from all
 local operation heads, stops at the cloud-accepted operation frontier, and
 encodes cloud-missing objects into deterministic, size-bounded, hash-verified
 packs.
@@ -76,7 +78,15 @@ The same sync engine also runs safely without a daemon. At a later command
 boundary it rediscovers native operations even when no outbox hint was written,
 and it durably replays any exact head request queued by an interrupted boundary.
 
-The warm local repository-open wrapper measures 1.30 to 1.31 times stock jj in
+`GitProjection` translates between the native store and a rebuildable bare-Git
+sidecar. Exact hidden paths are removed before excluded leaves are read, and
+Git links fail before native tree encoding. The Durable Object assigns hidden
+policy epochs and journals immutable Git receipts, quarantined projection
+states, exact ref cursors and fenced pending batches. A second machine can
+recover a remote ref move after the first machine omits finalisation, then
+rebuild an empty sidecar from cloud objects and accepted mappings.
+
+The warm local repository-open wrapper measures 1.297 to 1.300 times stock jj in
 the release-only probe against a 64-operation fixture repository and cannot
 issue cloud requests. End-to-end command latency remains to be measured once
 the v3 command runner exists.
@@ -86,6 +96,6 @@ their complete closure before adding them to jj's stock operation-head store.
 Reloading through jj removes ancestor heads and creates jj's own merge operation
 for genuine divergence; Devspace does not implement a parallel view merge.
 
-See [`docs/spike-1.md`](docs/spike-1.md) for the kernel contract and its
-verification surface and [`docs/spike-2.md`](docs/spike-2.md) for the
-convergence proof.
+See [`docs/spike-1.md`](docs/spike-1.md) for the kernel contract,
+[`docs/spike-2.md`](docs/spike-2.md) for the convergence proof and
+[`docs/spike-3.md`](docs/spike-3.md) for the Git projection proof.
