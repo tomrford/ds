@@ -16,7 +16,13 @@ The durable native stores are exactly:
 The default index and submodule store complete jj's repository layout. The
 index is rebuildable. The presence of jj's submodule store does not make Git
 submodule tree entries encodable by the simple backend; repositories containing
-Git links are unsupported and must be rejected before Git import.
+Git links are unsupported.
+
+Phase 2 has no Git import or projection path, so no Git link can currently
+reach `SimpleBackend::write_tree()`. The future import boundary must inspect
+Git trees and reject a link before asking jj to encode it; the simple backend's
+panic is not an acceptable rejection path. That boundary and its Git-link
+fixture belong to the Phase 3 projection work.
 
 Devspace sync metadata, cloud cursors, the durable outbox and the rebuildable
 Git projection belong beside this repository. They do not replace or extend a
@@ -74,8 +80,8 @@ byte ranges, ordered chunk ranges, per-chunk Blake2b-512 hashes, total byte
 length and a whole-pack Blake2b-512 hash. The pack ID is the Blake2b-512 hash
 of the canonical manifest bytes. Counts, integers and reserved fields have one
 fixed encoding. A checked private constructor enforces strictly ordered unique
-heads and objects, contiguous object and chunk ranges, and every format budget
-before bytes can be encoded. The same closure, cloud inventory and options
+heads and objects, at least one object, contiguous object and chunk ranges,
+and every format budget before bytes can be encoded. The same closure, cloud inventory and options
 therefore produce the same ordered pack set on different machines.
 
 Packing reopens every source object and derives the recorded range from the
@@ -123,7 +129,8 @@ same-kind parent in a later pack. The head transaction is the correct closure
 gate: it can advance only after the complete referenced graph exists, while
 individual packs remain independently uploadable in any order.
 
-The Workers tests prove a frozen Rust-format vector, corrupt-chunk rejection,
+The Workers tests prove frozen Rust-format vectors — a minimal manifest and a
+heads-carrying multi-chunk manifest — plus corrupt-chunk rejection,
 early-install rejection, retry idempotency, transaction rollback after a later
 object fails validation, cross-pack references and eviction between quarantine
 and installation.
@@ -135,9 +142,7 @@ incarnation-scoped catalog returns at most 256 logical pack IDs per page. The
 first page captures a high-water sequence, and later pages are bounded by that
 same value, so concurrent installs cannot extend or change an in-progress
 catalog traversal. The sequence is a pagination cursor only; pack identity
-remains the manifest hash. A separate catalog table is backfilled
-idempotently in bounded, retryable batches for Durable Objects created before
-download support existed. Client-supplied high-water values above the current
+remains the manifest hash. Client-supplied high-water values above the current
 catalog frontier are rejected.
 
 Authenticated GETs return the exact installed manifest and its logical chunks.
@@ -164,10 +169,10 @@ download bytes are rejected without changing the stock head store.
 
 ## Cloud operation heads
 
-The repository Durable Object is initialized once with a 128-bit incarnation.
-Initialization is currently a service-binding RPC because the control plane is
-outside this spike. Repeating the same initialization is safe; a different
-incarnation is rejected. Head reads and writes require the matching
+The repository Durable Object is initialized once with a 128-bit incarnation
+through an authenticated initialize POST; repository creation policy belongs
+to the future control plane. Repeating the same initialization is safe; a
+different incarnation is rejected. Head reads and writes require the matching
 incarnation.
 
 An authenticated head transaction carries one new operation head, the exact
@@ -186,7 +191,8 @@ It then uses one SQLite transaction to:
    monotonic cursor; and
 5. stores the cursor and resulting ordered head set as the exact retry result.
 
-The zero operation, zero view and root commit remain implicit jj objects.
+The zero operation, zero view and root commit remain implicit jj objects; the
+zero operation cannot be published as a head.
 Failed closure or ancestry checks do not consume the idempotency key, so a
 client can install a missing pack and retry the same logical request. Complete
 object closures are recorded once; later descendants stop at that immutable
@@ -285,6 +291,18 @@ ID, the cloud has one head and exactly 2 accepted head transactions, and no
 outbox remains. The machines share only the fault transport; they never copy
 objects directly or contact one another.
 
+## Live Worker transport
+
+`HttpTransport` implements the same transport contract over the Worker's HTTP
+protocol: bearer authentication, incarnation-scoped catalog, manifest and
+chunk routes, and the JSON head transaction. The ignored `cloud_live` test
+runs the two-machine convergence flow against a real Worker — `wrangler dev`
+or a deployment — via `DEVSPACE_SPIKE_URL` and `DEVSPACE_SPIKE_TOKEN`, so
+heads-carrying manifests, pack installation, chunk reconstruction and head
+transactions cross the Rust/TypeScript boundary rather than a test fake. The
+in-repo fault matrix stays on the deterministic fake; the live test is the
+cross-language proof.
+
 ## Exact cloud rebuild
 
 The rebuild test synchronizes a stock repository, records its operation ID,
@@ -309,11 +327,13 @@ cursors and heads persist and no outbox remains.
 ## Warm repository-open latency
 
 The release-only probe compares `MachineRepository::open()` with stock jj's
-`RepoLoader::load_at_head()` on the same warm stock repository. It alternates
-the order of 5 warm-up batches and 21 measured batches, takes the median batch
-time, and amortizes each over 20 opens. Three consecutive runs measured the
-Devspace wrapper at 1.503, 1.497 and 1.491 times stock jj, inside the 2 times
-budget for this shared subpath.
+`RepoLoader::load_at_head()` on the same warm stock repository, whose fixture
+holds 64 chained operations and a 64-bookmark view so the open reads a real
+operation and view. It alternates the order of 5 warm-up batches and 21
+measured batches, takes the median batch time, and amortizes each over 20
+opens. Three consecutive runs measured the Devspace wrapper at 1.309, 1.306
+and 1.304 times stock jj, inside the 2 times budget for this shared subpath.
+The probe is ignored by default and run explicitly; it does not gate CI.
 
 The wrapper validates the 5 stock store-type markers and delegates to jj's
 loader. This code path has no cloud client or `SyncTransport` value, so the
@@ -330,3 +350,34 @@ must remain within 2 times jj and issue zero cloud requests.
 Pack size, chunk count and SQLite versus R2 placement are measured outputs of
 this spike. The protocol must not bake in a storage-provider-specific object
 location.
+
+## Deferred concerns
+
+Known limits carried forward deliberately; each needs a decision or a
+measurement before the affected surface hardens.
+
+- The engine packs against an empty cloud inventory: no endpoint reports which
+  objects the cloud already holds, so every new operation re-uploads its full
+  reachable closure and every sync appends a full-closure pack to the catalog.
+  Idempotent installation keeps this correct, but upload bandwidth and rebuild
+  download cost scale with repository size times sync count. An inventory or
+  negotiation step is the next protocol decision.
+- Worker pack installation verifies and validates an entire pack inside one
+  synchronous Durable Object transaction; a full 64 MiB, 65,536-object pack
+  may exceed Durable Object CPU budgets. Bounded staged installation is the
+  fallback shape.
+- The head-transaction ancestry walk recurses over the full operation ancestry
+  on every transaction; closure checks are memoized through the proven
+  frontier, ancestry checks are not.
+- Download and catalog routes verify the incarnation by reading the full head
+  set; a cheap incarnation-only check would remove up to 4,096 rows of work
+  per request.
+- Untested asserted behavior: receipt expiry and quota enforcement, SQLite
+  part-splitting above 1 MiB values, catalog pagination beyond one page,
+  no-clobber mismatch on existing native objects, and the 4,096-head bounds.
+- The engine requires exactly one local head after reconciliation, so a
+  concurrent local jj operation during a sync pass fails that pass; the next
+  pass picks it up.
+- One shared bearer token authorizes every route, so any token holder can
+  initialize any repository name and claim its incarnation. Repository-scoped
+  authorization is control-plane work.

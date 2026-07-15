@@ -26,7 +26,8 @@ The Worker accepts authenticated manifest and chunk uploads under
 request. Uploads are quarantined until the Durable Object has checked the
 manifest, chunk and whole-pack hashes and revalidated every object through the
 Rust/Wasm kernel in one atomic install transaction. Authenticated head reads
-and transactions use `/repositories/:repository/heads`. An
+and transactions use `/repositories/:repository/heads`, and an authenticated
+POST on `/repositories/:repository/initialize` assigns the incarnation. An
 incarnation-scoped, paginated GET on `/repositories/:repository/packs` lists
 installed logical packs; their exact manifests and chunks are downloadable
 from the same pack routes.
@@ -63,7 +64,9 @@ do not replace jj's operation-head store.
 The native sync engine uses that sidecar around one transport contract. It
 replays pending head work first, installs new cloud packs, asks stock jj to
 reconcile, uploads the newly discovered local closure, and persists the exact
-head request before sending it.
+head request before sending it. `HttpTransport` implements that contract over
+the Worker protocol; the ignored `cloud_live` test converges 2 machines
+through a real Worker via `DEVSPACE_SPIKE_URL` and `DEVSPACE_SPIKE_TOKEN`.
 
 Deleting a fully synchronized machine copy and its sync sidecar is recoverable:
 a fresh stock repository downloads the cloud catalog, installs canonical
@@ -73,9 +76,10 @@ The same sync engine also runs safely without a daemon. At a later command
 boundary it rediscovers native operations even when no outbox hint was written,
 and it durably replays any exact head request queued by an interrupted boundary.
 
-The warm local repository-open wrapper measures 1.49 to 1.50 times stock jj in
-the release-only probe and cannot issue cloud requests. End-to-end command
-latency remains to be measured once the v3 command runner exists.
+The warm local repository-open wrapper measures 1.30 to 1.31 times stock jj in
+the release-only probe against a 64-operation fixture repository and cannot
+issue cloud requests. End-to-end command latency remains to be measured once
+the v3 command runner exists.
 
 When cloud operation objects have been installed locally, the machine validates
 their complete closure before adding them to jj's stock operation-head store.
