@@ -69,6 +69,10 @@ Deleting a fully synchronized machine copy and its sync sidecar is recoverable:
 a fresh stock repository downloads the cloud catalog, installs canonical
 objects and resolves to the exact previous operation ID and view.
 
+The same sync engine also runs safely without a daemon. At a later command
+boundary it rediscovers native operations even when no outbox hint was written,
+and it durably replays any exact head request queued by an interrupted boundary.
+
 When cloud operation objects have been installed locally, the machine validates
 their complete closure before adding them to jj's stock operation-head store.
 Reloading through jj removes ancestor heads and creates jj's own merge operation

@@ -295,14 +295,22 @@ cloud pack and authoritative head through the same engine, and reconstructs
 the exact operation ID, view and object set. Its rebuilt cursor and catalog
 frontier match the cloud and no outbox remains.
 
+## Command-boundary recovery
+
+The command-boundary test runs no daemon. A native jj transaction commits an
+operation while the sidecar has no outbox entry, modelling a crash before the
+hint is written. The next engine invocation rediscovers the operation from
+jj's stock operation heads, uploads its closure and writes the exact head
+request before a fault prevents cloud mutation. A separate invocation repairs
+and replays that queued request, then a later native transaction is likewise
+discovered and published at the following command boundary. Both accepted
+cursors and heads persist and no outbox remains.
+
 ## Remaining proof
 
-The remaining vertical slices are:
-
-1. Run the same engine only at command boundaries and prove queued work is
-   rediscovered even when the outbox hint is missing.
-2. Measure warm local command latency with the network disabled. It must stay
-   within 2 times local jj and make zero cloud requests.
+The remaining vertical slice measures warm local command latency with the
+network disabled. It must stay within 2 times local jj and make zero cloud
+requests.
 
 Pack size, chunk count and SQLite versus R2 placement are measured outputs of
 this spike. The protocol must not bake in a storage-provider-specific object

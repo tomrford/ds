@@ -33,6 +33,12 @@ fn settings() -> UserSettings {
 
 async fn offline_machine(path: &std::path::Path, name: &str) -> MachineRepository {
     let repository = MachineRepository::init(path, &settings()).await.unwrap();
+    commit_offline_operation(&repository, name).await;
+    drop(repository);
+    MachineRepository::open(path, &settings()).await.unwrap()
+}
+
+async fn commit_offline_operation(repository: &MachineRepository, name: &str) {
     let mut transaction = repository.repo().start_transaction();
     transaction.repo_mut().set_remote_bookmark(
         RemoteRefSymbol {
@@ -45,7 +51,6 @@ async fn offline_machine(path: &std::path::Path, name: &str) -> MachineRepositor
         },
     );
     transaction.commit(format!("offline {name}")).await.unwrap();
-    repository
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -469,4 +474,87 @@ async fn a_fully_synchronised_machine_rebuilds_exactly_from_cloud_state() {
         BTreeSet::from([expected_operation.as_bytes().try_into().unwrap()])
     );
     assert!(rebuilt_state.load_outbox().unwrap().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn command_boundaries_recover_work_with_no_outbox_or_daemon() {
+    let temp = tempfile::tempdir().unwrap();
+    let machine = temp.path().join("machine");
+    fs::create_dir(&machine).unwrap();
+    let mut repository = offline_machine(&machine.join("repo"), "first").await;
+    let first_operation = repository.repo().op_id().clone();
+    let state_store = MachineSyncStore::open(machine.join("sync")).unwrap();
+    let cloud = Rc::new(RefCell::new(
+        FakeCloud::new(&temp.path().join("cloud-objects")).await,
+    ));
+
+    assert!(state_store.load_outbox().unwrap().is_none());
+    let mut interrupted_boundary =
+        FakeTransport::new(cloud.clone(), Some(FaultBoundary::HeadRequest));
+    let mut engine = SyncEngine::new(
+        &mut repository,
+        &state_store,
+        machine.join("packs"),
+        &mut interrupted_boundary,
+    );
+    assert!(matches!(
+        engine.run().await,
+        Err(devspace_machine::SyncEngineError::Transport(_))
+    ));
+    drop(engine);
+
+    let queued = state_store.load_outbox().unwrap().unwrap();
+    assert_eq!(queued.new_head.as_slice(), first_operation.as_bytes());
+    assert_eq!(cloud.borrow().cursor, 0);
+    assert!(cloud.borrow().heads.is_empty());
+
+    let mut next_boundary = FakeTransport::new(cloud.clone(), None);
+    let mut engine = SyncEngine::new(
+        &mut repository,
+        &state_store,
+        machine.join("packs"),
+        &mut next_boundary,
+    );
+    let state = engine.run().await.unwrap();
+    drop(engine);
+    let (replayed_request, replayed_response) = cloud
+        .borrow()
+        .receipts
+        .get(&queued.idempotency_key)
+        .cloned()
+        .unwrap();
+    assert_eq!(replayed_request, queued);
+    assert_eq!(replayed_response.cursor, 1);
+    assert_eq!(replayed_response.heads, state.accepted_heads);
+    assert_eq!(state.cloud_cursor, 1);
+    assert_eq!(state.accepted_heads, BTreeSet::from([queued.new_head]));
+    assert_eq!(state_store.load_state().unwrap(), state);
+    assert_eq!(cloud.borrow().heads, state.accepted_heads);
+    assert!(state_store.load_outbox().unwrap().is_none());
+
+    commit_offline_operation(&repository, "second").await;
+    drop(repository);
+    repository = MachineRepository::open(machine.join("repo"), &settings())
+        .await
+        .unwrap();
+    let second_operation = repository.repo().op_id().clone();
+    assert_ne!(second_operation, first_operation);
+    assert!(state_store.load_outbox().unwrap().is_none());
+
+    let mut following_boundary = FakeTransport::new(cloud.clone(), None);
+    let mut engine = SyncEngine::new(
+        &mut repository,
+        &state_store,
+        machine.join("packs"),
+        &mut following_boundary,
+    );
+    let state = engine.run().await.unwrap();
+    assert_eq!(state.cloud_cursor, 2);
+    assert_eq!(
+        state.accepted_heads,
+        BTreeSet::from([second_operation.as_bytes().try_into().unwrap()])
+    );
+    assert_eq!(state_store.load_state().unwrap(), state);
+    assert_eq!(cloud.borrow().heads, state.accepted_heads);
+    assert!(state_store.load_outbox().unwrap().is_none());
 }
