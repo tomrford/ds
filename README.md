@@ -60,7 +60,25 @@ secret with `wrangler secret put`; it is absent from source and
 `wrangler.jsonc`.
 `DEVSPACE_DEVELOPMENT_USER_ID` is the non-secret fixed identity. This adapter is
 development-only. Dogfooding replaces it with real multi-user authentication
-without changing typed principals, repository authorization or transports.
+without changing typed principals, repository authorization or transports. The
+control plane scopes every directory and data-plane query by user ID, but with
+one fixed development user that isolation is exercised only by unit tests;
+demonstrating it end to end is an open gate for machine enrolment.
+
+## Offline behavior
+
+Every command except `ds repo new` works without connectivity. Reads and edits
+are local jj operations against the machine store. `ds add` resolves names in
+the local catalog, registers the workspace in the local repository and never
+opens a transport. Work created offline converges later: the sync engine
+uploads and installs at the next boundary that reaches the Worker, and jj's
+operation merge absorbs divergence created meanwhile on other machines.
+
+`ds repo new` requires connectivity because reserving a tenant-local name is a
+global operation on the directory. Offline repository creation is outside the
+current boundary; names are directory bindings rather than repository
+identities, so a future offline path can create under a provisional local
+identity and bind the name at first contact.
 
 The native machine crate initializes and reloads stock jj repositories. It
 rejects repositories whose backend, operation store, operation-head store,
@@ -119,7 +137,10 @@ command refreshes the workspace-path record and succeeds. If the destination is
 absent but that workspace is registered at the requested parent, the command
 rebuilds the checkout at its current working-copy commit. A workspace registered
 at another parent must be requested with that matching revision. Any destination
-without the matching ownership marker is left untouched and rejected.
+without the matching ownership marker is left untouched and rejected. These
+checks defend against accidental collisions, concurrent creators and stale
+leftovers; they are not a security boundary against other local processes,
+which own the same files the checkout does.
 
 Fresh creation writes the working-copy commit and workspace registration in one
 repository transaction. The checkout is built from scratch in a deterministic
