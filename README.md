@@ -70,11 +70,11 @@ encodes cloud-missing objects into deterministic, size-bounded, hash-verified
 packs.
 
 One `MachineStore` owns the platform data directory, a durable local repository
-catalog, creation journals and native repository locations. The
+catalog, the repository-creation journal and native repository locations. The
 catalog binds a tenant-visible name to an opaque repository ID and incarnation;
 native paths contain those 2 opaque values and never the name. Catalog and
-creation-journal changes use machine-local file locks and synced atomic
-replacement. Registration, materialization and catalog-only removal are
+repository-creation-journal changes use machine-local file locks and synced
+atomic replacement. Registration, materialization and catalog-only removal are
 library seams; removal does not prune native repository data. On macOS the
 default root is `~/Library/Application Support/devspace`; Linux uses the XDG
 data directory and Windows uses the local application-data directory.
@@ -101,21 +101,27 @@ workspace paths, including explicit `-R` paths, retain stock jj behavior.
 existing local machine repository. Both the revision and destination are
 explicit. Named revisions resolve against the locally accepted repository;
 plain `@`, `@-` and `@+` resolve only when the command runs inside another
-checkout of the same repository. Each checkout has a machine-scoped workspace
-identity and stock `.jj/repo` pointer to the shared native repository. Its
-working-copy state stays in the checkout. Before creating workspace state,
-`ds add` journals the original revision expression, its resolved base, the exact
-planned working-copy commit, a stable workspace ID, staging name and ownership
-token. It stages the whole checkout beside the absent destination and publishes
-the directory in one no-replace filesystem operation. A retry resumes the same
-registration, staging or publication step while the journaled parent remains
-stable. If an ancestor is renamed after the publication inode check, the
-anchored rename can land under that moved parent. The requested path then fails
-ownership, any foreign replacement remains untouched and the intent remains
-staged. Devspace cannot discover the checkout at an arbitrary renamed ancestor
-location. If another process creates or replaces the destination, `ds add`
-fails without adopting, replacing or deleting it. Removing a checkout path
-cannot follow repository data into the machine store.
+checkout of the same repository. The workspace identity is the machine ID plus
+a stable digest of the canonical destination path, so the same machine and path
+always select the same workspace. The checkout carries a self-describing
+`.jj/devspace-checkout-owner` marker and a stock `.jj/repo` pointer to the shared
+native repository. Its working-copy state stays in the checkout.
+
+`ds add` decides retries from the repository view and destination directory. A
+matching destination, workspace and requested parent is already complete; the
+command refreshes the workspace-path record and succeeds. If the destination is
+absent but that workspace is registered at the requested parent, the command
+rebuilds the checkout at its current working-copy commit. A workspace registered
+at another parent must be requested with that matching revision. Any destination
+without the matching ownership marker is left untouched and rejected.
+
+Fresh creation writes the working-copy commit and workspace registration in one
+repository transaction. The checkout is built from scratch in a deterministic
+sibling staging directory, synchronized and published with a no-replace rename.
+Stale staging with the matching marker is disposable and rebuilt wholesale. A
+machine-local per-destination lock rejects simultaneous creators; its file has no
+state. Removing a completed checkout directory and repeating the same command
+rebuilds it from the registered workspace.
 
 Downloaded packs are decoded and hash-checked again before the machine installs
 their canonical objects into the stock simple stores with no-clobber writes.

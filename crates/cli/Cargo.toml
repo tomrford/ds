@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait.workspace = true
+blake2.workspace = true
 clap.workspace = true
 devspace-machine = { path = "../machine" }
 dunce.workspace = true

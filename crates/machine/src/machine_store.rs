@@ -18,6 +18,7 @@ const CATALOG_FILE: &str = "repositories.json";
 const CATALOG_LOCK_FILE: &str = "repositories.lock";
 const MATERIALIZATION_LOCK_FILE: &str = "native.lock";
 const MATERIALIZATION_TEMP_PREFIX: &str = ".native-";
+const CHECKOUT_LOCK_DIRECTORY: &str = "locks/checkouts";
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -126,6 +127,10 @@ pub struct MachineStore {
     root: PathBuf,
 }
 
+pub struct CheckoutDestinationGuard {
+    _file: File,
+}
+
 impl MachineStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -156,6 +161,45 @@ impl MachineStore {
             .join(identity.repository_id.as_str())
             .join(identity.incarnation.as_str())
             .join("native")
+    }
+
+    pub fn try_lock_checkout_destination(
+        &self,
+        destination_hash: &str,
+    ) -> Result<CheckoutDestinationGuard, MachineStoreError> {
+        debug_assert!(
+            !destination_hash.is_empty()
+                && destination_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        let directory = self.root.join(CHECKOUT_LOCK_DIRECTORY);
+        fs::create_dir_all(&directory).map_err(|source| {
+            MachineStoreError::CreateCheckoutLockDirectory {
+                path: directory.clone(),
+                source,
+            }
+        })?;
+        let path = directory.join(format!("{destination_hash}.lock"));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| MachineStoreError::OpenCheckoutLock {
+                path: path.clone(),
+                source,
+            })?;
+        match file.try_lock() {
+            Ok(()) => Ok(CheckoutDestinationGuard { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => {
+                Err(MachineStoreError::CheckoutAlreadyLocked { path })
+            }
+            Err(fs::TryLockError::Error(source)) => {
+                Err(MachineStoreError::LockCheckout { path, source })
+            }
+        }
     }
 
     pub fn resolve(
@@ -616,6 +660,26 @@ pub enum MachineStoreError {
     PlatformDataDirectory,
     #[error("failed to create machine-store root at {path}")]
     CreateRoot {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create checkout lock directory at {path}")]
+    CreateCheckoutLockDirectory {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to open checkout lock at {path}")]
+    OpenCheckoutLock {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("checkout creation for this destination is already in progress ({path})")]
+    CheckoutAlreadyLocked { path: PathBuf },
+    #[error("failed to lock checkout destination at {path}")]
+    LockCheckout {
         path: PathBuf,
         #[source]
         source: io::Error,

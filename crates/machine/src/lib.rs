@@ -1,4 +1,3 @@
-mod checkout_creation;
 mod control_plane_client;
 mod creation_intent;
 mod git_projection;
@@ -32,10 +31,6 @@ use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
 use jj_lib::simple_op_store::SimpleOpStore;
 use thiserror::Error;
 
-pub use checkout_creation::{
-    CheckoutCreationGuard, CheckoutCreationIntent, CheckoutCreationIntentError,
-    CheckoutCreationPhase, CheckoutCreationTarget, CheckoutCreationToken,
-};
 pub use control_plane_client::{CloudRepository, ControlPlaneClient, ControlPlaneClientError};
 pub use creation_intent::{
     RepositoryCreationIntent, RepositoryCreationIntentError, RepositoryCreationKey,
@@ -50,8 +45,8 @@ pub use http_transport::HttpTransport;
 pub use install::{InstalledPack, PackInstallError};
 pub use machine_config::{MachineConfig, MachineConfigError, MachineId, SharedSecret};
 pub use machine_store::{
-    CatalogEntry, MACHINE_STORE_OVERRIDE, MachineStore, MachineStoreError, RepositoryId,
-    RepositoryIdentity, RepositoryIncarnation, RepositoryName,
+    CatalogEntry, CheckoutDestinationGuard, MACHINE_STORE_OVERRIDE, MachineStore,
+    MachineStoreError, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
 };
 pub use object_closure::{
     MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectId, ObjectKey,
