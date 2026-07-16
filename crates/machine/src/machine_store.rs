@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use jj_lib::settings::UserSettings;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::locked_json::{LockedJsonError, LockedJsonFile, sync_directory};
 use crate::{MachineRepository, MachineRepositoryError};
 
 pub const MACHINE_STORE_OVERRIDE: &str = "DEVSPACE_MACHINE_STORE_DIR";
@@ -19,7 +19,6 @@ const CATALOG_LOCK_FILE: &str = "repositories.lock";
 const MATERIALIZATION_LOCK_FILE: &str = "native.lock";
 const MATERIALIZATION_TEMP_PREFIX: &str = ".native-";
 const CHECKOUT_LOCK_DIRECTORY: &str = "locks/checkouts";
-static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RepositoryName(String);
@@ -440,87 +439,20 @@ impl MachineStore {
         exclusive: bool,
         operation: impl FnOnce(&mut PersistedCatalog) -> Result<T, MachineStoreError>,
     ) -> Result<T, MachineStoreError> {
-        let lock_path = self.root.join(CATALOG_LOCK_FILE);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| MachineStoreError::OpenCatalogLock {
-                path: lock_path.clone(),
-                source,
-            })?;
-        if exclusive {
-            lock.lock()
-        } else {
-            lock.lock_shared()
-        }
-        .map_err(|source| MachineStoreError::LockCatalog {
-            path: lock_path,
-            source,
-        })?;
-
-        let mut catalog = self.read_catalog()?;
+        let storage = self.catalog_storage();
+        let _lock = storage.lock(exclusive)?;
+        let mut catalog = storage.read_or_default()?;
         validate_catalog(&catalog)?;
         operation(&mut catalog)
     }
 
-    fn read_catalog(&self) -> Result<PersistedCatalog, MachineStoreError> {
-        let path = self.catalog_path();
-        match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|source| MachineStoreError::ReadCatalog { path, source }),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                Ok(PersistedCatalog::default())
-            }
-            Err(source) => Err(MachineStoreError::OpenCatalog { path, source }),
-        }
+    fn catalog_storage(&self) -> LockedJsonFile<'_> {
+        LockedJsonFile::new(&self.root, CATALOG_FILE, CATALOG_LOCK_FILE)
     }
 
     fn persist_catalog(&self, catalog: &PersistedCatalog) -> Result<(), MachineStoreError> {
-        let path = self.catalog_path();
-        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp_path = self.root.join(format!(
-            ".{CATALOG_FILE}.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
-        let mut temp = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .map_err(|source| MachineStoreError::WriteCatalog {
-                path: temp_path.clone(),
-                source,
-            })?;
-        let result = (|| {
-            serde_json::to_writer_pretty(&mut temp, catalog).map_err(|source| {
-                MachineStoreError::SerializeCatalog {
-                    path: temp_path.clone(),
-                    source,
-                }
-            })?;
-            temp.write_all(b"\n")
-                .and_then(|()| temp.sync_all())
-                .map_err(|source| MachineStoreError::WriteCatalog {
-                    path: temp_path.clone(),
-                    source,
-                })?;
-            fs::rename(&temp_path, &path).map_err(|source| MachineStoreError::ReplaceCatalog {
-                from: temp_path.clone(),
-                to: path,
-                source,
-            })?;
-            sync_directory(&self.root).map_err(|source| MachineStoreError::SyncRoot {
-                path: self.root.clone(),
-                source,
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temp_path);
-        }
-        result
+        self.catalog_storage().persist(catalog)?;
+        Ok(())
     }
 }
 
@@ -634,16 +566,6 @@ fn platform_data_directory() -> Result<PathBuf, MachineStoreError> {
     Err(MachineStoreError::PlatformDataDirectory)
 }
 
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 #[derive(Debug, Error)]
 pub enum MachineStoreError {
     #[error("repository name {0:?} must match [a-z0-9][a-z0-9._-]{{0,127}}")]
@@ -684,57 +606,10 @@ pub enum MachineStoreError {
         #[source]
         source: io::Error,
     },
-    #[error("failed to open machine-store catalog lock at {path}")]
-    OpenCatalogLock {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to lock machine-store catalog at {path}")]
-    LockCatalog {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to open machine-store catalog at {path}")]
-    OpenCatalog {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to decode machine-store catalog at {path}")]
-    ReadCatalog {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
+    #[error("machine-store catalog: {0}")]
+    CatalogStorage(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("machine-store catalog version {0} is unsupported")]
     UnsupportedCatalogVersion(u32),
-    #[error("failed to serialize machine-store catalog at {path}")]
-    SerializeCatalog {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("failed to write machine-store catalog at {path}")]
-    WriteCatalog {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to atomically replace machine-store catalog {to} from {from}")]
-    ReplaceCatalog {
-        from: PathBuf,
-        to: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to sync machine-store root at {path}")]
-    SyncRoot {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
     #[error("repository name {name} is already bound to {registered:?}, not {requested:?}")]
     ConflictingName {
         name: RepositoryName,
@@ -833,4 +708,10 @@ pub enum MachineStoreError {
     },
     #[error(transparent)]
     Repository(#[from] MachineRepositoryError),
+}
+
+impl From<LockedJsonError> for MachineStoreError {
+    fn from(error: LockedJsonError) -> Self {
+        Self::CatalogStorage(Box::new(error))
+    }
 }

@@ -311,8 +311,7 @@ async fn repo_new_replays_a_lost_response_with_the_durable_request_key() {
 
     let store = machine_store(temp.path());
     let name = RepositoryName::parse("retry-safe").unwrap();
-    let completed = store.repository_creation_intent(&name).unwrap().unwrap();
-    assert!(completed.is_complete());
+    assert!(store.repository_creation_intent(&name).unwrap().is_none());
     let entry = store.resolve(&name).unwrap().unwrap();
     let repository = MachineRepository::open(&entry.native_repository_path, &settings())
         .await
@@ -340,8 +339,9 @@ async fn repo_new_replays_a_lost_response_with_the_durable_request_key() {
     }
 
     let after_completion = ds(temp.path(), &config, &["repo", "new", "retry-safe"]);
+    assert_eq!(after_completion.status.code(), Some(1));
     assert!(
-        after_completion.status.success(),
+        stderr(&after_completion).contains("repository retry-safe already exists on this machine"),
         "{}",
         stderr(&after_completion)
     );
@@ -562,51 +562,12 @@ async fn repo_new_recovers_locally_after_cloud_success_precedes_catalog_write() 
     let name = RepositoryName::parse("catalog-retry").unwrap();
     let intent = store.repository_creation_intent(&name).unwrap().unwrap();
     assert!(intent.identity().is_some());
-    assert!(!intent.is_complete());
     fs::remove_dir(store.catalog_path()).unwrap();
 
     let second = ds(temp.path(), &config, &["repo", "new", "catalog-retry"]);
     assert!(second.status.success(), "{}", stderr(&second));
     assert!(store.resolve(&name).unwrap().is_some());
-    assert!(
-        store
-            .repository_creation_intent(&name)
-            .unwrap()
-            .unwrap()
-            .is_complete()
-    );
-}
-
-#[test]
-fn repo_new_does_not_restore_a_removed_completed_catalog_binding() {
-    let temp = tempfile::tempdir().unwrap();
-    let response = repository_response("removed-binding");
-    let (base_url, server) = create_server(1, move |_, _, stream| {
-        respond(stream, "200 OK", &response);
-    });
-    configure_machine(temp.path(), &base_url);
-    let config = write_cli_config(temp.path());
-
-    let first = ds(temp.path(), &config, &["repo", "new", "removed-binding"]);
-    server.join().unwrap();
-    assert!(first.status.success(), "{}", stderr(&first));
-
-    let store = machine_store(temp.path());
-    let name = RepositoryName::parse("removed-binding").unwrap();
-    let entry = store.resolve(&name).unwrap().unwrap();
-    store
-        .unregister_repository(&name, &entry.identity)
-        .unwrap()
-        .unwrap();
-
-    let retry = ds(temp.path(), &config, &["repo", "new", "removed-binding"]);
-    assert_eq!(retry.status.code(), Some(1), "{}", stderr(&retry));
-    assert!(
-        stderr(&retry).contains("recorded local catalog binding is missing or changed"),
-        "{}",
-        stderr(&retry)
-    );
-    assert!(store.resolve(&name).unwrap().is_none());
+    assert!(store.repository_creation_intent(&name).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -647,38 +608,148 @@ async fn repo_new_recovers_after_catalog_registration_precedes_materialization()
     );
     assert!(second.status.success(), "{}", stderr(&second));
     assert!(entry.native_repository_path.exists());
-    assert!(
-        store
-            .repository_creation_intent(&name)
-            .unwrap()
-            .unwrap()
-            .is_complete()
-    );
+    assert!(store.repository_creation_intent(&name).unwrap().is_none());
 }
 
 #[test]
-fn repo_new_does_not_adopt_a_same_name_repository_from_another_request() {
+fn repo_new_retries_a_retired_receipt_once_with_a_fresh_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let response = repository_response("expired-provisional");
+    let (base_url, server) = create_server(2, move |index, _, stream| {
+        if index == 0 {
+            respond(
+                stream,
+                "409 Conflict",
+                r#"{"error":"repository created by this request was retired"}"#,
+            );
+        } else {
+            respond(stream, "200 OK", &response);
+        }
+    });
+    configure_machine(temp.path(), &base_url);
+    let config = write_cli_config(temp.path());
+
+    let output = ds(
+        temp.path(),
+        &config,
+        &["repo", "new", "expired-provisional"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_ne!(
+        request_json(&requests[0])["idempotencyKey"],
+        request_json(&requests[1])["idempotencyKey"]
+    );
+
+    let store = machine_store(temp.path());
+    let name = RepositoryName::parse("expired-provisional").unwrap();
+    assert!(store.resolve(&name).unwrap().is_some());
+    assert!(store.repository_creation_intent(&name).unwrap().is_none());
+}
+
+#[test]
+fn repo_new_discards_an_idempotency_key_invariant_failure() {
     let temp = tempfile::tempdir().unwrap();
     let (base_url, server) = create_server(1, |_, _, stream| {
         respond(
             stream,
             "409 Conflict",
-            r#"{"error":"repository name is already in use"}"#,
+            r#"{"error":"idempotency key was already used for a different repository request"}"#,
         );
     });
     configure_machine(temp.path(), &base_url);
     let config = write_cli_config(temp.path());
 
+    let output = ds(temp.path(), &config, &["repo", "new", "broken-key"]);
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output)
+            .contains("idempotency key was already used for a different repository request"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        machine_store(temp.path())
+            .repository_creation_intent(&RepositoryName::parse("broken-key").unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn repo_new_retains_the_intent_for_authentication_and_server_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    for (name, status, body) in [
+        (
+            "auth-retry",
+            "401 Unauthorized",
+            r#"{"error":"unauthorized"}"#,
+        ),
+        (
+            "server-retry",
+            "503 Service Unavailable",
+            r#"{"error":"temporarily unavailable"}"#,
+        ),
+    ] {
+        let (base_url, server) = create_server(1, move |_, _, stream| {
+            respond(stream, status, body);
+        });
+        configure_machine(temp.path(), &base_url);
+
+        let output = ds(temp.path(), &config, &["repo", "new", name]);
+        server.join().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let intent = machine_store(temp.path())
+            .repository_creation_intent(&RepositoryName::parse(name).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(intent.identity().is_none());
+    }
+}
+
+#[test]
+fn repo_new_discards_a_name_conflict_and_can_create_after_the_name_is_freed() {
+    let temp = tempfile::tempdir().unwrap();
+    let response = repository_response("occupied");
+    let (base_url, server) = create_server(2, move |index, _, stream| {
+        if index == 0 {
+            respond(
+                stream,
+                "409 Conflict",
+                r#"{"error":"repository name is already in use"}"#,
+            );
+        } else {
+            respond(stream, "200 OK", &response);
+        }
+    });
+    configure_machine(temp.path(), &base_url);
+    let config = write_cli_config(temp.path());
+
     let output = ds(temp.path(), &config, &["repo", "new", "occupied"]);
-    let requests = server.join().unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("repository name is already in use"));
     assert!(!stderr(&output).contains(DEVELOPMENT_SECRET));
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with("POST /repositories HTTP/1.1"));
     let store = machine_store(temp.path());
     let name = RepositoryName::parse("occupied").unwrap();
     assert!(store.resolve(&name).unwrap().is_none());
-    let intent = store.repository_creation_intent(&name).unwrap().unwrap();
-    assert!(intent.identity().is_none());
+    assert!(store.repository_creation_intent(&name).unwrap().is_none());
+
+    let retry = ds(temp.path(), &config, &["repo", "new", "occupied"]);
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    assert!(store.resolve(&name).unwrap().is_some());
+    assert!(store.repository_creation_intent(&name).unwrap().is_none());
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.starts_with("POST /repositories HTTP/1.1"))
+    );
+    assert_ne!(
+        request_json(&requests[0])["idempotencyKey"],
+        request_json(&requests[1])["idempotencyKey"]
+    );
 }

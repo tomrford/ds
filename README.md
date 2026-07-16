@@ -84,18 +84,22 @@ The `ds` binary embeds jj-cli 0.42 as its parser and command engine. `ds repo
 new <name>` durably records a random 128-bit idempotency key before claiming the
 cloud name. A retry replays only that exact request, persists the returned
 opaque identity, registers it in the catalog and atomically publishes an empty
-stock-format bare repository. The completed receipt remains local so a retry
-after the final write is distinct from adopting an unrelated catalog entry.
-Normal jj workspaces use jj's stock loader and command behavior. `ds -R <name>
-log` resolves the name through the local catalog and opens its stock bare
-repository directly, with no temporary workspace or working-copy snapshot.
-There is no selected checkout, so `@` is unavailable. Other commands against a
-bare machine repository are rejected; this read path constructs no Devspace
-sync transport or HTTP client. Bare roots with jj repository or workspace
-config markers are rejected, and raw native paths are not repository
-identities. A missing local name fails locally because cloud first-use belongs
-to the repository lifecycle commands rather than the warm read path. Existing
-workspace paths, including explicit `-R` paths, retain stock jj behavior.
+stock-format bare repository. Network, authentication and server failures leave
+the pending key available for a later replay. A terminal cloud conflict discards
+the intent; an expired provisional creation is retried once immediately with a
+fresh key. Successful local materialization removes the intent because the
+catalog is then the durable record, and repeating the command reports that the
+repository already exists on this machine. Normal jj workspaces use jj's stock
+loader and command behavior. `ds -R <name> log` resolves the name through the
+local catalog and opens its stock bare repository directly, with no temporary
+workspace or working-copy snapshot. There is no selected checkout, so `@` is
+unavailable. Other commands against a bare machine repository are rejected;
+this read path constructs no Devspace sync transport or HTTP client. Bare roots
+with jj repository or workspace config markers are rejected, and raw native
+paths are not repository identities. A missing local name fails locally because
+cloud first-use belongs to the repository lifecycle commands rather than the
+warm read path. Existing workspace paths, including explicit `-R` paths, retain
+stock jj behavior.
 
 `ds add <name> -r <revision> <path>` creates a new working checkout for an
 existing local machine repository. Both the revision and destination are

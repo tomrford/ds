@@ -1,8 +1,8 @@
 use std::io::Write as _;
 
 use devspace_machine::{
-    ControlPlaneClient, MachineStore, RepositoryCreationKey, RepositoryCreationTarget,
-    RepositoryName,
+    ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind, MachineStore,
+    RepositoryCreationKey, RepositoryCreationTarget, RepositoryName,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -55,11 +55,8 @@ async fn create_empty_repository(
         .map_err(|error| user_error(error.to_string()))?;
     let client = ControlPlaneClient::new(&config).map_err(|error| user_error(error.to_string()))?;
     let target = RepositoryCreationTarget::from_config(&config);
-    let mut key = [0; 16];
-    getrandom::fill(&mut key)
-        .map_err(|_| user_error("failed to generate a repository creation idempotency key"))?;
     let mut intent = store
-        .begin_repository_creation(name.clone(), target, RepositoryCreationKey::new(key))
+        .begin_repository_creation(name.clone(), target.clone(), new_creation_key()?)
         .map_err(|error| user_error(error.to_string()))?;
 
     let identity = if let Some(identity) = intent.identity() {
@@ -70,16 +67,56 @@ async fn create_empty_repository(
         // the embedded command runner or machine-store work Tokio-specific.
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|_| user_error("failed to start the cloud transport runtime"))?;
-        let repository = runtime
-            .block_on(client.create_repository(&name, intent.key().bytes()))
-            .map_err(|error| user_error(error.to_string()))?;
-        intent = store
-            .record_repository_created(&intent, repository.identity)
-            .map_err(|error| user_error(error.to_string()))?;
-        intent
-            .identity()
-            .expect("recording the cloud response stores its identity")
-            .clone()
+        let mut retirement_retry_available = true;
+        loop {
+            if let Some(identity) = intent.identity() {
+                break identity.clone();
+            }
+            match runtime.block_on(client.create_repository(&name, intent.key().bytes())) {
+                Ok(repository) => {
+                    intent = store
+                        .record_repository_created(&intent, repository.identity)
+                        .map_err(|error| user_error(error.to_string()))?;
+                }
+                Err(error) => {
+                    let terminal_kind = match &error {
+                        ControlPlaneClientError::Remote { kind, .. } => Some(*kind),
+                        _ => None,
+                    };
+                    match terminal_kind {
+                        Some(
+                            ControlPlaneRemoteErrorKind::RepositoryCreationRetired
+                            | ControlPlaneRemoteErrorKind::RepositoryCreationRetiring,
+                        ) => {
+                            store
+                                .discard_repository_creation(&intent)
+                                .map_err(|error| user_error(error.to_string()))?;
+                            if retirement_retry_available {
+                                retirement_retry_available = false;
+                                intent = store
+                                    .begin_repository_creation(
+                                        name.clone(),
+                                        target.clone(),
+                                        new_creation_key()?,
+                                    )
+                                    .map_err(|error| user_error(error.to_string()))?;
+                                continue;
+                            }
+                        }
+                        Some(
+                            ControlPlaneRemoteErrorKind::RepositoryNameInUse
+                            | ControlPlaneRemoteErrorKind::IdempotencyKeyReused,
+                        ) => {
+                            store
+                                .discard_repository_creation(&intent)
+                                .map_err(|error| user_error(error.to_string()))?;
+                        }
+                        Some(ControlPlaneRemoteErrorKind::Other) | None => {}
+                    }
+                    return Err(user_error(error.to_string()));
+                }
+            }
+        }
     };
 
     let entry = store
@@ -96,4 +133,11 @@ async fn create_empty_repository(
 
     writeln!(ui.status(), "Created repository `{name}`.")?;
     Ok(())
+}
+
+fn new_creation_key() -> Result<RepositoryCreationKey, CommandError> {
+    let mut key = [0; 16];
+    getrandom::fill(&mut key)
+        .map_err(|_| user_error("failed to generate a repository creation idempotency key"))?;
+    Ok(RepositoryCreationKey::new(key))
 }

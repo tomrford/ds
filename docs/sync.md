@@ -234,8 +234,10 @@ random 128-bit key to the machine-store creation journal before sending that
 request. A lost response reuses the recorded key. Once a response is available,
 the command durably records its opaque repository ID and incarnation before
 catalog registration, then atomically publishes an empty stock repository. A
-completed receipt remains available for retries; a catalog entry without that
-receipt is never adopted as the result of a new create request.
+terminal name or key conflict discards the intent. A retired provisional
+creation discards the intent and retries once with a fresh key. Authentication,
+network and server failures retain the current intent. Successful local
+materialization removes it because the catalog is then the durable record.
 
 Deletion first blocks new authorization and retires the repository object. It
 then frees the tenant-local name. Recreating the name produces a different ID

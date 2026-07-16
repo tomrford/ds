@@ -1,22 +1,21 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::locked_json::{LockedJsonError, LockedJsonFile, hex_bytes};
 use crate::{
     MachineConfig, MachineId, MachineStore, MachineStoreError, RepositoryId, RepositoryIdentity,
     RepositoryIncarnation, RepositoryName,
 };
 
-const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
 const JOURNAL_FILE: &str = "repository-creations.json";
 const JOURNAL_LOCK_FILE: &str = "repository-creations.lock";
-static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct RepositoryCreationKey([u8; 16]);
@@ -58,7 +57,6 @@ pub struct RepositoryCreationIntent {
     key: RepositoryCreationKey,
     target: RepositoryCreationTarget,
     identity: Option<RepositoryIdentity>,
-    complete: bool,
 }
 
 impl RepositoryCreationIntent {
@@ -73,18 +71,12 @@ impl RepositoryCreationIntent {
     pub fn identity(&self) -> Option<&RepositoryIdentity> {
         self.identity.as_ref()
     }
-
-    pub fn is_complete(&self) -> bool {
-        self.complete
-    }
 }
 
 impl MachineStore {
     /// Starts a durable create saga or resumes the exact request already recorded.
     ///
-    /// The proposed key is ignored when an intent already exists. Completed
-    /// records are retained so a retry after the final local publication can be
-    /// distinguished from an unrelated repository already in the catalog.
+    /// The proposed key is ignored when an intent already exists.
     pub fn begin_repository_creation(
         &self,
         name: RepositoryName,
@@ -103,19 +95,6 @@ impl MachineStore {
                 if intent.target != target {
                     return Err(RepositoryCreationIntentError::TargetChanged(name));
                 }
-                if intent.complete {
-                    let recorded = intent
-                        .identity
-                        .as_ref()
-                        .expect("completed creation intents have a cloud identity");
-                    let binding = self.resolve(&name)?;
-                    if binding
-                        .as_ref()
-                        .is_none_or(|entry| &entry.identity != recorded)
-                    {
-                        return Err(RepositoryCreationIntentError::CompletedBindingChanged(name));
-                    }
-                }
                 return Ok(intent);
             }
             if self.resolve(&name)?.is_some() {
@@ -126,7 +105,6 @@ impl MachineStore {
                 key: proposed_key,
                 target,
                 identity: None,
-                complete: false,
             };
             journal
                 .creations
@@ -165,11 +143,11 @@ impl MachineStore {
         })
     }
 
-    /// Marks local catalog registration and atomic native materialization complete.
+    /// Removes an intent after local catalog registration and materialization succeed.
     pub fn complete_repository_creation(
         &self,
         intent: &RepositoryCreationIntent,
-    ) -> Result<RepositoryCreationIntent, RepositoryCreationIntentError> {
+    ) -> Result<(), RepositoryCreationIntentError> {
         self.with_creation_journal(true, |journal| {
             let current = current_intent(journal, intent)?;
             if current.identity.is_none() {
@@ -177,19 +155,24 @@ impl MachineStore {
                     intent.name.clone(),
                 ));
             }
-            if current.complete {
-                return Ok(current);
-            }
-            let updated = RepositoryCreationIntent {
-                complete: true,
-                ..current
-            };
-            journal.creations.insert(
-                updated.name.as_str().to_owned(),
-                PersistedIntent::from(&updated),
-            );
+            require_exact_intent(&current, intent)?;
+            journal.creations.remove(intent.name.as_str());
             self.persist_creation_journal(journal)?;
-            Ok(updated)
+            Ok(())
+        })
+    }
+
+    /// Discards an intent after the cloud proves that request cannot succeed.
+    pub fn discard_repository_creation(
+        &self,
+        intent: &RepositoryCreationIntent,
+    ) -> Result<(), RepositoryCreationIntentError> {
+        self.with_creation_journal(true, |journal| {
+            let current = current_intent(journal, intent)?;
+            require_exact_intent(&current, intent)?;
+            journal.creations.remove(intent.name.as_str());
+            self.persist_creation_journal(journal)?;
+            Ok(())
         })
     }
 
@@ -214,92 +197,23 @@ impl MachineStore {
         exclusive: bool,
         operation: impl FnOnce(&mut PersistedJournal) -> Result<T, RepositoryCreationIntentError>,
     ) -> Result<T, RepositoryCreationIntentError> {
-        let lock_path = self.root().join(JOURNAL_LOCK_FILE);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| RepositoryCreationIntentError::OpenLock {
-                path: lock_path.clone(),
-                source,
-            })?;
-        if exclusive {
-            lock.lock()
-        } else {
-            lock.lock_shared()
-        }
-        .map_err(|source| RepositoryCreationIntentError::Lock {
-            path: lock_path,
-            source,
-        })?;
-
-        let mut journal = self.read_creation_journal()?;
+        let storage = self.creation_journal_storage();
+        let _lock = storage.lock(exclusive)?;
+        let mut journal = storage.read_or_default()?;
         validate_journal(&journal)?;
         operation(&mut journal)
     }
 
-    fn read_creation_journal(&self) -> Result<PersistedJournal, RepositoryCreationIntentError> {
-        let path = self.root().join(JOURNAL_FILE);
-        match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|source| RepositoryCreationIntentError::Decode { path, source }),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                Ok(PersistedJournal::default())
-            }
-            Err(source) => Err(RepositoryCreationIntentError::Read { path, source }),
-        }
+    fn creation_journal_storage(&self) -> LockedJsonFile<'_> {
+        LockedJsonFile::new(self.root(), JOURNAL_FILE, JOURNAL_LOCK_FILE)
     }
 
     fn persist_creation_journal(
         &self,
         journal: &PersistedJournal,
     ) -> Result<(), RepositoryCreationIntentError> {
-        let path = self.root().join(JOURNAL_FILE);
-        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp_path = self.root().join(format!(
-            ".{JOURNAL_FILE}.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
-        let mut temp = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .map_err(|source| RepositoryCreationIntentError::Write {
-                path: temp_path.clone(),
-                source,
-            })?;
-        let result = (|| {
-            serde_json::to_writer_pretty(&mut temp, journal).map_err(|source| {
-                RepositoryCreationIntentError::Serialize {
-                    path: temp_path.clone(),
-                    source,
-                }
-            })?;
-            temp.write_all(b"\n")
-                .and_then(|()| temp.sync_all())
-                .map_err(|source| RepositoryCreationIntentError::Write {
-                    path: temp_path.clone(),
-                    source,
-                })?;
-            fs::rename(&temp_path, &path).map_err(|source| {
-                RepositoryCreationIntentError::Replace {
-                    from: temp_path.clone(),
-                    to: path,
-                    source,
-                }
-            })?;
-            sync_directory(self.root()).map_err(|source| RepositoryCreationIntentError::SyncRoot {
-                path: self.root().to_owned(),
-                source,
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temp_path);
-        }
-        result
+        self.creation_journal_storage().persist(journal)?;
+        Ok(())
     }
 }
 
@@ -328,6 +242,18 @@ fn current_intent(
     Ok(current)
 }
 
+fn require_exact_intent(
+    current: &RepositoryCreationIntent,
+    expected: &RepositoryCreationIntent,
+) -> Result<(), RepositoryCreationIntentError> {
+    if current.identity != expected.identity {
+        return Err(RepositoryCreationIntentError::IntentChanged(
+            expected.name.clone(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedJournal {
@@ -352,7 +278,6 @@ struct PersistedIntent {
     machine_id: String,
     repository_id: Option<String>,
     incarnation: Option<String>,
-    complete: bool,
 }
 
 impl From<&RepositoryCreationIntent> for PersistedIntent {
@@ -369,7 +294,6 @@ impl From<&RepositoryCreationIntent> for PersistedIntent {
                 .identity
                 .as_ref()
                 .map(|identity| identity.incarnation.as_str().to_owned()),
-            complete: intent.complete,
         }
     }
 }
@@ -395,9 +319,6 @@ fn parse_intent(
         (None, None) => None,
         _ => return Err(RepositoryCreationIntentError::IncompleteCloudIdentity(name)),
     };
-    if persisted.complete && identity.is_none() {
-        return Err(RepositoryCreationIntentError::CloudIdentityMissing(name));
-    }
     Ok(RepositoryCreationIntent {
         name,
         key: RepositoryCreationKey(parse_hex_16(&persisted.idempotency_key)?),
@@ -406,7 +327,6 @@ fn parse_intent(
             machine_id: MachineId::parse(persisted.machine_id.clone())?,
         },
         identity,
-        complete: persisted.complete,
     })
 }
 
@@ -441,29 +361,9 @@ fn hex_digit(byte: u8) -> Result<u8, RepositoryCreationIntentError> {
     }
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 #[derive(Debug, Error)]
 pub enum RepositoryCreationIntentError {
-    #[error("repository {0} is already registered locally by a different workflow")]
+    #[error("repository {0} already exists on this machine")]
     AlreadyRegistered(RepositoryName),
     #[error(
         "machine configuration changed while repository {0} creation is pending; restore the original control-plane configuration to resume it"
@@ -479,10 +379,6 @@ pub enum RepositoryCreationIntentError {
     IncompleteCloudIdentity(RepositoryName),
     #[error("repository {0} creation has no recorded cloud identity")]
     CloudIdentityMissing(RepositoryName),
-    #[error(
-        "repository {0} was created previously, but its recorded local catalog binding is missing or changed; restore that binding or choose a different repository name"
-    )]
-    CompletedBindingChanged(RepositoryName),
     #[error("repository creation idempotency key is invalid")]
     InvalidKey,
     #[error("repository creation journal version {0} is unsupported")]
@@ -493,55 +389,8 @@ pub enum RepositoryCreationIntentError {
         #[source]
         source: io::Error,
     },
-    #[error("failed to open repository creation lock at {path}")]
-    OpenLock {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to lock repository creation journal at {path}")]
-    Lock {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to read repository creation journal at {path}")]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to decode repository creation journal at {path}")]
-    Decode {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("failed to serialize repository creation journal at {path}")]
-    Serialize {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("failed to write repository creation journal at {path}")]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to atomically replace repository creation journal {to} from {from}")]
-    Replace {
-        from: PathBuf,
-        to: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to sync machine-store root at {path}")]
-    SyncRoot {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
+    #[error("repository creation journal: {0}")]
+    JournalStorage(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     MachineStore(Box<MachineStoreError>),
     #[error(transparent)]
@@ -551,5 +400,11 @@ pub enum RepositoryCreationIntentError {
 impl From<MachineStoreError> for RepositoryCreationIntentError {
     fn from(error: MachineStoreError) -> Self {
         Self::MachineStore(Box::new(error))
+    }
+}
+
+impl From<LockedJsonError> for RepositoryCreationIntentError {
+    fn from(error: LockedJsonError) -> Self {
+        Self::JournalStorage(Box::new(error))
     }
 }

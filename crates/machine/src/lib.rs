@@ -3,6 +3,7 @@ mod creation_intent;
 mod git_projection;
 mod http_transport;
 mod install;
+mod locked_json;
 mod machine_config;
 mod machine_store;
 mod object_closure;
@@ -31,7 +32,9 @@ use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
 use jj_lib::simple_op_store::SimpleOpStore;
 use thiserror::Error;
 
-pub use control_plane_client::{CloudRepository, ControlPlaneClient, ControlPlaneClientError};
+pub use control_plane_client::{
+    CloudRepository, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
+};
 pub use creation_intent::{
     RepositoryCreationIntent, RepositoryCreationIntentError, RepositoryCreationKey,
     RepositoryCreationTarget,

@@ -4,6 +4,7 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::locked_json::hex_bytes;
 use crate::{
     MachineConfig, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
     SharedSecret,
@@ -45,6 +46,15 @@ struct RepositoryResponse {
 #[serde(deny_unknown_fields)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlPlaneRemoteErrorKind {
+    RepositoryNameInUse,
+    RepositoryCreationRetired,
+    RepositoryCreationRetiring,
+    IdempotencyKeyReused,
+    Other,
 }
 
 impl ControlPlaneClient {
@@ -116,14 +126,15 @@ impl ControlPlaneClient {
         let status = response.status();
         let bytes = read_bounded(response, MAX_DIRECTORY_RESPONSE_BYTES).await?;
         if !status.is_success() {
-            let error = serde_json::from_slice::<ErrorResponse>(&bytes)
-                .map_or_else(
-                    |_| "cloud request failed without a valid error body".to_owned(),
-                    |body| body.error,
-                )
-                .replace(self.shared_secret.expose(), "[REDACTED]");
+            let raw_error = serde_json::from_slice::<ErrorResponse>(&bytes).map_or_else(
+                |_| "cloud request failed without a valid error body".to_owned(),
+                |body| body.error,
+            );
+            let kind = classify_remote_error(status.as_u16(), &raw_error);
+            let error = raw_error.replace(self.shared_secret.expose(), "[REDACTED]");
             return Err(ControlPlaneClientError::Remote {
                 status: status.as_u16(),
+                kind,
                 error,
             });
         }
@@ -139,6 +150,25 @@ impl ControlPlaneClient {
             return Err(ControlPlaneClientError::UnexpectedRepositoryName);
         }
         Ok(repository)
+    }
+}
+
+fn classify_remote_error(status: u16, error: &str) -> ControlPlaneRemoteErrorKind {
+    if status != 409 {
+        return ControlPlaneRemoteErrorKind::Other;
+    }
+    match error {
+        "repository name is already in use" => ControlPlaneRemoteErrorKind::RepositoryNameInUse,
+        "repository created by this request was retired" => {
+            ControlPlaneRemoteErrorKind::RepositoryCreationRetired
+        }
+        "repository created by this request is retiring" => {
+            ControlPlaneRemoteErrorKind::RepositoryCreationRetiring
+        }
+        "idempotency key was already used for a different repository request" => {
+            ControlPlaneRemoteErrorKind::IdempotencyKeyReused
+        }
+        _ => ControlPlaneRemoteErrorKind::Other,
     }
 }
 
@@ -162,16 +192,6 @@ async fn read_bounded(
     Ok(bytes)
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
 #[derive(Debug, Error)]
 pub enum ControlPlaneClientError {
     #[error("shared development credential cannot be represented as an HTTP header")]
@@ -183,7 +203,11 @@ pub enum ControlPlaneClientError {
     #[error("cloud directory response exceeds the {0}-byte limit")]
     ResponseTooLarge(usize),
     #[error("cloud directory returned HTTP {status}: {error}")]
-    Remote { status: u16, error: String },
+    Remote {
+        status: u16,
+        kind: ControlPlaneRemoteErrorKind,
+        error: String,
+    },
     #[error("cloud directory returned an invalid response")]
     Decode(#[from] serde_json::Error),
     #[error("cloud directory returned a different repository name")]
@@ -252,6 +276,37 @@ mod tests {
         assert!(!format!("{config:?}").contains(secret));
         let client = ControlPlaneClient::new(&config).unwrap();
         assert!(!format!("{:?}", client.authorization).contains(secret));
+    }
+
+    #[test]
+    fn classifies_terminal_repository_creation_conflicts() {
+        assert_eq!(
+            classify_remote_error(409, "repository name is already in use"),
+            ControlPlaneRemoteErrorKind::RepositoryNameInUse
+        );
+        assert_eq!(
+            classify_remote_error(409, "repository created by this request was retired"),
+            ControlPlaneRemoteErrorKind::RepositoryCreationRetired
+        );
+        assert_eq!(
+            classify_remote_error(409, "repository created by this request is retiring"),
+            ControlPlaneRemoteErrorKind::RepositoryCreationRetiring
+        );
+        assert_eq!(
+            classify_remote_error(
+                409,
+                "idempotency key was already used for a different repository request"
+            ),
+            ControlPlaneRemoteErrorKind::IdempotencyKeyReused
+        );
+        assert_eq!(
+            classify_remote_error(500, "repository name is already in use"),
+            ControlPlaneRemoteErrorKind::Other
+        );
+        assert_eq!(
+            classify_remote_error(409, "another conflict"),
+            ControlPlaneRemoteErrorKind::Other
+        );
     }
 
     #[tokio::test]

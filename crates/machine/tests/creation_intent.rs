@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -29,7 +30,7 @@ fn target(url: &str, machine: u8) -> RepositoryCreationTarget {
 }
 
 #[test]
-fn intent_reuses_the_original_request_and_retains_a_completed_receipt() {
+fn intent_reuses_the_original_request_then_completion_deletes_it() {
     let temp = tempfile::tempdir().unwrap();
     let store = MachineStore::new(temp.path());
     let repository_name = name("retry-safe");
@@ -62,8 +63,13 @@ fn intent_reuses_the_original_request_and_retains_a_completed_receipt() {
     reopened
         .register_repository(repository_name.clone(), cloud_identity.clone())
         .unwrap();
-    let completed = reopened.complete_repository_creation(&recorded).unwrap();
-    assert!(completed.is_complete());
+    reopened.complete_repository_creation(&recorded).unwrap();
+    assert!(
+        reopened
+            .repository_creation_intent(&repository_name)
+            .unwrap()
+            .is_none()
+    );
 
     let after_completion = MachineStore::new(temp.path())
         .begin_repository_creation(
@@ -71,10 +77,65 @@ fn intent_reuses_the_original_request_and_retains_a_completed_receipt() {
             creation_target,
             RepositoryCreationKey::new([0xbc; 16]),
         )
+        .unwrap_err();
+    assert!(matches!(
+        &after_completion,
+        RepositoryCreationIntentError::AlreadyRegistered(_)
+    ));
+    assert!(
+        after_completion
+            .to_string()
+            .contains("already exists on this machine")
+    );
+}
+
+#[test]
+fn discarded_intent_allows_a_fresh_request_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = MachineStore::new(temp.path());
+    let repository_name = name("fresh-after-rejection");
+    let creation_target = target("https://worker.example.test", 0x12);
+    let first = store
+        .begin_repository_creation(
+            repository_name.clone(),
+            creation_target.clone(),
+            RepositoryCreationKey::new([0x34; 16]),
+        )
         .unwrap();
-    assert_eq!(after_completion.key().bytes(), [0x34; 16]);
-    assert_eq!(after_completion.identity(), Some(&cloud_identity));
-    assert!(after_completion.is_complete());
+
+    store.discard_repository_creation(&first).unwrap();
+    assert!(
+        store
+            .repository_creation_intent(&repository_name)
+            .unwrap()
+            .is_none()
+    );
+    let second = store
+        .begin_repository_creation(
+            repository_name,
+            creation_target,
+            RepositoryCreationKey::new([0x56; 16]),
+        )
+        .unwrap();
+    assert_eq!(second.key().bytes(), [0x56; 16]);
+}
+
+#[test]
+fn older_journal_versions_are_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("repository-creations.json"),
+        r#"{"version":1,"creations":{}}"#,
+    )
+    .unwrap();
+
+    let error = MachineStore::new(temp.path())
+        .repository_creation_intent(&name("old-journal"))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RepositoryCreationIntentError::UnsupportedVersion(1)
+    ));
 }
 
 #[test]
