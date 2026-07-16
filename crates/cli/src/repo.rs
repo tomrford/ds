@@ -9,11 +9,14 @@ use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
 
 use crate::add::{AddArgs, add_checkout};
+use crate::remove::{RemoveArgs, remove_checkout};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum DevspaceCommand {
     /// Create a checkout of a repository already present on this machine.
     Add(AddArgs),
+    /// Remove a disposable checkout while preserving its repository.
+    Remove(RemoveArgs),
     /// Manage cloud repositories.
     Repo(RepoArgs),
 }
@@ -37,6 +40,7 @@ pub(crate) async fn run(
 ) -> Result<(), CommandError> {
     match args {
         DevspaceCommand::Add(args) => add_checkout(ui, command, args).await,
+        DevspaceCommand::Remove(args) => remove_checkout(ui, command, args).await,
         DevspaceCommand::Repo(RepoArgs {
             command: RepoCommand::New { name },
         }) => create_empty_repository(ui, command, name).await,

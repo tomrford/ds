@@ -1,5 +1,7 @@
 mod add;
 mod bare_workspace;
+mod checkout;
+mod remove;
 mod repo;
 
 use std::process::ExitCode;

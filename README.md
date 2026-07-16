@@ -68,11 +68,11 @@ demonstrating it end to end is an open gate for machine enrolment.
 ## Offline behavior
 
 Every command except `ds repo new` works without connectivity. Reads and edits
-are local jj operations against the machine store. `ds add` resolves names in
-the local catalog, registers the workspace in the local repository and never
-opens a transport. Work created offline converges later: the sync engine
-uploads and installs at the next boundary that reaches the Worker, and jj's
-operation merge absorbs divergence created meanwhile on other machines.
+are local jj operations against the machine store. `ds add` and `ds remove`
+resolve checkout state locally and never open a transport. Work created offline
+converges later: the sync engine uploads and installs at the next boundary that
+reaches the Worker, and jj's operation merge absorbs divergence created
+meanwhile on other machines.
 
 `ds repo new` requires connectivity because reserving a tenant-local name is a
 global operation on the directory. Offline repository creation is outside the
@@ -148,7 +148,23 @@ sibling staging directory, synchronized and published with a no-replace rename.
 Stale staging with the matching marker is disposable and rebuilt wholesale. A
 machine-local per-destination lock rejects simultaneous creators; its file has no
 state. Removing a completed checkout directory and repeating the same command
-rebuilds it from the registered workspace.
+rebuilds it from the registered workspace. Use `ds remove` for normal removal
+so the workspace identity is freed.
+
+`ds remove <path>` removes one checkout without removing its native repository
+or catalog entry. The command accepts only a directory with a valid Devspace
+ownership marker whose repository identity is in the local catalog. It
+snapshots the checkout first, including stale working-copy recovery, so final
+file edits remain in the shared store. It then forgets the workspace, removes
+its workspace-path record and deletes the checkout directory. Other checkouts
+and repository data remain available. `--json` prints the removed repository,
+workspace and root identity.
+
+Removal also converges from interrupted states. A marked directory whose
+workspace is already forgotten is deleted. If the directory is already gone,
+the deterministic workspace identity and stored path allow the command to
+forget its remaining registration. An unmarked directory or a marker whose
+repository is absent from the catalog is left untouched.
 
 Downloaded packs are decoded and hash-checked again before the machine installs
 their canonical objects into the stock simple stores with no-clobber writes.

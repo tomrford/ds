@@ -2,10 +2,6 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use std::io::Read as _;
-
-use blake2::{Blake2b512, Digest as _};
 use devspace_machine::{CatalogEntry, MachineRepository, MachineStore, RepositoryName};
 use jj_cli::cli_util::{CommandHelper, RevisionArg};
 use jj_cli::command_error::{CommandError, user_error};
@@ -21,10 +17,11 @@ use jj_lib::workspace::{Workspace, default_working_copy_factories, default_worki
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
 use crate::bare_workspace::{is_stock_bare_repository, workspace_for_repository};
-
-const CHECKOUT_OWNER_FILE: &str = "devspace-checkout-owner";
-const DESTINATION_HASH_BYTES: usize = 12;
-const MAX_OWNER_MARKER_BYTES: u64 = 16 * 1024;
+use crate::checkout::{
+    CHECKOUT_OWNER_FILE, CheckoutOwner, absolute_path, canonical_destination_path,
+    destination_hash, ensure_destination_parent, owned_directory_matches,
+    reject_unsupported_global_options, workspace_name,
+};
 
 #[derive(clap::Args)]
 pub(crate) struct AddArgs {
@@ -51,14 +48,6 @@ struct AddedCheckout<'a> {
     workspace_id: &'a str,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-struct CheckoutOwner {
-    repository_id: String,
-    incarnation: String,
-    workspace_name: String,
-}
-
 #[derive(Clone, Copy)]
 enum AddOutcome {
     Created,
@@ -71,7 +60,7 @@ pub(crate) async fn add_checkout(
     command: &CommandHelper,
     args: AddArgs,
 ) -> Result<(), CommandError> {
-    reject_unsupported_global_options(command)?;
+    reject_unsupported_global_options(command, "add")?;
     let requested_path = absolute_path(command.cwd(), &args.path);
     if args.json && requested_path.to_str().is_none() {
         return Err(user_error(
@@ -100,15 +89,12 @@ pub(crate) async fn add_checkout(
     ensure_destination_parent(&requested_path)?;
     let requested_path = canonical_destination_path(&requested_path)?;
     let destination_hash = destination_hash(&requested_path);
-    let workspace_name = WorkspaceNameBuf::from(format!(
-        "{}-{destination_hash}",
-        machine.machine_id().as_str()
-    ));
-    let owner = CheckoutOwner {
-        repository_id: entry.identity.repository_id.as_str().to_owned(),
-        incarnation: entry.identity.incarnation.as_str().to_owned(),
-        workspace_name: workspace_name.as_str().to_owned(),
-    };
+    let workspace_name = workspace_name(machine.machine_id().as_str(), &requested_path);
+    let owner = CheckoutOwner::new(
+        entry.identity.repository_id.as_str(),
+        entry.identity.incarnation.as_str(),
+        workspace_name.as_str(),
+    );
     let _destination_guard = store
         .try_lock_checkout_destination(&destination_hash)
         .map_err(|error| user_error(error.to_string()))?;
@@ -240,70 +226,6 @@ pub(crate) async fn add_checkout(
         }
     }
     Ok(())
-}
-
-fn reject_unsupported_global_options(command: &CommandHelper) -> Result<(), CommandError> {
-    let global = command.global_args();
-    if global.no_integrate_operation {
-        return Err(user_error(
-            "`ds add` does not support `--no-integrate-operation`",
-        ));
-    }
-    if global.ignore_working_copy {
-        return Err(user_error(
-            "`ds add` does not support `--ignore-working-copy`",
-        ));
-    }
-    if global.at_operation.is_some() {
-        return Err(user_error("`ds add` does not support `--at-operation`"));
-    }
-    Ok(())
-}
-
-fn absolute_path(cwd: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_owned()
-    } else {
-        cwd.join(path)
-    }
-}
-
-fn ensure_destination_parent(requested: &Path) -> Result<(), CommandError> {
-    requested.file_name().ok_or_else(|| {
-        user_error(format!(
-            "Checkout destination {} has no directory name",
-            requested.display()
-        ))
-    })?;
-    let parent = requested.parent().ok_or_else(|| {
-        user_error(format!(
-            "Checkout destination {} has no parent directory",
-            requested.display()
-        ))
-    })?;
-    fs::create_dir_all(parent).map_err(|error| {
-        user_error(format!(
-            "Failed to create checkout parent {}: {error}",
-            parent.display()
-        ))
-    })?;
-    Ok(())
-}
-
-fn canonical_destination_path(requested: &Path) -> Result<PathBuf, CommandError> {
-    let name = requested
-        .file_name()
-        .expect("destination name was checked before canonicalization");
-    let parent = requested
-        .parent()
-        .expect("destination parent was checked before canonicalization");
-    let parent = dunce::canonicalize(parent).map_err(|error| {
-        user_error(format!(
-            "Failed to canonicalize checkout parent {}: {error}",
-            parent.display()
-        ))
-    })?;
-    Ok(parent.join(name))
 }
 
 async fn resolve_base_revision(
@@ -449,8 +371,14 @@ async fn rebuild_checkout(
     ensure_repository_pointer(&staging, &repository_path)?;
     let mut workspace =
         initialize_working_copy(&staging, repo.as_ref(), workspace_name.to_owned())?;
+    let working_copy_commit = workspace
+        .repo_loader()
+        .store()
+        .get_commit_async(working_copy_commit.id())
+        .await
+        .map_err(|error| format!("failed to reload checkout commit: {error}"))?;
     workspace
-        .check_out(repo.op_id().clone(), None, working_copy_commit)
+        .check_out(repo.op_id().clone(), None, &working_copy_commit)
         .await
         .map_err(|error| format!("failed to materialize checkout files: {error}"))?;
     sync_directory(&staging).map_err(|error| format!("failed to sync staged checkout: {error}"))?;
@@ -604,101 +532,6 @@ async fn update_source_operation(
         .map_err(|error| error.to_string())
 }
 
-#[cfg(unix)]
-fn owned_directory_matches(path: &Path, owner: &CheckoutOwner) -> Result<bool, String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "owned checkout path has no parent".to_owned())?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| "owned checkout path has no file name".to_owned())?;
-    let parent = fs::File::open(parent)
-        .map_err(|error| format!("failed to open checkout parent: {error}"))?;
-    let Some(root) = openat_nofollow(&parent, name, true)? else {
-        return Ok(false);
-    };
-    let Some(jj_dir) = openat_nofollow(&root, std::ffi::OsStr::new(".jj"), true)? else {
-        return Ok(false);
-    };
-    let Some(marker) = openat_nofollow(&jj_dir, std::ffi::OsStr::new(CHECKOUT_OWNER_FILE), false)?
-    else {
-        return Ok(false);
-    };
-    let marker = fs::File::from(marker);
-    if !marker
-        .metadata()
-        .map_err(|error| format!("failed to inspect checkout ownership marker: {error}"))?
-        .is_file()
-    {
-        return Ok(false);
-    }
-    let mut bytes = Vec::new();
-    std::io::Read::take(marker, MAX_OWNER_MARKER_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("failed to read checkout ownership marker: {error}"))?;
-    if bytes.len() as u64 > MAX_OWNER_MARKER_BYTES {
-        return Ok(false);
-    }
-    Ok(serde_json::from_slice::<CheckoutOwner>(&bytes).is_ok_and(|actual| actual == *owner))
-}
-
-#[cfg(unix)]
-fn openat_nofollow(
-    directory: impl rustix::fd::AsFd,
-    name: &std::ffi::OsStr,
-    is_directory: bool,
-) -> Result<Option<rustix::fd::OwnedFd>, String> {
-    let mut flags =
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW;
-    if is_directory {
-        flags |= rustix::fs::OFlags::DIRECTORY;
-    }
-    match rustix::fs::openat(directory, name, flags, rustix::fs::Mode::empty()) {
-        Ok(file) => Ok(Some(file)),
-        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
-            Ok(None)
-        }
-        Err(error) => Err(format!(
-            "failed to inspect owned checkout component: {error}"
-        )),
-    }
-}
-
-#[cfg(not(unix))]
-fn owned_directory_matches(path: &Path, owner: &CheckoutOwner) -> Result<bool, String> {
-    // Checkout creation protects against accidental collisions and stale leftovers, not local
-    // adversaries, so non-Unix platforms use best-effort path-based ownership checks.
-    for component in [path.to_owned(), path.join(".jj")] {
-        let metadata = match fs::symlink_metadata(&component) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(format!("failed to inspect checkout ownership: {error}")),
-        };
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            return Ok(false);
-        }
-    }
-    let marker = path.join(".jj").join(CHECKOUT_OWNER_FILE);
-    let metadata = match fs::symlink_metadata(&marker) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(format!(
-                "failed to inspect checkout ownership marker: {error}"
-            ));
-        }
-    };
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Ok(false);
-    }
-    if metadata.len() > MAX_OWNER_MARKER_BYTES {
-        return Ok(false);
-    }
-    let bytes = fs::read(&marker)
-        .map_err(|error| format!("failed to read checkout ownership marker: {error}"))?;
-    Ok(serde_json::from_slice::<CheckoutOwner>(&bytes).is_ok_and(|actual| actual == *owner))
-}
-
 fn record_workspace_destination(
     repository_path: &Path,
     workspace_name: &WorkspaceName,
@@ -769,33 +602,6 @@ fn publish_directory_noclobber(staging: &Path, destination: &Path) -> Result<(),
             .expect("checkout destination has a parent"),
     )
     .map_err(|error| format!("failed to sync checkout parent: {error}"))
-}
-
-fn destination_hash(path: &Path) -> String {
-    let encoded = encode_path(path);
-    let digest = Blake2b512::digest(encoded.as_bytes());
-    hex_bytes(&digest[..DESTINATION_HASH_BYTES])
-}
-
-#[cfg(unix)]
-fn encode_path(path: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt as _;
-    format!("unix:{}", hex_bytes(path.as_os_str().as_bytes()))
-}
-
-#[cfg(windows)]
-fn encode_path(path: &Path) -> String {
-    use std::os::windows::ffi::OsStrExt as _;
-    let bytes = path
-        .as_os_str()
-        .encode_wide()
-        .flat_map(u16::to_le_bytes)
-        .collect::<Vec<_>>();
-    format!("windows:{}", hex_bytes(&bytes))
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(unix)]
