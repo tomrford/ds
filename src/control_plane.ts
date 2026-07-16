@@ -9,6 +9,16 @@ const INCARNATION_PATTERN = /^[0-9a-f]{32}$/;
 const IDEMPOTENCY_KEY_PATTERN = /^[0-9a-f]{32}$/;
 const PROVISIONAL_RETENTION_MS = 24 * 60 * 60 * 1_000;
 const RETIREMENT_RECOVERY_BATCH = 64;
+const NAME_IN_USE = "name-in-use";
+const CREATION_RETIRED = "creation-retired";
+const CREATION_RETIRING = "creation-retiring";
+const IDEMPOTENCY_KEY_REUSED = "idempotency-key-reused";
+
+type ControlPlaneErrorCode =
+  | typeof NAME_IN_USE
+  | typeof CREATION_RETIRED
+  | typeof CREATION_RETIRING
+  | typeof IDEMPOTENCY_KEY_REUSED;
 
 export interface AuthenticatedPrincipal {
   userId: string;
@@ -38,6 +48,7 @@ class ControlPlaneError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly code?: ControlPlaneErrorCode,
   ) {
     super(message);
   }
@@ -133,14 +144,23 @@ export class ControlPlane extends DurableObject<Env> {
             throw new ControlPlaneError(
               "idempotency key was already used for a different repository request",
               409,
+              IDEMPOTENCY_KEY_REUSED,
             );
           }
           const repository = this.repositoryById(identity.userId, receipt.repository_id);
           if (repository === undefined || repository.status === "deleted") {
-            throw new ControlPlaneError("repository created by this request was retired", 409);
+            throw new ControlPlaneError(
+              "repository created by this request was retired",
+              409,
+              CREATION_RETIRED,
+            );
           }
           if (repository.status === "retiring") {
-            throw new ControlPlaneError("repository created by this request is retiring", 409);
+            throw new ControlPlaneError(
+              "repository created by this request is retiring",
+              409,
+              CREATION_RETIRING,
+            );
           }
           return {
             authority: {
@@ -160,7 +180,9 @@ export class ControlPlane extends DurableObject<Env> {
             request.name,
           )
           .one().count;
-        if (occupied !== 0) throw new ControlPlaneError("repository name is already in use", 409);
+        if (occupied !== 0) {
+          throw new ControlPlaneError("repository name is already in use", 409, NAME_IN_USE);
+        }
 
         const repositoryId = this.env.REPOSITORIES.newUniqueId().toString();
         const incarnation = randomHex(16);
@@ -515,10 +537,12 @@ function expectedFailure(error: unknown) {
 }
 
 function failure(error: unknown, status: number) {
+  const code = error instanceof ControlPlaneError ? error.code : undefined;
   return {
     ok: false as const,
     status,
     error: error instanceof Error ? error.message : String(error),
+    ...(code === undefined ? {} : { code }),
   };
 }
 

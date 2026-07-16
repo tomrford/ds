@@ -1,5 +1,5 @@
 import { env, exports } from "cloudflare:workers";
-import { evictDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 const packId = "00".repeat(64);
@@ -143,6 +143,18 @@ describe("cloud identity and repository directory", () => {
     expect(conflict.status).toBe(409);
     expect(await conflict.json()).toEqual({
       error: "idempotency key was already used for a different repository request",
+      code: "idempotency-key-reused",
+    });
+
+    const nameConflict = await apiRequest(machineId, "/repositories", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "retry-safe", idempotencyKey: "45".repeat(16) }),
+    });
+    expect(nameConflict.status).toBe(409);
+    expect(await nameConflict.json()).toEqual({
+      error: "repository name is already in use",
+      code: "name-in-use",
     });
   });
 
@@ -172,6 +184,7 @@ describe("cloud identity and repository directory", () => {
     expect(replay.status).toBe(409);
     expect(await replay.json()).toEqual({
       error: "repository created by this request was retired",
+      code: "creation-retired",
     });
     expect(await (await apiRequest(machineId, "/repositories/retiring-replay")).json()).toEqual(
       replacement,
@@ -188,6 +201,49 @@ describe("cloud identity and repository directory", () => {
         incarnation: repository.incarnation,
       }),
     ).toMatchObject({ ok: false, status: 409 });
+  });
+
+  it("reports a replay whose repository is concurrently retiring", async () => {
+    const identity = {
+      userId: env.DEVSPACE_DEVELOPMENT_USER_ID,
+      machineId: "46".repeat(16),
+    };
+    const idempotencyKey = "46".repeat(16);
+    const repository = await createRepository(
+      identity.machineId,
+      "concurrent-retiring-replay",
+      idempotencyKey,
+    );
+    const control = env.CONTROL_PLANE.getByName("directory");
+    await runInDurableObject(control, (instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE repositories SET status = 'retiring' WHERE repository_id = ?",
+        repository.repositoryId,
+      );
+      const testControl = instance as unknown as {
+        recoverRetiringRepositories?: () => Promise<void>;
+      };
+      testControl.recoverRetiringRepositories = async () => {};
+    });
+    try {
+      const replay = await apiRequest(identity.machineId, "/repositories", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "concurrent-retiring-replay", idempotencyKey }),
+      });
+      expect(replay.status).toBe(409);
+      expect(await replay.json()).toEqual({
+        error: "repository created by this request is retiring",
+        code: "creation-retiring",
+      });
+    } finally {
+      await runInDurableObject(control, (instance) => {
+        const testControl = instance as unknown as {
+          recoverRetiringRepositories?: () => Promise<void>;
+        };
+        delete testControl.recoverRetiringRepositories;
+      });
+    }
   });
 
   it("fences initialization when retirement reaches a repository first", async () => {

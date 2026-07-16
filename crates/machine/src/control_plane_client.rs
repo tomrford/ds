@@ -46,6 +46,7 @@ struct RepositoryResponse {
 #[serde(deny_unknown_fields)]
 struct ErrorResponse {
     error: String,
+    code: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,11 +127,16 @@ impl ControlPlaneClient {
         let status = response.status();
         let bytes = read_bounded(response, MAX_DIRECTORY_RESPONSE_BYTES).await?;
         if !status.is_success() {
-            let raw_error = serde_json::from_slice::<ErrorResponse>(&bytes).map_or_else(
-                |_| "cloud request failed without a valid error body".to_owned(),
-                |body| body.error,
-            );
-            let kind = classify_remote_error(status.as_u16(), &raw_error);
+            let (raw_error, kind) = match serde_json::from_slice::<ErrorResponse>(&bytes) {
+                Ok(body) => {
+                    let kind = classify_remote_error(body.code.as_deref());
+                    (body.error, kind)
+                }
+                Err(_) => (
+                    "cloud request failed without a valid error body".to_owned(),
+                    ControlPlaneRemoteErrorKind::Other,
+                ),
+            };
             let error = raw_error.replace(self.shared_secret.expose(), "[REDACTED]");
             return Err(ControlPlaneClientError::Remote {
                 status: status.as_u16(),
@@ -153,21 +159,12 @@ impl ControlPlaneClient {
     }
 }
 
-fn classify_remote_error(status: u16, error: &str) -> ControlPlaneRemoteErrorKind {
-    if status != 409 {
-        return ControlPlaneRemoteErrorKind::Other;
-    }
-    match error {
-        "repository name is already in use" => ControlPlaneRemoteErrorKind::RepositoryNameInUse,
-        "repository created by this request was retired" => {
-            ControlPlaneRemoteErrorKind::RepositoryCreationRetired
-        }
-        "repository created by this request is retiring" => {
-            ControlPlaneRemoteErrorKind::RepositoryCreationRetiring
-        }
-        "idempotency key was already used for a different repository request" => {
-            ControlPlaneRemoteErrorKind::IdempotencyKeyReused
-        }
+fn classify_remote_error(code: Option<&str>) -> ControlPlaneRemoteErrorKind {
+    match code {
+        Some("name-in-use") => ControlPlaneRemoteErrorKind::RepositoryNameInUse,
+        Some("creation-retired") => ControlPlaneRemoteErrorKind::RepositoryCreationRetired,
+        Some("creation-retiring") => ControlPlaneRemoteErrorKind::RepositoryCreationRetiring,
+        Some("idempotency-key-reused") => ControlPlaneRemoteErrorKind::IdempotencyKeyReused,
         _ => ControlPlaneRemoteErrorKind::Other,
     }
 }
@@ -281,30 +278,27 @@ mod tests {
     #[test]
     fn classifies_terminal_repository_creation_conflicts() {
         assert_eq!(
-            classify_remote_error(409, "repository name is already in use"),
+            classify_remote_error(Some("name-in-use")),
             ControlPlaneRemoteErrorKind::RepositoryNameInUse
         );
         assert_eq!(
-            classify_remote_error(409, "repository created by this request was retired"),
+            classify_remote_error(Some("creation-retired")),
             ControlPlaneRemoteErrorKind::RepositoryCreationRetired
         );
         assert_eq!(
-            classify_remote_error(409, "repository created by this request is retiring"),
+            classify_remote_error(Some("creation-retiring")),
             ControlPlaneRemoteErrorKind::RepositoryCreationRetiring
         );
         assert_eq!(
-            classify_remote_error(
-                409,
-                "idempotency key was already used for a different repository request"
-            ),
+            classify_remote_error(Some("idempotency-key-reused")),
             ControlPlaneRemoteErrorKind::IdempotencyKeyReused
         );
         assert_eq!(
-            classify_remote_error(500, "repository name is already in use"),
+            classify_remote_error(None),
             ControlPlaneRemoteErrorKind::Other
         );
         assert_eq!(
-            classify_remote_error(409, "another conflict"),
+            classify_remote_error(Some("another-conflict")),
             ControlPlaneRemoteErrorKind::Other
         );
     }
@@ -317,7 +311,7 @@ mod tests {
             let (mut connection, _) = listener.accept().unwrap();
             let mut request = [0; 4096];
             let _ = connection.read(&mut request).unwrap();
-            let body = r#"{"error":"conflict mentions remote-error-secret"}"#;
+            let body = r#"{"error":"conflict mentions remote-error-secret","code":"name-in-use"}"#;
             write!(
                 connection,
                 "HTTP/1.1 409 Conflict\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -338,8 +332,12 @@ mod tests {
             .unwrap_err();
         server.join().unwrap();
         assert!(matches!(
-            error,
-            ControlPlaneClientError::Remote { status: 409, .. }
+            &error,
+            ControlPlaneClientError::Remote {
+                status: 409,
+                kind: ControlPlaneRemoteErrorKind::RepositoryNameInUse,
+                ..
+            }
         ));
         let message = error.to_string();
         assert!(message.contains("[REDACTED]"));

@@ -620,7 +620,7 @@ fn repo_new_retries_a_retired_receipt_once_with_a_fresh_key() {
             respond(
                 stream,
                 "409 Conflict",
-                r#"{"error":"repository created by this request was retired"}"#,
+                r#"{"error":"repository created by this request was retired","code":"creation-retired"}"#,
             );
         } else {
             respond(stream, "200 OK", &response);
@@ -655,7 +655,7 @@ fn repo_new_discards_an_idempotency_key_invariant_failure() {
         respond(
             stream,
             "409 Conflict",
-            r#"{"error":"idempotency key was already used for a different repository request"}"#,
+            r#"{"error":"idempotency key was already used for a different repository request","code":"idempotency-key-reused"}"#,
         );
     });
     configure_machine(temp.path(), &base_url);
@@ -719,7 +719,7 @@ fn repo_new_discards_a_name_conflict_and_can_create_after_the_name_is_freed() {
             respond(
                 stream,
                 "409 Conflict",
-                r#"{"error":"repository name is already in use"}"#,
+                r#"{"error":"repository name is already in use","code":"name-in-use"}"#,
             );
         } else {
             respond(stream, "200 OK", &response);

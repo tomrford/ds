@@ -26,7 +26,9 @@ one fixed server-side user; callers cannot select a user. An authenticated
 POST to `/repositories` reserves a tenant-local name under a 128-bit
 idempotency key and returns an opaque repository ID and 128-bit incarnation.
 GET and DELETE on `/repositories/:name` resolve and retire that directory
-record. Deleting and recreating a name assigns a new ID and incarnation.
+record. Directory API failures return `error` prose and include a stable
+kebab-case `code` when callers can act on a specific rejection. Deleting and
+recreating a name assigns a new ID and incarnation.
 
 The Worker accepts repository-authorized manifest and chunk uploads under
 `/repositories/:repository-id/packs/:pack`, followed by an explicit install

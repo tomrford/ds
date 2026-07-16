@@ -240,12 +240,15 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
     }
 }
 
-function errorResponse(status: number, message: string): Response {
-  return Response.json({ error: message }, { status });
+function errorResponse(status: number, message: string, code?: string): Response {
+  const body = code === undefined ? { error: message } : { error: message, code };
+  return Response.json(body, { status });
 }
 
-function rpcResponse(result: { ok: boolean; error?: string; status?: number }): Response {
-  if (!result.ok) return errorResponse(result.status ?? 400, result.error ?? "request failed");
+function rpcResponse(result: { ok: boolean; error?: string; code?: string; status?: number }): Response {
+  if (!result.ok) {
+    return errorResponse(result.status ?? 400, result.error ?? "request failed", result.code);
+  }
   const { ok: _, status: __, ...body } = result;
   return Response.json(body);
 }
