@@ -49,6 +49,7 @@ describe("cloud identity and repository directory", () => {
       ok: false,
       status: 404,
       error: "repository not found",
+      code: "repository-not-found",
     });
     expect(
       await control.authorizeRepository(stranger, created.repositoryId, created.incarnation),
@@ -111,7 +112,12 @@ describe("cloud identity and repository directory", () => {
         { userId: "attacker", machineId },
         "header-identity-injection",
       ),
-    ).toEqual({ ok: false, status: 404, error: "repository not found" });
+    ).toEqual({
+      ok: false,
+      status: 404,
+      error: "repository not found",
+      code: "repository-not-found",
+    });
 
     const injectedBody = await apiRequest(machineId, "/repositories", {
       method: "POST",

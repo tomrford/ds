@@ -2,7 +2,10 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use devspace_machine::{CatalogEntry, MachineRepository, MachineStore, RepositoryName};
+use devspace_machine::{
+    CatalogEntry, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
+    MachineConfig, MachineRepository, MachineStore, MachineStoreError, RepositoryName,
+};
 use jj_cli::cli_util::{CommandHelper, RevisionArg};
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
@@ -25,7 +28,7 @@ use crate::checkout::{
 
 #[derive(clap::Args)]
 pub(crate) struct AddArgs {
-    /// Repository name in the local machine catalog.
+    /// Repository name in the local machine catalog or cloud directory.
     repo: String,
 
     /// Directory to create the checkout at.
@@ -72,17 +75,28 @@ pub(crate) async fn add_checkout(
     let machine = store
         .load_config()
         .map_err(|error| user_error(error.to_string()))?;
-    let entry = store
+    let (entry, config) = match store
         .resolve(&name)
         .map_err(|error| user_error(error.to_string()))?
-        .ok_or_else(|| {
-            user_error(format!(
-                "Repository `{name}` is not present in this machine store. Cloud first-use is unavailable until production machine enrolment exists."
-            ))
-        })?;
-    if !is_stock_bare_repository(&entry.native_repository_path) {
+    {
+        Some(entry) => (entry, None),
+        None => {
+            let config = store
+                .load_config()
+                .map_err(|error| user_error(error.to_string()))?;
+            let repository = resolve_cloud_repository(&config, &name)?;
+            let entry = store
+                .register_repository(repository.name, repository.identity)
+                .map_err(|error| user_error(error.to_string()))?;
+            failpoint("after_clone_registration");
+            (entry, Some(config))
+        }
+    };
+    if !entry.native_repository_path.exists() {
+        clone_repository(ui, command, &store, &entry, config).await?;
+    } else if !is_stock_bare_repository(&entry.native_repository_path) {
         return Err(user_error(format!(
-            "Repository `{name}` is registered locally, but its native repository is missing or invalid. Cloud first-use is unavailable until production machine enrolment exists."
+            "Repository `{name}` is registered locally, but its native repository is invalid."
         )));
     }
 
@@ -225,6 +239,97 @@ pub(crate) async fn add_checkout(
             )?,
         }
     }
+    Ok(())
+}
+
+fn resolve_cloud_repository(
+    config: &MachineConfig,
+    name: &RepositoryName,
+) -> Result<devspace_machine::CloudRepository, CommandError> {
+    let client = ControlPlaneClient::new(config).map_err(|error| user_error(error.to_string()))?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|_| user_error("failed to start the cloud transport runtime"))?;
+    match runtime.block_on(client.resolve_repository(name)) {
+        Ok(repository) => Ok(repository),
+        Err(ControlPlaneClientError::Request(error)) => Err(user_error(format!(
+            "Repository `{name}` is unknown locally and the control plane is unreachable: {error}"
+        ))),
+        Err(ControlPlaneClientError::Remote {
+            kind: ControlPlaneRemoteErrorKind::RepositoryNotFound,
+            ..
+        }) => Err(user_error(format!(
+            "Repository `{name}` was not found in the control plane."
+        ))),
+        Err(error) => Err(user_error(error.to_string())),
+    }
+}
+
+async fn clone_repository(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    store: &MachineStore,
+    entry: &CatalogEntry,
+    config: Option<MachineConfig>,
+) -> Result<(), CommandError> {
+    let name = &entry.name;
+    let sync_guard =
+        store
+            .try_lock_repository_sync(&entry.identity)
+            .map_err(|error| match error {
+                MachineStoreError::RepositorySyncAlreadyLocked { .. } => user_error(format!(
+                    "Repository `{name}` is already being cloned or synchronized; retry `ds add`."
+                )),
+                error => user_error(error.to_string()),
+            })?;
+
+    if entry.native_repository_path.exists() {
+        if is_stock_bare_repository(&entry.native_repository_path) {
+            return Ok(());
+        }
+        return Err(user_error(format!(
+            "Repository `{name}` is registered locally, but its native repository is invalid."
+        )));
+    }
+
+    let config = match config {
+        Some(config) => config,
+        None => store
+            .load_config()
+            .map_err(|error| user_error(error.to_string()))?,
+    };
+    let (settings, _) = command.settings_for_new_workspace(ui, &entry.native_repository_path)?;
+    let Some(mut staging) = store
+        .stage_repository_clone(sync_guard, name, &entry.identity, &settings)
+        .await
+        .map_err(|error| user_error(error.to_string()))?
+    else {
+        if is_stock_bare_repository(&entry.native_repository_path) {
+            return Ok(());
+        }
+        return Err(user_error(format!(
+            "Repository `{name}` is registered locally, but its native repository is invalid."
+        )));
+    };
+    let sync_path = staging.sync_path().to_owned();
+    let packs_path = staging.packs_path().to_owned();
+    crate::sync::run_sync_engine(
+        &config,
+        &entry.identity,
+        staging.repository_mut(),
+        &sync_path,
+        &packs_path,
+    )
+    .map_err(|error| {
+        user_error(format!(
+            "Repository `{name}` is incomplete locally and could not be cloned from the control plane: {error}. Retry `ds add` when cloud access is available."
+        ))
+    })?;
+    drop(
+        staging
+            .publish(&settings)
+            .await
+            .map_err(|error| user_error(error.to_string()))?,
+    );
     Ok(())
 }
 

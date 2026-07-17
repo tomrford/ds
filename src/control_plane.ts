@@ -13,12 +13,14 @@ const NAME_IN_USE = "name-in-use";
 const CREATION_RETIRED = "creation-retired";
 const CREATION_RETIRING = "creation-retiring";
 const IDEMPOTENCY_KEY_REUSED = "idempotency-key-reused";
+const REPOSITORY_NOT_FOUND = "repository-not-found";
 
 type ControlPlaneErrorCode =
   | typeof NAME_IN_USE
   | typeof CREATION_RETIRED
   | typeof CREATION_RETIRING
-  | typeof IDEMPOTENCY_KEY_REUSED;
+  | typeof IDEMPOTENCY_KEY_REUSED
+  | typeof REPOSITORY_NOT_FOUND;
 
 export interface AuthenticatedPrincipal {
   userId: string;
@@ -275,7 +277,9 @@ export class ControlPlane extends DurableObject<Env> {
         name,
       )
       .toArray()[0];
-    if (repository === undefined) return failure("repository not found", 404);
+    if (repository === undefined) {
+      return failure(new ControlPlaneError("repository not found", 404, REPOSITORY_NOT_FOUND), 404);
+    }
     return {
       ok: true as const,
       name: repository.name,

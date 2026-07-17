@@ -11,6 +11,9 @@ use thiserror::Error;
 use crate::locked_json::{LockedJsonError, LockedJsonFile, sync_directory};
 use crate::{MachineRepository, MachineRepositoryError};
 
+mod repository_clone;
+pub use repository_clone::StagedRepositoryClone;
+
 pub const MACHINE_STORE_OVERRIDE: &str = "DEVSPACE_MACHINE_STORE_DIR";
 
 const CATALOG_VERSION: u32 = 1;
@@ -132,6 +135,7 @@ pub struct CheckoutDestinationGuard {
 }
 
 pub struct RepositorySyncGuard {
+    identity: RepositoryIdentity,
     _file: File,
 }
 
@@ -240,7 +244,10 @@ impl MachineStore {
                 source,
             })?;
         match file.try_lock() {
-            Ok(()) => Ok(RepositorySyncGuard { _file: file }),
+            Ok(()) => Ok(RepositorySyncGuard {
+                identity: identity.clone(),
+                _file: file,
+            }),
             Err(fs::TryLockError::WouldBlock) => {
                 Err(MachineStoreError::RepositorySyncAlreadyLocked { path })
             }
@@ -669,6 +676,8 @@ pub enum MachineStoreError {
     },
     #[error("repository sync is already in progress ({path})")]
     RepositorySyncAlreadyLocked { path: PathBuf },
+    #[error("repository clone staging requires the sync lock for its own repository identity")]
+    MismatchedRepositorySyncLock,
     #[error("failed to lock repository sync at {path}")]
     LockRepositorySync {
         path: PathBuf,
@@ -758,6 +767,26 @@ pub enum MachineStoreError {
     },
     #[error("failed to create native repository staging directory under {path}")]
     CreateRepositoryStaging {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to remove incomplete clone state at {path}")]
+    RemoveIncompleteCloneState {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to publish staged clone {component} at {to} from {from}")]
+    PublishCloneComponent {
+        component: &'static str,
+        from: PathBuf,
+        to: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to remove clone staging directory at {path}")]
+    RemoveCloneStaging {
         path: PathBuf,
         #[source]
         source: io::Error,

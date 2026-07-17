@@ -50,7 +50,7 @@ pub use machine_config::{MachineConfig, MachineConfigError, MachineId, SharedSec
 pub use machine_store::{
     CatalogEntry, CheckoutDestinationGuard, MACHINE_STORE_OVERRIDE, MachineStore,
     MachineStoreError, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
-    RepositorySyncGuard,
+    RepositorySyncGuard, StagedRepositoryClone,
 };
 pub use object_closure::{
     MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectId, ObjectKey,

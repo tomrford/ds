@@ -159,6 +159,44 @@ fn sync_run_rejects_an_unknown_repository_cleanly() {
     );
 }
 
+#[test]
+fn sync_run_points_an_incomplete_clone_back_to_add() {
+    let temp = tempfile::tempdir().unwrap();
+    configure_machine(
+        temp.path(),
+        "http://127.0.0.1:1",
+        FIRST_MACHINE_ID,
+        DEVELOPMENT_SECRET,
+    );
+    let store = machine_store(temp.path());
+    store
+        .register_repository(
+            RepositoryName::parse("incomplete").unwrap(),
+            RepositoryIdentity::new(
+                RepositoryId::parse("ab".repeat(32)).unwrap(),
+                RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
+            ),
+        )
+        .unwrap();
+    let config = write_cli_config(temp.path());
+
+    let output = ds(
+        temp.path(),
+        temp.path(),
+        &config,
+        &["sync", "run", "--repository", "incomplete"],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains(
+            "Repository `incomplete` has an incomplete clone; run `ds add` again to finish it."
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
 #[tokio::test]
 async fn sync_run_reports_offline_transport_failure_without_mutating_durable_state() {
     let temp = tempfile::tempdir().unwrap();
@@ -244,15 +282,15 @@ async fn two_machine_cli_sync_converges_through_a_live_worker() {
     seal_commit(&checkout_a, &home_a, &config_a, "machine A");
     let commit_a = commit_id(&checkout_a, &home_a, &config_a, "@-");
 
+    let uploaded_a = ds(
+        &home_a,
+        &home_a,
+        &config_a,
+        &["sync", "run", "--repository", &repository_name],
+    );
+    assert!(uploaded_a.status.success(), "{}", stderr(&uploaded_a));
+
     let store_b = machine_store(&home_b);
-    store_b
-        .register_repository(name.clone(), entry_a.identity.clone())
-        .unwrap();
-    // Chunk 2 replaces this direct materialization bridge with clone-on-first-use.
-    store_b
-        .materialize_repository(&name, &entry_a.identity, &settings())
-        .await
-        .unwrap();
     let checkout_b = home_b.join("checkout");
     let added_b = ds(
         &home_b,
@@ -262,11 +300,15 @@ async fn two_machine_cli_sync_converges_through_a_live_worker() {
             "add",
             &repository_name,
             "-r",
-            "root()",
+            &commit_a,
             checkout_b.to_str().unwrap(),
         ],
     );
     assert!(added_b.status.success(), "{}", stderr(&added_b));
+    assert_eq!(
+        fs::read_to_string(checkout_b.join("from-a.txt")).unwrap(),
+        "machine A\n"
+    );
     fs::write(checkout_b.join("from-b.txt"), "machine B\n").unwrap();
     seal_commit(&checkout_b, &home_b, &config_b, "machine B");
     let commit_b = commit_id(&checkout_b, &home_b, &config_b, "@-");
@@ -316,6 +358,35 @@ async fn two_machine_cli_sync_converges_through_a_live_worker() {
             .load_outbox()
             .unwrap()
             .is_none()
+    );
+
+    fs::remove_dir_all(store_b.root()).unwrap();
+    configure_machine(&home_b, &base_url, SECOND_MACHINE_ID, &shared_secret);
+    let rebuilt_b = ds(
+        &home_b,
+        &home_b,
+        &config_b,
+        &[
+            "add",
+            &repository_name,
+            "-r",
+            &commit_b,
+            checkout_b.to_str().unwrap(),
+        ],
+    );
+    assert!(rebuilt_b.status.success(), "{}", stderr(&rebuilt_b));
+    let rebuilt_entry_b = store_b.resolve(&name).unwrap().unwrap();
+    assert_eq!(
+        operation_heads(&rebuilt_entry_b.native_repository_path).await,
+        heads_a
+    );
+    assert_eq!(
+        fs::read_to_string(checkout_b.join("from-a.txt")).unwrap(),
+        "machine A\n"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout_b.join("from-b.txt")).unwrap(),
+        "machine B\n"
     );
 }
 

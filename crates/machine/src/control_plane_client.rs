@@ -51,6 +51,7 @@ struct ErrorResponse {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlPlaneRemoteErrorKind {
+    RepositoryNotFound,
     RepositoryNameInUse,
     RepositoryCreationRetired,
     RepositoryCreationRetiring,
@@ -161,6 +162,7 @@ impl ControlPlaneClient {
 
 fn classify_remote_error(code: Option<&str>) -> ControlPlaneRemoteErrorKind {
     match code {
+        Some("repository-not-found") => ControlPlaneRemoteErrorKind::RepositoryNotFound,
         Some("name-in-use") => ControlPlaneRemoteErrorKind::RepositoryNameInUse,
         Some("creation-retired") => ControlPlaneRemoteErrorKind::RepositoryCreationRetired,
         Some("creation-retiring") => ControlPlaneRemoteErrorKind::RepositoryCreationRetiring,
@@ -277,6 +279,10 @@ mod tests {
 
     #[test]
     fn classifies_terminal_repository_creation_conflicts() {
+        assert_eq!(
+            classify_remote_error(Some("repository-not-found")),
+            ControlPlaneRemoteErrorKind::RepositoryNotFound
+        );
         assert_eq!(
             classify_remote_error(Some("name-in-use")),
             ControlPlaneRemoteErrorKind::RepositoryNameInUse

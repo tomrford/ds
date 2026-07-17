@@ -61,13 +61,19 @@ async fn restrict_bare_repository_commands(
     {
         let Some(entry) = repository_selector.catalog_entry().map_err(user_error)? else {
             return Err(user_error(format!(
-                "Repository `{}` is not present in this machine store. Cloud first-use is unavailable until production machine enrolment exists.",
+                "Repository `{}` is not present in this machine store; run `ds add` to clone it first.",
                 name.as_str()
             )));
         };
+        if !entry.native_repository_path.exists() {
+            return Err(user_error(format!(
+                "Repository `{}` has an incomplete clone; run `ds add` again to finish it.",
+                name.as_str()
+            )));
+        }
         if !is_stock_bare_repository(&entry.native_repository_path) {
             return Err(user_error(format!(
-                "Repository `{}` is registered locally, but its native repository is missing or invalid. Cloud first-use is unavailable until production machine enrolment exists.",
+                "Repository `{}` is registered locally, but its native repository is invalid.",
                 name.as_str()
             )));
         }

@@ -458,6 +458,26 @@ async fn remove_refuses_a_marker_without_its_catalog_entry() {
 }
 
 #[tokio::test]
+async fn remove_points_an_incomplete_clone_back_to_add() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_path = local_repository(temp.path(), "incomplete-remove").await;
+    let config = write_cli_config(temp.path());
+    let path = temp.path().join("checkout");
+    add_checkout(temp.path(), &config, "incomplete-remove", "root()", &path);
+    fs::remove_dir_all(repository_path).unwrap();
+
+    let output = remove_checkout(temp.path(), &config, &path);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("has an incomplete clone; run `ds add` again to finish it"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(path.join(".jj/devspace-checkout-owner").is_file());
+}
+
+#[tokio::test]
 async fn remove_snapshots_uncommitted_edits_before_forgetting() {
     let temp = tempfile::tempdir().unwrap();
     let repository_path = local_repository(temp.path(), "snapshot").await;

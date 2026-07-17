@@ -1,11 +1,15 @@
+use std::collections::BTreeSet;
 use std::fs;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
+    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore, PackOptions,
     RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
+    build_packs,
 };
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
@@ -78,18 +82,22 @@ fn machine_store(root: &Path) -> MachineStore {
     MachineStore::new(root.join("machine-store"))
 }
 
-async fn local_repository(root: &Path, repository_name: &str) -> PathBuf {
-    let store = machine_store(root);
-    store
+fn configure_machine(root: &Path, base_url: &str) {
+    machine_store(root)
         .write_config(
             &MachineConfig::new(
-                "http://127.0.0.1:1",
+                base_url,
                 MachineId::parse(MACHINE_ID).unwrap(),
                 SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
             )
             .unwrap(),
         )
         .unwrap();
+}
+
+async fn local_repository(root: &Path, repository_name: &str) -> PathBuf {
+    let store = machine_store(root);
+    configure_machine(root, "http://127.0.0.1:1");
     let entry = store
         .register_repository(
             RepositoryName::parse(repository_name).unwrap(),
@@ -103,6 +111,356 @@ async fn local_repository(root: &Path, repository_name: &str) -> PathBuf {
         .await
         .unwrap();
     entry.native_repository_path
+}
+
+fn create_server<F>(mut handle: F) -> (String, thread::JoinHandle<Vec<String>>)
+where
+    F: FnMut(&str, &mut TcpStream) -> bool + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return requests;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("failed to accept test HTTP connection: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            let request = read_http_request(&mut stream);
+            let done = handle(&request, &mut stream);
+            requests.push(request);
+            if done {
+                return requests;
+            }
+            deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        }
+    });
+    (address, server)
+}
+
+fn read_http_request(stream: &mut TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 16 * 1024];
+    let expected_length = loop {
+        let read = stream.read(&mut buffer).unwrap();
+        assert_ne!(read, 0, "HTTP request ended before its headers");
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            break header_end + 4 + content_length;
+        }
+    };
+    while bytes.len() < expected_length {
+        let read = stream.read(&mut buffer).unwrap();
+        assert_ne!(read, 0, "HTTP request ended before its body");
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    String::from_utf8_lossy(&bytes[..expected_length]).into_owned()
+}
+
+fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+    respond_bytes(stream, status, "application/json", body.as_bytes());
+}
+
+fn respond_bytes(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    stream.write_all(body).unwrap();
+}
+
+fn repository_response(name: &str) -> String {
+    format!(
+        r#"{{"name":"{name}","repositoryId":"{}","incarnation":"{}"}}"#,
+        "ab".repeat(32),
+        "cd".repeat(16)
+    )
+}
+
+fn request_body(request: &str) -> serde_json::Value {
+    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    serde_json::from_str(body).unwrap()
+}
+
+struct CloudFixture {
+    pack_id: String,
+    manifest: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
+    operation_head: String,
+}
+
+async fn cloud_fixture(root: &Path) -> CloudFixture {
+    let fixture_root = root.join("cloud-fixture");
+    fs::create_dir(&fixture_root).unwrap();
+    let repository_path = local_repository(&fixture_root, "fixture").await;
+    let config = write_cli_config(&fixture_root);
+    let destination = fixture_root.join("checkout");
+    let output = add(&fixture_root, &config, "fixture", "root()", &destination);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let repository = MachineRepository::open(&repository_path, &settings())
+        .await
+        .unwrap();
+    let closure = repository.object_closure(&BTreeSet::new()).await.unwrap();
+    let operation_head = hex_bytes(*closure.operation_heads.first().unwrap());
+    let built = build_packs(
+        &closure,
+        &BTreeSet::new(),
+        fixture_root.join("packs"),
+        PackOptions::default(),
+    )
+    .unwrap();
+    let pack = built.packs.into_iter().next().unwrap();
+    let chunks = (0..pack.manifest.chunks().len())
+        .map(|position| fs::read(pack.directory.join(format!("{position:08}.chunk"))).unwrap())
+        .collect();
+    CloudFixture {
+        pack_id: hex_bytes(pack.id),
+        manifest: pack.manifest.encode(),
+        chunks,
+        operation_head,
+    }
+}
+
+fn hex_bytes<const N: usize>(bytes: [u8; N]) -> String {
+    bytes
+        .into_iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn create_cloud_sync_server(fixture: CloudFixture) -> (String, thread::JoinHandle<Vec<String>>) {
+    create_server(move |request, stream| {
+        let request_line = request.lines().next().unwrap();
+        if request_line.starts_with("GET ") && request_line.contains("/packs?") {
+            respond(
+                stream,
+                "200 OK",
+                &format!(
+                    r#"{{"packs":[{{"sequence":1,"id":"{}"}}],"nextAfter":1,"through":1,"hasMore":false}}"#,
+                    fixture.pack_id
+                ),
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/manifest?") {
+            respond_bytes(
+                stream,
+                "200 OK",
+                "application/octet-stream",
+                &fixture.manifest,
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/chunks/") {
+            let position = request_line
+                .split("/chunks/")
+                .nth(1)
+                .unwrap()
+                .split(['?', ' '])
+                .next()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            respond_bytes(
+                stream,
+                "200 OK",
+                "application/octet-stream",
+                &fixture.chunks[position],
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/heads?") {
+            respond(
+                stream,
+                "200 OK",
+                &format!(r#"{{"cursor":1,"heads":["{}"]}}"#, fixture.operation_head),
+            );
+        } else if request_line.starts_with("POST ") && request_line.contains("/objects/inventory ")
+        {
+            let objects = request_body(request)["objects"].clone();
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({ "objects": objects }).to_string(),
+            );
+        } else {
+            respond(stream, "200 OK", "{}");
+        }
+        false
+    })
+}
+
+#[test]
+fn add_catalog_miss_reports_unreachable_control_plane_without_registering() {
+    let temp = tempfile::tempdir().unwrap();
+    configure_machine(temp.path(), "http://127.0.0.1:1");
+    let config = write_cli_config(temp.path());
+    let destination = temp.path().join("checkout");
+
+    let output = add(temp.path(), &config, "offline-miss", "root()", &destination);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "Repository `offline-miss` is unknown locally and the control plane is unreachable"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        machine_store(temp.path())
+            .resolve(&RepositoryName::parse("offline-miss").unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn add_catalog_miss_classifies_unknown_name_by_remote_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let (base_url, server) = create_server(|_, stream| {
+        respond(
+            stream,
+            "409 Conflict",
+            r#"{"error":"opaque directory failure","code":"repository-not-found"}"#,
+        );
+        true
+    });
+    configure_machine(temp.path(), &base_url);
+    let config = write_cli_config(temp.path());
+    let destination = temp.path().join("checkout");
+
+    let output = add(temp.path(), &config, "unknown-name", "root()", &destination);
+    let requests = server.join().unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("Repository `unknown-name` was not found in the control plane."),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /repositories/unknown-name "));
+    assert!(
+        machine_store(temp.path())
+            .resolve(&RepositoryName::parse("unknown-name").unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn add_catalog_hit_never_contacts_the_control_plane() {
+    let temp = tempfile::tempdir().unwrap();
+    local_repository(temp.path(), "offline-hit").await;
+    let config = write_cli_config(temp.path());
+    let destination = temp.path().join("checkout");
+
+    let output = add(temp.path(), &config, "offline-hit", "root()", &destination);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(destination.join(".jj/repo").is_file());
+}
+
+#[tokio::test]
+async fn add_resumes_after_kill_between_catalog_registration_and_native_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = cloud_fixture(temp.path()).await;
+    let response = repository_response("kill-clone");
+    let (base_url, resolver) = create_server(move |_, stream| {
+        respond(stream, "200 OK", &response);
+        true
+    });
+    configure_machine(temp.path(), &base_url);
+    let config = write_cli_config(temp.path());
+    let destination = temp.path().join("checkout");
+    let ready = temp.path().join("ready");
+    let mut child = spawn_add_at_failpoint(
+        temp.path(),
+        &config,
+        "kill-clone",
+        &destination,
+        "after_clone_registration",
+        &ready,
+        None,
+    );
+    wait_for_failpoint(&ready);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(resolver.join().unwrap().len(), 1);
+
+    let store = machine_store(temp.path());
+    let name = RepositoryName::parse("kill-clone").unwrap();
+    let entry = store.resolve(&name).unwrap().unwrap();
+    assert!(!entry.native_repository_path.exists());
+    assert!(!destination.exists());
+
+    configure_machine(temp.path(), "http://127.0.0.1:1");
+    let offline = add(temp.path(), &config, "kill-clone", "root()", &destination);
+    assert_eq!(offline.status.code(), Some(1), "{}", stderr(&offline));
+    assert!(
+        stderr(&offline).contains("Repository `kill-clone` is incomplete locally"),
+        "{}",
+        stderr(&offline)
+    );
+    assert!(!entry.native_repository_path.exists());
+    assert!(!destination.exists());
+
+    let repository_directory = entry.native_repository_path.parent().unwrap();
+    for path in [
+        repository_directory.join(".clone-staging"),
+        store.repository_sync_path(&entry.identity),
+        store.repository_packs_path(&entry.identity),
+    ] {
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("stale"), "must disappear").unwrap();
+    }
+
+    let (base_url, sync_server) = create_cloud_sync_server(fixture);
+    configure_machine(temp.path(), &base_url);
+    let retry = add(temp.path(), &config, "kill-clone", "root()", &destination);
+    let requests = sync_server.join().unwrap();
+
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    assert!(entry.native_repository_path.is_dir());
+    assert!(destination.join(".jj/repo").is_file());
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.starts_with("GET /repositories/kill-clone "))
+    );
+    assert!(!repository_directory.join(".clone-staging").exists());
+    assert!(
+        !store
+            .repository_sync_path(&entry.identity)
+            .join("stale")
+            .exists()
+    );
+    assert!(
+        !store
+            .repository_packs_path(&entry.identity)
+            .join("stale")
+            .exists()
+    );
 }
 
 fn add(cwd: &Path, config: &Path, repository_name: &str, revision: &str, path: &Path) -> Output {

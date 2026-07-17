@@ -243,11 +243,17 @@ fn workspace_paths_match(
 }
 
 fn require_native_repository(entry: &CatalogEntry) -> Result<(), CommandError> {
+    if !entry.native_repository_path.exists() {
+        return Err(user_error(format!(
+            "Repository `{}` has an incomplete clone; run `ds add` again to finish it; nothing was touched",
+            entry.name
+        )));
+    }
     if is_stock_bare_repository(&entry.native_repository_path) {
         Ok(())
     } else {
         Err(user_error(format!(
-            "Repository `{}` is registered locally, but its native repository is missing or invalid; nothing was touched",
+            "Repository `{}` is registered locally, but its native repository is invalid; nothing was touched",
             entry.name
         )))
     }

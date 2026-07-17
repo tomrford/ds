@@ -14,7 +14,7 @@ use crate::sync::{SyncArgs, run_sync};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum DevspaceCommand {
-    /// Create a checkout of a repository already present on this machine.
+    /// Create a checkout, cloning the repository on first use.
     Add(AddArgs),
     /// Remove a disposable checkout while preserving its repository.
     Remove(RemoveArgs),
@@ -119,7 +119,11 @@ async fn create_empty_repository(
                                 .discard_repository_creation(&intent)
                                 .map_err(|error| user_error(error.to_string()))?;
                         }
-                        Some(ControlPlaneRemoteErrorKind::Other) | None => {}
+                        Some(
+                            ControlPlaneRemoteErrorKind::RepositoryNotFound
+                            | ControlPlaneRemoteErrorKind::Other,
+                        )
+                        | None => {}
                     }
                     return Err(user_error(error.to_string()));
                 }

@@ -377,7 +377,7 @@ async fn bare_log_accepts_all_repository_option_spellings() {
 }
 
 #[test]
-fn missing_local_name_fails_without_cloud_bootstrap_ux() {
+fn missing_local_name_points_to_add_without_network() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
 
@@ -390,8 +390,7 @@ fn missing_local_name_fails_without_cloud_bootstrap_ux() {
         stderr(&output)
     );
     assert!(
-        stderr(&output)
-            .contains("Cloud first-use is unavailable until production machine enrolment exists"),
+        stderr(&output).contains("run `ds add`"),
         "{}",
         stderr(&output)
     );
@@ -529,7 +528,7 @@ async fn bare_config_markers_are_rejected_before_loading_or_writing() {
             stderr(&output)
         );
         assert!(
-            stderr(&output).contains("native repository is missing or invalid"),
+            stderr(&output).contains("native repository is invalid"),
             "{marker}: {}",
             stderr(&output)
         );

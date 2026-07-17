@@ -1,9 +1,10 @@
 use std::error::Error as _;
 use std::io::Write as _;
+use std::path::Path;
 
 use devspace_machine::{
-    HttpTransport, MachineRepository, MachineStore, MachineStoreError, MachineSyncStore,
-    RepositoryName, SyncEngine, SyncEngineError,
+    HttpTransport, MachineConfig, MachineRepository, MachineStore, MachineStoreError,
+    MachineSyncStore, RepositoryIdentity, RepositoryName, SyncEngine, SyncEngineError,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -53,6 +54,16 @@ async fn sync_repository(
                 "Repository `{name}` is not present in this machine store."
             ))
         })?;
+    if !entry.native_repository_path.exists() {
+        return Err(user_error(format!(
+            "Repository `{name}` has an incomplete clone; run `ds add` again to finish it."
+        )));
+    }
+    if !crate::bare_workspace::is_stock_bare_repository(&entry.native_repository_path) {
+        return Err(user_error(format!(
+            "Repository `{name}` is registered locally, but its native repository is invalid."
+        )));
+    }
 
     let _guard = match store.try_lock_repository_sync(&entry.identity) {
         Ok(guard) => guard,
@@ -74,26 +85,33 @@ async fn sync_repository(
     let mut repository = MachineRepository::open(&entry.native_repository_path, command.settings())
         .await
         .map_err(|error| user_error(error.to_string()))?;
-    let state = MachineSyncStore::open(store.repository_sync_path(&entry.identity))
-        .map_err(|error| user_error(error.to_string()))?;
-    let incarnation = parse_incarnation(entry.identity.incarnation.as_str());
-    let mut transport =
-        HttpTransport::new(&config, entry.identity.repository_id.as_str(), incarnation)
-            .map_err(|error| user_error(error.to_string()))?;
+    run_sync_engine(
+        &config,
+        &entry.identity,
+        &mut repository,
+        &store.repository_sync_path(&entry.identity),
+        &store.repository_packs_path(&entry.identity),
+    )
+    .map_err(user_error)
+}
+
+pub(crate) fn run_sync_engine(
+    config: &MachineConfig,
+    identity: &RepositoryIdentity,
+    repository: &mut MachineRepository,
+    sync_path: &Path,
+    packs_path: &Path,
+) -> Result<(), String> {
+    let state = MachineSyncStore::open(sync_path).map_err(|error| error.to_string())?;
+    let incarnation = parse_incarnation(identity.incarnation.as_str());
+    let mut transport = HttpTransport::new(config, identity.repository_id.as_str(), incarnation)
+        .map_err(|error| error.to_string())?;
     let runtime = tokio::runtime::Runtime::new()
-        .map_err(|_| user_error("failed to start the cloud transport runtime"))?;
+        .map_err(|_| "failed to start the cloud transport runtime".to_owned())?;
     runtime
-        .block_on(
-            SyncEngine::new(
-                &mut repository,
-                &state,
-                store.repository_packs_path(&entry.identity),
-                &mut transport,
-            )
-            .run(),
-        )
-        .map_err(|error| user_error(sync_error_message(&error)))?;
-    Ok(())
+        .block_on(SyncEngine::new(repository, &state, packs_path, &mut transport).run())
+        .map(|_| ())
+        .map_err(|error| sync_error_message(&error))
 }
 
 fn parse_incarnation(value: &str) -> [u8; 16] {
