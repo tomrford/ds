@@ -1,6 +1,6 @@
 //! Mirrors the wire shapes of `jj_lib::protos::simple_store` and
-//! `simple_op_store`, including the canonical variants that pin deterministic
-//! field and map ordering.
+//! `simple_op_store`, including variants that retain protobuf map-entry order
+//! for byte-exact validation.
 
 use std::collections::HashMap;
 
@@ -280,7 +280,7 @@ pub(crate) struct StringStringEntry {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct CanonicalView {
+pub(crate) struct OrderedView {
     #[prost(bytes = "vec", repeated, tag = "1")]
     pub head_ids: Vec<Vec<u8>>,
     #[prost(bytes = "vec", tag = "2")]
@@ -304,13 +304,13 @@ pub(crate) struct CanonicalView {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct CanonicalOperation {
+pub(crate) struct OrderedOperation {
     #[prost(bytes = "vec", tag = "1")]
     pub view_id: Vec<u8>,
     #[prost(bytes = "vec", repeated, tag = "2")]
     pub parents: Vec<Vec<u8>>,
     #[prost(message, optional, tag = "3")]
-    pub metadata: Option<CanonicalOperationMetadata>,
+    pub metadata: Option<OrderedOperationMetadata>,
     #[prost(message, repeated, tag = "4")]
     pub commit_predecessors: Vec<CommitPredecessors>,
     #[prost(bool, tag = "5")]
@@ -318,7 +318,7 @@ pub(crate) struct CanonicalOperation {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct CanonicalOperationMetadata {
+pub(crate) struct OrderedOperationMetadata {
     #[prost(message, optional, tag = "1")]
     pub start_time: Option<Timestamp>,
     #[prost(message, optional, tag = "2")]

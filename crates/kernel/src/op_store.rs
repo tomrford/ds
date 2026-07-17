@@ -262,6 +262,43 @@ fn remote_refs_to_proto(values: &BTreeMap<String, RemoteRef>) -> Vec<proto::Remo
         .collect()
 }
 
+fn unique_map_key_order<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    label: &str,
+) -> Result<Vec<String>, ValidationError> {
+    let mut seen = BTreeSet::new();
+    let mut order = Vec::new();
+    for key in keys {
+        if !seen.insert(key) {
+            return Err(ValidationError::new(format!(
+                "{label} contains duplicate key {key:?}"
+            )));
+        }
+        order.push(key.to_owned());
+    }
+    Ok(order)
+}
+
+fn map_entries_in_order<'a, V>(
+    values: &'a BTreeMap<String, V>,
+    key_order: &[String],
+) -> Vec<(&'a str, &'a V)> {
+    let ordered_keys: BTreeSet<&str> = key_order.iter().map(String::as_str).collect();
+    let mut entries = Vec::with_capacity(values.len());
+    entries.extend(key_order.iter().filter_map(|key| {
+        values
+            .get_key_value(key)
+            .map(|(stored_key, value)| (stored_key.as_str(), value))
+    }));
+    entries.extend(
+        values
+            .iter()
+            .filter(|(key, _)| !ordered_keys.contains(key.as_str()))
+            .map(|(key, value)| (key.as_str(), value)),
+    );
+    entries
+}
+
 fn view_from_proto(value: proto::View) -> Result<View, ValidationError> {
     let mut wc_commit_ids = BTreeMap::new();
     if !value.wc_commit_id.is_empty() {
@@ -349,7 +386,11 @@ fn view_from_proto(value: proto::View) -> Result<View, ValidationError> {
     })
 }
 
-fn view_to_proto(view: &View) -> proto::CanonicalView {
+fn view_to_proto(
+    view: &View,
+    head_id_order: &[Vec<u8>],
+    wc_commit_id_order: &[String],
+) -> proto::OrderedView {
     let mut all_bookmarks = BTreeSet::new();
     all_bookmarks.extend(view.local_bookmarks.keys().cloned());
     for remote in view.remote_views.values() {
@@ -385,8 +426,8 @@ fn view_to_proto(view: &View) -> proto::CanonicalView {
         })
         .collect();
 
-    proto::CanonicalView {
-        head_ids: view.head_ids.iter().map(|id| id.0.clone()).collect(),
+    proto::OrderedView {
+        head_ids: head_id_order.to_vec(),
         wc_commit_id: Vec::new(),
         git_refs: view
             .git_refs
@@ -407,11 +448,10 @@ fn view_to_proto(view: &View) -> proto::CanonicalView {
             })
             .collect(),
         git_head_legacy: Vec::new(),
-        wc_commit_ids: view
-            .wc_commit_ids
-            .iter()
+        wc_commit_ids: map_entries_in_order(&view.wc_commit_ids, wc_commit_id_order)
+            .into_iter()
             .map(|(key, value)| proto::StringBytesEntry {
-                key: key.clone(),
+                key: key.to_owned(),
                 value: value.0.clone(),
             })
             .collect(),
@@ -440,11 +480,24 @@ fn collect_target_references(value: &RefTarget, output: &mut Vec<ObjectReference
 }
 
 pub(crate) fn validate_view(bytes: &[u8]) -> Result<ValidatedObject, ValidationError> {
+    let ordered = proto::OrderedView::decode(bytes).context("decode ordered view object")?;
+    let mut head_ids = BTreeSet::new();
+    for head_id in &ordered.head_ids {
+        if !head_ids.insert(head_id.as_slice()) {
+            return Err(ValidationError::new(
+                "view head_ids contains a duplicate id",
+            ));
+        }
+    }
+    let wc_commit_id_order = unique_map_key_order(
+        ordered.wc_commit_ids.iter().map(|entry| entry.key.as_str()),
+        "view wc_commit_ids",
+    )?;
     let value = proto::View::decode(bytes).context("decode view object")?;
     let view = view_from_proto(value)?;
-    if view_to_proto(&view).encode_to_vec() != bytes {
+    if view_to_proto(&view, &ordered.head_ids, &wc_commit_id_order).encode_to_vec() != bytes {
         return Err(ValidationError::new(
-            "view object is not canonically encoded",
+            "view object does not exactly re-encode",
         ));
     }
 
@@ -566,6 +619,16 @@ fn timestamp_proto(value: Timestamp) -> proto::Timestamp {
 }
 
 pub(crate) fn validate_operation(bytes: &[u8]) -> Result<ValidatedObject, ValidationError> {
+    let ordered =
+        proto::OrderedOperation::decode(bytes).context("decode ordered operation object")?;
+    let attribute_order = unique_map_key_order(
+        ordered
+            .metadata
+            .iter()
+            .flat_map(|metadata| metadata.attributes.iter())
+            .map(|entry| entry.key.as_str()),
+        "operation metadata attributes",
+    )?;
     let stored = proto::Operation::decode(bytes).context("decode operation object")?;
     if stored.parents.is_empty() {
         return Err(ValidationError::new(
@@ -610,18 +673,16 @@ pub(crate) fn validate_operation(bytes: &[u8]) -> Result<ValidatedObject, Valida
             .then_some(commit_predecessors),
     };
 
-    let canonical_metadata = proto::CanonicalOperationMetadata {
+    let canonical_metadata = proto::OrderedOperationMetadata {
         start_time: Some(timestamp_proto(operation.metadata.time.start)),
         end_time: Some(timestamp_proto(operation.metadata.time.end)),
         description: operation.metadata.description.clone(),
         hostname: operation.metadata.hostname.clone(),
         username: operation.metadata.username.clone(),
-        attributes: operation
-            .metadata
-            .attributes
-            .iter()
+        attributes: map_entries_in_order(&operation.metadata.attributes, &attribute_order)
+            .into_iter()
             .map(|(key, value)| proto::StringStringEntry {
-                key: key.clone(),
+                key: key.to_owned(),
                 value: value.clone(),
             })
             .collect(),
@@ -641,7 +702,7 @@ pub(crate) fn validate_operation(bytes: &[u8]) -> Result<ValidatedObject, Valida
                 .collect()
         })
         .unwrap_or_default();
-    let canonical = proto::CanonicalOperation {
+    let canonical = proto::OrderedOperation {
         view_id: operation.view_id.0.clone(),
         parents: operation.parents.iter().map(|id| id.0.clone()).collect(),
         metadata: Some(canonical_metadata),
@@ -650,7 +711,7 @@ pub(crate) fn validate_operation(bytes: &[u8]) -> Result<ValidatedObject, Valida
     };
     if canonical.encode_to_vec() != bytes {
         return Err(ValidationError::new(
-            "operation object is not canonically encoded",
+            "operation object does not exactly re-encode",
         ));
     }
 
