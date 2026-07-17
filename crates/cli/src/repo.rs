@@ -10,6 +10,7 @@ use jj_cli::ui::Ui;
 
 use crate::add::{AddArgs, add_checkout};
 use crate::remove::{RemoveArgs, remove_checkout};
+use crate::sync::{SyncArgs, run_sync};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum DevspaceCommand {
@@ -19,6 +20,8 @@ pub(crate) enum DevspaceCommand {
     Remove(RemoveArgs),
     /// Manage cloud repositories.
     Repo(RepoArgs),
+    #[command(hide = true)]
+    Sync(SyncArgs),
 }
 
 #[derive(clap::Args)]
@@ -44,6 +47,7 @@ pub(crate) async fn run(
         DevspaceCommand::Repo(RepoArgs {
             command: RepoCommand::New { name },
         }) => create_empty_repository(ui, command, name).await,
+        DevspaceCommand::Sync(args) => run_sync(ui, command, args).await,
     }
 }
 

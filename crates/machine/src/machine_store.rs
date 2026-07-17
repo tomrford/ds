@@ -19,6 +19,7 @@ const CATALOG_LOCK_FILE: &str = "repositories.lock";
 const MATERIALIZATION_LOCK_FILE: &str = "native.lock";
 const MATERIALIZATION_TEMP_PREFIX: &str = ".native-";
 const CHECKOUT_LOCK_DIRECTORY: &str = "locks/checkouts";
+const REPOSITORY_SYNC_LOCK_FILE: &str = "sync.lock";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RepositoryName(String);
@@ -130,6 +131,10 @@ pub struct CheckoutDestinationGuard {
     _file: File,
 }
 
+pub struct RepositorySyncGuard {
+    _file: File,
+}
+
 impl MachineStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -154,12 +159,23 @@ impl MachineStore {
     }
 
     pub fn native_repository_path(&self, identity: &RepositoryIdentity) -> PathBuf {
+        self.repository_directory(identity).join("native")
+    }
+
+    pub fn repository_sync_path(&self, identity: &RepositoryIdentity) -> PathBuf {
+        self.repository_directory(identity).join("sync")
+    }
+
+    pub fn repository_packs_path(&self, identity: &RepositoryIdentity) -> PathBuf {
+        self.repository_directory(identity).join("packs")
+    }
+
+    fn repository_directory(&self, identity: &RepositoryIdentity) -> PathBuf {
         self.root
             .join("repositories")
             .join(&identity.repository_id.as_str()[..2])
             .join(identity.repository_id.as_str())
             .join(identity.incarnation.as_str())
-            .join("native")
     }
 
     pub fn try_lock_checkout_destination(
@@ -197,6 +213,39 @@ impl MachineStore {
             }
             Err(fs::TryLockError::Error(source)) => {
                 Err(MachineStoreError::LockCheckout { path, source })
+            }
+        }
+    }
+
+    pub fn try_lock_repository_sync(
+        &self,
+        identity: &RepositoryIdentity,
+    ) -> Result<RepositorySyncGuard, MachineStoreError> {
+        let directory = self.repository_directory(identity);
+        fs::create_dir_all(&directory).map_err(|source| {
+            MachineStoreError::CreateRepositorySyncLockDirectory {
+                path: directory.clone(),
+                source,
+            }
+        })?;
+        let path = directory.join(REPOSITORY_SYNC_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| MachineStoreError::OpenRepositorySyncLock {
+                path: path.clone(),
+                source,
+            })?;
+        match file.try_lock() {
+            Ok(()) => Ok(RepositorySyncGuard { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => {
+                Err(MachineStoreError::RepositorySyncAlreadyLocked { path })
+            }
+            Err(fs::TryLockError::Error(source)) => {
+                Err(MachineStoreError::LockRepositorySync { path, source })
             }
         }
     }
@@ -602,6 +651,26 @@ pub enum MachineStoreError {
     CheckoutAlreadyLocked { path: PathBuf },
     #[error("failed to lock checkout destination at {path}")]
     LockCheckout {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create repository sync lock directory at {path}")]
+    CreateRepositorySyncLockDirectory {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to open repository sync lock at {path}")]
+    OpenRepositorySyncLock {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("repository sync is already in progress ({path})")]
+    RepositorySyncAlreadyLocked { path: PathBuf },
+    #[error("failed to lock repository sync at {path}")]
+    LockRepositorySync {
         path: PathBuf,
         #[source]
         source: io::Error,

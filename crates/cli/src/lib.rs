@@ -3,6 +3,7 @@ mod bare_workspace;
 mod checkout;
 mod remove;
 mod repo;
+mod sync;
 
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
@@ -44,6 +45,11 @@ async fn restrict_bare_repository_commands(
     command: &CommandHelper,
     stock_dispatch: jj_cli::cli_util::BoxedAsyncCliDispatch<'_>,
 ) -> Result<(), CommandError> {
+    // `sync run --repository` deliberately shares jj's global option spelling,
+    // but resolves the value itself through the machine catalog.
+    if command.matches().subcommand_name() == Some("sync") {
+        return stock_dispatch.call(ui, command).await;
+    }
     let repository_selector = REPOSITORY_SELECTOR
         .get()
         .expect("repository selector is initialized before the CLI runner");
