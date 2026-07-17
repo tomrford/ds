@@ -84,6 +84,9 @@ pub(crate) fn spawn_recorded() {
         let mut command = Command::new(&executable);
         command
             .args(["sync", "run", "--repository", &name])
+            // The parent's cwd may no longer exist (`ds remove .` deletes it);
+            // give the child a directory that outlives the command.
+            .current_dir(&repository_directory)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(error_log));

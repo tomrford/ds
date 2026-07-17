@@ -397,6 +397,45 @@ async fn successful_repository_command_spawns_a_silent_detached_sync() {
 }
 
 #[tokio::test]
+async fn removal_from_inside_the_checkout_still_spawns_boundary_sync() {
+    let temp = tempfile::tempdir().unwrap();
+    let entry = local_repository(temp.path(), "boundary-removed", "http://127.0.0.1:1").await;
+    let config = write_cli_config(temp.path());
+    let checkout = temp.path().join("checkout");
+    let added = ds(
+        temp.path(),
+        temp.path(),
+        &config,
+        &[
+            "add",
+            "boundary-removed",
+            "-r",
+            "root()",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+
+    // Removing the checkout deletes the command's own working directory; the
+    // detached sync must still run from a surviving one.
+    let output = ds_boundary(&checkout, temp.path(), &config, &["remove", "."]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!checkout.exists());
+
+    let sync_log = entry
+        .native_repository_path
+        .parent()
+        .unwrap()
+        .join("sync.log");
+    assert!(
+        poll_until(Duration::from_secs(3), || fs::read_to_string(&sync_log)
+            .is_ok_and(|log| log.contains("error sending request"))),
+        "detached sync after removal did not run from a surviving directory: {}",
+        sync_log.display()
+    );
+}
+
+#[tokio::test]
 async fn failed_repository_command_does_not_spawn_boundary_sync() {
     let temp = tempfile::tempdir().unwrap();
     let entry = local_repository(temp.path(), "boundary-failed", "http://127.0.0.1:1").await;
