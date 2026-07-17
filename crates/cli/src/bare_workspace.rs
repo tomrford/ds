@@ -103,11 +103,16 @@ impl RepositorySelector {
         let Some(selection) = self.selection() else {
             return Ok(None);
         };
-        self.catalog_entry
+        let entry = self
+            .catalog_entry
             .get_or_init(|| resolve(&selection.name))
             .as_ref()
             .map(Option::as_ref)
-            .map_err(String::as_str)
+            .map_err(String::as_str)?;
+        if let Some(entry) = entry {
+            crate::boundary_sync::record(entry);
+        }
+        Ok(entry)
     }
 }
 
@@ -125,7 +130,9 @@ impl WorkspaceLoaderFactory for DevspaceWorkspaceLoaderFactory {
         workspace_root: &Path,
     ) -> Result<Box<dyn WorkspaceLoader>, WorkspaceLoadError> {
         if workspace_root.join(".jj").is_dir() {
-            DefaultWorkspaceLoaderFactory.create(workspace_root)
+            let loader = DefaultWorkspaceLoaderFactory.create(workspace_root)?;
+            crate::boundary_sync::record_repository_path(loader.repo_path());
+            Ok(loader)
         } else if let Some(selection) = self.repository_selector.selection()
             && workspace_root == selection.requested_path
         {

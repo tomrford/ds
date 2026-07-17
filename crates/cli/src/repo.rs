@@ -47,7 +47,10 @@ pub(crate) async fn run(
         DevspaceCommand::Repo(RepoArgs {
             command: RepoCommand::New { name },
         }) => create_empty_repository(ui, command, name).await,
-        DevspaceCommand::Sync(args) => run_sync(ui, command, args).await,
+        DevspaceCommand::Sync(args) => {
+            crate::boundary_sync::suppress();
+            run_sync(ui, command, args).await
+        }
     }
 }
 
@@ -142,6 +145,7 @@ async fn create_empty_repository(
     store
         .complete_repository_creation(&intent)
         .map_err(|error| user_error(error.to_string()))?;
+    crate::boundary_sync::record(&entry);
 
     writeln!(ui.status(), "Created repository `{name}`.")?;
     Ok(())

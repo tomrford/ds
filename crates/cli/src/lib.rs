@@ -1,5 +1,6 @@
 mod add;
 mod bare_workspace;
+mod boundary_sync;
 mod checkout;
 mod remove;
 mod repo;
@@ -24,7 +25,7 @@ pub fn run() -> ExitCode {
         .get_or_init(|| Arc::new(RepositorySelector::from_process_cwd()))
         .clone();
     let selector_for_args = repository_selector.clone();
-    CliRunner::init()
+    let exit_code = CliRunner::init()
         .name("ds")
         .version(env!("CARGO_PKG_VERSION"))
         .set_workspace_loader_factory(Box::new(DevspaceWorkspaceLoaderFactory::new(
@@ -37,7 +38,11 @@ pub fn run() -> ExitCode {
         })
         .add_dispatch_hook(restrict_bare_repository_commands)
         .run()
-        .into()
+        .into();
+    if exit_code == ExitCode::SUCCESS {
+        boundary_sync::spawn_recorded();
+    }
+    exit_code
 }
 
 async fn restrict_bare_repository_commands(

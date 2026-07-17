@@ -97,6 +97,7 @@ fn ds_with_env(cwd: &Path, config: &Path, args: &[&str], environment: &[(&str, &
             config.parent().unwrap().join("machine-store"),
         )
         .env("JJ_CONFIG", config)
+        .env("DEVSPACE_BOUNDARY_SYNC", "0")
         .env("NO_COLOR", "1")
         .env("PAGER", "cat")
         .args(args);

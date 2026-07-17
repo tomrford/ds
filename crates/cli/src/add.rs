@@ -99,6 +99,7 @@ pub(crate) async fn add_checkout(
             "Repository `{name}` is registered locally, but its native repository is invalid."
         )));
     }
+    crate::boundary_sync::record(&entry);
 
     ensure_destination_parent(&requested_path)?;
     let requested_path = canonical_destination_path(&requested_path)?;

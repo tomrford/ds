@@ -70,6 +70,7 @@ pub(crate) async fn remove_checkout(
         }
         Err(_) => return Err(not_checkout(&path)),
     };
+    crate::boundary_sync::record(&target.entry);
     let _destination_guard = store
         .try_lock_checkout_destination(&destination_hash(&path))
         .map_err(|error| user_error(error.to_string()))?;

@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use devspace_machine::{
     CatalogEntry, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository,
@@ -70,16 +72,27 @@ fn configure_machine(root: &Path, base_url: &str, machine_id: &str, secret: &str
 }
 
 fn ds(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
+    ds_command(cwd, home, config).args(args).output().unwrap()
+}
+
+fn ds_boundary(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
+    ds_command(cwd, home, config)
+        .env("DEVSPACE_BOUNDARY_SYNC", "1")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn ds_command(cwd: &Path, home: &Path, config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
     command
         .current_dir(cwd)
         .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
         .env("JJ_CONFIG", config)
+        .env("DEVSPACE_BOUNDARY_SYNC", "0")
         .env("NO_COLOR", "1")
-        .env("PAGER", "cat")
-        .args(args)
-        .output()
-        .unwrap()
+        .env("PAGER", "cat");
+    command
 }
 
 fn stdout(output: &Output) -> String {
@@ -236,6 +249,121 @@ async fn sync_run_reports_offline_transport_failure_without_mutating_durable_sta
     assert!(sync_store.load_outbox().unwrap().is_none());
 }
 
+#[tokio::test]
+async fn successful_repository_command_spawns_a_silent_detached_sync() {
+    let temp = tempfile::tempdir().unwrap();
+    let entry = local_repository(temp.path(), "boundary-offline", "http://127.0.0.1:1").await;
+    let config = write_cli_config(temp.path());
+    let checkout = temp.path().join("checkout");
+    let added = ds(
+        temp.path(),
+        temp.path(),
+        &config,
+        &[
+            "add",
+            "boundary-offline",
+            "-r",
+            "root()",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+
+    let started = Instant::now();
+    let output = ds_boundary(
+        &checkout,
+        temp.path(),
+        &config,
+        &["log", "-r", "root()", "--no-graph"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "repository command waited for boundary sync: {:?}",
+        started.elapsed()
+    );
+    for visible_output in [stdout(&output), stderr(&output)] {
+        assert!(!visible_output.contains("error sending request"));
+        assert!(!visible_output.contains("synchroniz"));
+    }
+
+    let sync_log = entry
+        .native_repository_path
+        .parent()
+        .unwrap()
+        .join("sync.log");
+    assert!(
+        poll_until(Duration::from_secs(3), || fs::read_to_string(&sync_log)
+            .is_ok_and(|log| log.contains("error sending request"))),
+        "detached sync did not report its transport failure in {}",
+        sync_log.display()
+    );
+}
+
+#[tokio::test]
+async fn failed_repository_command_does_not_spawn_boundary_sync() {
+    let temp = tempfile::tempdir().unwrap();
+    let entry = local_repository(temp.path(), "boundary-failed", "http://127.0.0.1:1").await;
+    let config = write_cli_config(temp.path());
+    let checkout = temp.path().join("checkout");
+    let added = ds(
+        temp.path(),
+        temp.path(),
+        &config,
+        &[
+            "add",
+            "boundary-failed",
+            "-r",
+            "root()",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let store = machine_store(temp.path());
+    let _sync_guard = store.try_lock_repository_sync(&entry.identity).unwrap();
+    let sync_log = entry
+        .native_repository_path
+        .parent()
+        .unwrap()
+        .join("sync.log");
+
+    let output = ds_boundary(
+        &checkout,
+        temp.path(),
+        &config,
+        &["log", "-r", "does-not-exist", "--no-graph"],
+    );
+    assert!(!output.status.success());
+    assert!(!poll_until(Duration::from_secs(1), || sync_log.exists()));
+}
+
+#[tokio::test]
+async fn sync_run_does_not_respawn_itself() {
+    let temp = tempfile::tempdir().unwrap();
+    let entry = local_repository(temp.path(), "boundary-recursion", "http://127.0.0.1:1").await;
+    let config = write_cli_config(temp.path());
+    let store = machine_store(temp.path());
+    let _sync_guard = store.try_lock_repository_sync(&entry.identity).unwrap();
+    let sync_log = entry
+        .native_repository_path
+        .parent()
+        .unwrap()
+        .join("sync.log");
+    fs::write(&sync_log, "sentinel\n").unwrap();
+
+    let output = ds_boundary(
+        temp.path(),
+        temp.path(),
+        &config,
+        &["sync", "run", "--repository", "boundary-recursion"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).contains("already being synchronized; skipping"));
+    assert!(!poll_until(Duration::from_secs(1), || {
+        fs::read_to_string(&sync_log).unwrap() != "sentinel\n"
+    }));
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
 async fn two_machine_cli_sync_converges_through_a_live_worker() {
@@ -390,6 +518,96 @@ async fn two_machine_cli_sync_converges_through_a_live_worker() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
+async fn boundary_sync_uploads_machine_a_without_explicit_sync() {
+    let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
+    let shared_secret =
+        std::env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
+    let temp = tempfile::tempdir().unwrap();
+    let home_a = temp.path().join("machine-a");
+    let home_b = temp.path().join("machine-b");
+    fs::create_dir_all(&home_a).unwrap();
+    fs::create_dir_all(&home_b).unwrap();
+    configure_machine(&home_a, &base_url, FIRST_MACHINE_ID, &shared_secret);
+    configure_machine(&home_b, &base_url, SECOND_MACHINE_ID, &shared_secret);
+    let config_a = write_cli_config(&home_a);
+    let config_b = write_cli_config(&home_b);
+    let repository_name = unique_repository_name(temp.path());
+
+    let created = ds_boundary(
+        &home_a,
+        &home_a,
+        &config_a,
+        &["repo", "new", &repository_name],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let name = RepositoryName::parse(repository_name.clone()).unwrap();
+    let store_a = machine_store(&home_a);
+    let entry_a = store_a.resolve(&name).unwrap().unwrap();
+
+    let checkout_a = home_a.join("checkout");
+    let added_a = ds_boundary(
+        &home_a,
+        &home_a,
+        &config_a,
+        &[
+            "add",
+            &repository_name,
+            "-r",
+            "root()",
+            checkout_a.to_str().unwrap(),
+        ],
+    );
+    assert!(added_a.status.success(), "{}", stderr(&added_a));
+    fs::write(checkout_a.join("from-boundary-a.txt"), "machine A\n").unwrap();
+    seal_commit_boundary(&checkout_a, &home_a, &config_a, "boundary machine A");
+    let commit_a = commit_id_boundary(&checkout_a, &home_a, &config_a, "@-");
+
+    let store_b = machine_store(&home_b);
+    let entry_b = store_b
+        .register_repository(name.clone(), entry_a.identity.clone())
+        .unwrap();
+    MachineRepository::init(&entry_b.native_repository_path, &settings())
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let boundary = ds_boundary(
+            &checkout_a,
+            &home_a,
+            &config_a,
+            &["log", "-r", &commit_a, "--no-graph"],
+        );
+        assert!(boundary.status.success(), "{}", stderr(&boundary));
+
+        let pulled_b = ds(
+            &home_b,
+            &home_b,
+            &config_b,
+            &["sync", "run", "--repository", &repository_name],
+        );
+        assert!(pulled_b.status.success(), "{}", stderr(&pulled_b));
+        if repository_commit_ids(&home_b, &config_b, &repository_name).contains(&commit_a) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "machine A boundary sync did not upload {commit_a}; sync log: {}",
+            fs::read_to_string(
+                entry_a
+                    .native_repository_path
+                    .parent()
+                    .unwrap()
+                    .join("sync.log")
+            )
+            .unwrap_or_else(|error| format!("<unavailable: {error}>"))
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn seal_commit(cwd: &Path, home: &Path, config: &Path, description: &str) {
     let described = ds(cwd, home, config, &["describe", "-m", description]);
     assert!(described.status.success(), "{}", stderr(&described));
@@ -397,8 +615,33 @@ fn seal_commit(cwd: &Path, home: &Path, config: &Path, description: &str) {
     assert!(sealed.status.success(), "{}", stderr(&sealed));
 }
 
+fn seal_commit_boundary(cwd: &Path, home: &Path, config: &Path, description: &str) {
+    let described = ds_boundary(cwd, home, config, &["describe", "-m", description]);
+    assert!(described.status.success(), "{}", stderr(&described));
+    let sealed = ds_boundary(cwd, home, config, &["new"]);
+    assert!(sealed.status.success(), "{}", stderr(&sealed));
+}
+
 fn commit_id(cwd: &Path, home: &Path, config: &Path, revision: &str) -> String {
     let output = ds(
+        cwd,
+        home,
+        config,
+        &[
+            "log",
+            "-r",
+            revision,
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    stdout(&output).trim().to_owned()
+}
+
+fn commit_id_boundary(cwd: &Path, home: &Path, config: &Path, revision: &str) -> String {
+    let output = ds_boundary(
         cwd,
         home,
         config,
@@ -460,6 +703,17 @@ fn unique_repository_name(temp: &Path) -> String {
         .map(|byte| byte.to_ascii_lowercase() as char)
         .collect::<String>();
     format!("sync-live-{}-{suffix}", std::process::id())
+}
+
+fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    condition()
 }
 
 fn snapshot_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {

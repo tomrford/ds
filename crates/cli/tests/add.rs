@@ -65,6 +65,7 @@ fn ds_command(cwd: &Path, config: &Path) -> Command {
             config.parent().unwrap().join("machine-store"),
         )
         .env("JJ_CONFIG", config)
+        .env("DEVSPACE_BOUNDARY_SYNC", "0")
         .env("NO_COLOR", "1")
         .env("PAGER", "cat");
     command
