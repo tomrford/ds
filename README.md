@@ -67,12 +67,18 @@ demonstrating it end to end is an open gate for machine enrolment.
 
 ## Offline behavior
 
-Every command except `ds repo new` works without connectivity. Reads and edits
-are local jj operations against the machine store. `ds add` and `ds remove`
-resolve checkout state locally and never open a transport. Work created offline
-converges later: the sync engine uploads and installs at the next boundary that
-reaches the Worker, and jj's operation merge absorbs divergence created
-meanwhile on other machines.
+Reads and edits in an existing checkout are local jj operations against the
+machine store. After a successful repository command returns, `ds` starts a
+detached sync pass for that repository. The pass uploads local operations and
+installs cloud operations without delaying the command. Work created offline
+converges at later command boundaries that reach the Worker. jj's operation
+merge absorbs divergence created on other machines.
+
+`ds status` adds one local-only sync line to jj's status output. It reports
+whether the checkout has never synchronized, has operations pending upload, or
+matches the cloud heads recorded by the last successful sync. The indicator
+never contacts the Worker. `ds sync run --repository <name>` is the plumbing
+command used by detached boundary sync and manual recovery.
 
 `ds repo new` requires connectivity because reserving a tenant-local name is a
 global operation on the directory. Offline repository creation is outside the
@@ -121,13 +127,16 @@ cloud first-use belongs to the repository lifecycle commands rather than the
 warm read path. Existing workspace paths, including explicit `-R` paths, retain
 stock jj behavior.
 
-`ds add <name> -r <revision> <path>` creates a new working checkout for an
-existing local machine repository. Both the revision and destination are
-explicit. Named revisions resolve against the locally accepted repository;
-plain `@`, `@-` and `@+` resolve only when the command runs inside another
-checkout of the same repository. The workspace identity is the machine ID plus
-a stable digest of the canonical destination path, so the same machine and path
-always select the same workspace. The checkout carries a self-describing
+`ds add <name> -r <revision> <path>` creates a working checkout. On first use on
+a machine, it resolves the cloud directory entry, synchronizes a staged native
+repository and publishes the complete clone before creating the checkout. This
+first use requires connectivity. Later checkouts use the local machine
+repository. Both the revision and destination are explicit. Named revisions
+resolve against the locally accepted repository; plain `@`, `@-` and `@+`
+resolve only when the command runs inside another checkout of the same
+repository. The workspace identity is the machine ID plus a stable digest of
+the canonical destination path, so the same machine and path always select the
+same workspace. The checkout carries a self-describing
 `.jj/devspace-checkout-owner` marker and a stock `.jj/repo` pointer to the shared
 native repository. Its working-copy state stays in the checkout.
 

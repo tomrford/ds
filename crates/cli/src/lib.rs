@@ -5,6 +5,7 @@ mod checkout;
 mod remove;
 mod repo;
 mod sync;
+mod sync_status;
 
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
@@ -85,7 +86,8 @@ async fn restrict_bare_repository_commands(
     }
     let is_bare_repository = loader.workspace_root() == loader.repo_path();
     if !is_bare_repository {
-        return stock_dispatch.call(ui, command).await;
+        stock_dispatch.call(ui, command).await?;
+        return sync_status::write_status_line(ui, command).await;
     }
     let is_log = command.matches().subcommand_name() == Some("log");
     if command.global_args().repository.is_none() {

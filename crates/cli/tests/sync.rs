@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use devspace_machine::{
     CatalogEntry, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository,
-    MachineStore, MachineSyncStore, RepositoryId, RepositoryIdentity, RepositoryIncarnation,
-    RepositoryName, SharedSecret,
+    MachineStore, MachineSyncStore, PendingHeadBatch, PendingHeadTransaction, RepositoryId,
+    RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret, SyncState,
 };
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
@@ -247,6 +247,102 @@ async fn sync_run_reports_offline_transport_failure_without_mutating_durable_sta
         .unwrap();
     assert_eq!(repository.repo().op_id(), &operation_before);
     assert!(sync_store.load_outbox().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn status_reports_local_sync_state_even_when_boundary_sync_is_disabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let entry = local_repository(temp.path(), "status-indicator", "http://127.0.0.1:1").await;
+    let config = write_cli_config(temp.path());
+    let checkout = temp.path().join("checkout");
+    let added = ds(
+        temp.path(),
+        temp.path(),
+        &config,
+        &[
+            "add",
+            "status-indicator",
+            "-r",
+            "root()",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+
+    let never = ds(&checkout, temp.path(), &config, &["status"]);
+    assert!(never.status.success(), "{}", stderr(&never));
+    assert!(
+        stdout(&never).contains("Working copy"),
+        "{}",
+        stdout(&never)
+    );
+    assert!(!stdout(&never).contains("sync:"), "{}", stdout(&never));
+    assert!(
+        stderr(&never).contains("sync: never synchronized"),
+        "{}",
+        stderr(&never)
+    );
+    assert_eq!(stderr(&never).matches("sync:").count(), 1);
+    let log = ds(
+        &checkout,
+        temp.path(),
+        &config,
+        &["log", "-r", "root()", "--no-graph"],
+    );
+    assert!(log.status.success(), "{}", stderr(&log));
+    assert!(!stdout(&log).contains("sync:"), "{}", stdout(&log));
+    assert!(!stderr(&log).contains("sync:"), "{}", stderr(&log));
+
+    let store = machine_store(temp.path());
+    let sync_store = MachineSyncStore::open(store.repository_sync_path(&entry.identity)).unwrap();
+    let pending = ds(&checkout, temp.path(), &config, &["status"]);
+    assert!(pending.status.success(), "{}", stderr(&pending));
+    assert!(
+        stderr(&pending).contains("sync: 1 operation pending upload"),
+        "{}",
+        stderr(&pending)
+    );
+
+    let accepted_heads = operation_head_ids(&entry.native_repository_path).await;
+    sync_store
+        .save_state(&SyncState {
+            accepted_heads: accepted_heads.clone(),
+            ..SyncState::default()
+        })
+        .unwrap();
+    let synchronized = ds(&checkout, temp.path(), &config, &["status"]);
+    assert!(synchronized.status.success(), "{}", stderr(&synchronized));
+    assert!(
+        stderr(&synchronized).contains("sync: in sync with cloud as of the last successful sync"),
+        "{}",
+        stderr(&synchronized)
+    );
+
+    let accepted_head = *accepted_heads.first().unwrap();
+    sync_store
+        .save_outbox(
+            &PendingHeadBatch::from_transactions(vec![
+                PendingHeadTransaction {
+                    idempotency_key: [1; 16],
+                    new_head: accepted_head,
+                    observed_heads: BTreeSet::new(),
+                },
+                PendingHeadTransaction {
+                    idempotency_key: [2; 16],
+                    new_head: [7; 64],
+                    observed_heads: BTreeSet::new(),
+                },
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    let outbox = ds(&checkout, temp.path(), &config, &["status"]);
+    assert!(outbox.status.success(), "{}", stderr(&outbox));
+    assert!(
+        stderr(&outbox).contains("sync: 2 operations pending upload"),
+        "{}",
+        stderr(&outbox)
+    );
 }
 
 #[tokio::test]
@@ -682,7 +778,7 @@ async fn operation_heads(repository_path: &Path) -> Vec<String> {
     let repository = MachineRepository::open(repository_path, &settings())
         .await
         .unwrap();
-    repository
+    let mut heads = repository
         .repo()
         .op_heads_store()
         .get_op_heads()
@@ -690,6 +786,23 @@ async fn operation_heads(repository_path: &Path) -> Vec<String> {
         .unwrap()
         .into_iter()
         .map(|head| head.hex())
+        .collect::<Vec<_>>();
+    heads.sort();
+    heads
+}
+
+async fn operation_head_ids(repository_path: &Path) -> BTreeSet<[u8; 64]> {
+    let repository = MachineRepository::open(repository_path, &settings())
+        .await
+        .unwrap();
+    repository
+        .repo()
+        .op_heads_store()
+        .get_op_heads()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|head| head.as_bytes().try_into().unwrap())
         .collect()
 }
 

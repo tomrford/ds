@@ -424,14 +424,13 @@ frontier match the cloud and no outbox remains.
 
 ## Command-boundary recovery
 
-The command-boundary test runs no daemon. A native jj transaction commits an
-operation while the sidecar has no outbox entry, modelling a crash before the
-hint is written. The next engine invocation rediscovers the operation from
-jj's stock operation heads, uploads its closure and writes the exact head
-request before a fault prevents cloud mutation. A separate invocation repairs
-and replays that queued request, then a later native transaction is likewise
-discovered and published at the following command boundary. Both accepted
-cursors and heads persist and no outbox remains.
+After each successful repository command, `ds` starts a detached
+`ds sync run --repository <name>` process. Command failures and the plumbing
+command itself do not spawn a sync pass. The engine rediscovers operations from
+jj's stock operation heads even when the sidecar has no outbox entry. It writes
+the exact head request before cloud mutation, so a later boundary can replay an
+interrupted request. The `ds status` sync line reads only the local operation
+heads, accepted heads and outbox. It does not start a transport.
 
 ## Warm latency
 
@@ -469,10 +468,10 @@ on a working copy. The read-only loader prunes ancestor operation heads in
 memory and requires exactly one remaining head; sync reconciles genuinely
 divergent heads before command execution. Bare roots with jj config markers are
 rejected, and raw native paths are not product-facing identities. A missing
-local name fails without a cloud request because clone-on-first-use does not
-exist yet. The local read constructs no Devspace
-sync transport or HTTP client. Normal jj workspaces, including explicit `-R`
-workspace paths, continue through jj's stock loader.
+local name fails without a cloud request on this warm read path. `ds add`
+handles cloud first use by resolving the name, synchronizing a staged native
+repository and publishing the complete clone. Normal jj workspaces, including
+explicit `-R` workspace paths, continue through jj's stock loader.
 
 ## Open verification
 
