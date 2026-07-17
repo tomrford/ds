@@ -405,6 +405,22 @@ describe("cloud operation heads", () => {
 describe("cloud pack download", () => {
   const incarnation = "33".repeat(16);
 
+  it("reconstructs a chunk with a zero-length object in its byte range", async () => {
+    const repository = "pack-download-zero-length";
+    await initialize(repository, incarnation);
+    const fixture = zeroLengthMiddleObjectPack();
+    expect((await putManifest(repository, fixture.id, fixture.manifest)).status).toBe(200);
+    expect((await putChunk(repository, fixture.id, 0, fixture.chunk)).status).toBe(200);
+    expect((await install(repository, fixture.id)).status).toBe(200);
+
+    expect(await downloadPackManifest(repository, fixture.id, incarnation)).toEqual(
+      fixture.manifest,
+    );
+    expect(await downloadPackChunk(repository, fixture.id, 0, incarnation)).toEqual(
+      fixture.chunk,
+    );
+  });
+
   it("lists installed packs and reproduces their exact manifest and chunks", async () => {
     const repository = "pack-download";
     await initialize(repository, incarnation);
@@ -1638,6 +1654,39 @@ function spanningObjectPack() {
     byteOffset += chunk.byteLength;
   }
   return { id: toHex(kernel.hash([manifest])), manifest, chunks };
+}
+
+function zeroLengthMiddleObjectPack() {
+  const kernel = new Kernel();
+  const objects = [
+    { kind: KIND.file, bytes: new TextEncoder().encode("before") },
+    { kind: KIND.tree, bytes: new Uint8Array() },
+    { kind: KIND.view, bytes: canonicalEmptyView() },
+  ].map((object) => ({ ...object, id: kernel.validate(object.kind, object.bytes).id }));
+  const chunk = concat(...objects.map((object) => object.bytes));
+  const packHash = kernel.hash([chunk]);
+  const manifest = new Uint8Array(96 + objects.length * 88 + 80);
+  const view = new DataView(manifest.buffer);
+  manifest.set(new TextEncoder().encode("DSPK"));
+  view.setUint16(4, 1, true);
+  view.setUint32(8, 64 * 1024, true);
+  view.setUint32(16, objects.length, true);
+  view.setUint32(20, 1, true);
+  view.setBigUint64(24, BigInt(chunk.byteLength), true);
+  manifest.set(packHash, 32);
+  let byteOffset = 0;
+  for (const [position, object] of objects.entries()) {
+    const offset = 96 + position * 88;
+    manifest[offset] = object.kind;
+    manifest.set(object.id, offset + 8);
+    view.setBigUint64(offset + 72, BigInt(byteOffset), true);
+    view.setBigUint64(offset + 80, BigInt(object.bytes.byteLength), true);
+    byteOffset += object.bytes.byteLength;
+  }
+  const chunkOffset = 96 + objects.length * 88;
+  view.setUint32(chunkOffset + 8, chunk.byteLength, true);
+  manifest.set(packHash, chunkOffset + 16);
+  return { id: toHex(kernel.hash([manifest])), manifest, chunk };
 }
 
 function fromHex(value: string): Uint8Array {

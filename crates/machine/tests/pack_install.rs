@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 
-use devspace_machine::{MachineRepository, PackInstallError, PackOptions, build_packs};
+use devspace_machine::{
+    MachineObject, MachineRepository, ObjectClosure, ObjectKey, ObjectKind, PackInstallError,
+    PackOptions, build_packs,
+};
 use jj_lib::backend::{CopyId, TreeValue};
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::merge::Merge;
@@ -132,6 +135,72 @@ async fn installs_downloaded_packs_idempotently_and_reconciles_their_head() {
             remote: "origin".as_ref(),
         });
     assert!(remote.target.is_present());
+}
+
+#[tokio::test]
+async fn installs_a_zero_length_object_from_a_downloaded_pack() {
+    let temp = tempfile::tempdir().unwrap();
+    let sources = temp.path().join("objects");
+    fs::create_dir(&sources).unwrap();
+    let fixtures = [
+        (ObjectKind::File, b"before".as_slice()),
+        (ObjectKind::Tree, b"".as_slice()),
+        (
+            ObjectKind::View,
+            [0x4a, 0x04, 0x1a, 0x02, 0x12, 0x00, 0x60, 0x01].as_slice(),
+        ),
+    ];
+    let objects = fixtures
+        .into_iter()
+        .enumerate()
+        .map(|(index, (kind, bytes))| {
+            let path = sources.join(format!("object-{index}"));
+            fs::write(&path, bytes).unwrap();
+            MachineObject {
+                key: ObjectKey {
+                    kind,
+                    id: devspace_kernel::validate(kind, bytes).unwrap().id,
+                },
+                path,
+                length: bytes.len() as u64,
+            }
+        })
+        .collect::<Vec<_>>();
+    let empty_tree = objects[1].key;
+    let built = build_packs(
+        &ObjectClosure {
+            operation_heads: Vec::new(),
+            objects,
+        },
+        &BTreeSet::new(),
+        temp.path().join("packs"),
+        PackOptions::default(),
+    )
+    .unwrap();
+    let pack = &built.packs[0];
+    assert_eq!(pack.manifest.objects()[1].key, empty_tree);
+    assert_eq!(pack.manifest.objects()[1].length, 0);
+    let (manifest, chunks) = pack_bytes(pack);
+
+    let destination_path = temp.path().join("destination");
+    let destination = MachineRepository::init(&destination_path, &settings())
+        .await
+        .unwrap();
+    let empty_tree_path = destination_path.join("store/trees").join(
+        empty_tree
+            .id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    );
+    assert_eq!(fs::metadata(&empty_tree_path).unwrap().len(), 0);
+    fs::remove_file(&empty_tree_path).unwrap();
+
+    let installed = destination
+        .install_pack(pack.id, &manifest, &chunks)
+        .unwrap();
+    assert_eq!(installed.inserted_objects, 3);
+    assert_eq!(fs::metadata(empty_tree_path).unwrap().len(), 0);
 }
 
 #[tokio::test]

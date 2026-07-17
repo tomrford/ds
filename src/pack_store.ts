@@ -368,6 +368,7 @@ export class PackStore {
          FROM installed_pack_objects AS indexed
          JOIN objects ON objects.kind = indexed.kind AND objects.id = indexed.id
          WHERE indexed.pack_id = ?
+           AND indexed.byte_length > 0
            AND indexed.byte_offset < ?
            AND indexed.byte_offset + indexed.byte_length > ?
          ORDER BY indexed.position`,
