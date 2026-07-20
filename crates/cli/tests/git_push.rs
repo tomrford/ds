@@ -209,7 +209,7 @@ async fn remote_add_prints_the_workers_kebab_case_error_code_without_the_url() {
 #[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
 async fn pushes_hidden_history_without_publishing_private_objects() {
     let fixture = LiveFixture::new("happy").await;
-    fs::write(fixture.checkout_a.join(".dshide"), b"secret*\n").unwrap();
+    fs::write(fixture.checkout_a.join(".dsprivate"), b"secret*\n").unwrap();
     fs::write(fixture.checkout_a.join("secret.bin"), PRIVATE_SENTINEL).unwrap();
     fs::write(fixture.checkout_a.join("visible.txt"), b"public one\n").unwrap();
     seal_commit(
@@ -287,7 +287,7 @@ async fn pushes_hidden_history_without_publishing_private_objects() {
 #[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
 async fn fresh_machine_claims_and_replays_a_push_left_pending_after_git_moved() {
     let fixture = LiveFixture::new("recovery").await;
-    fs::write(fixture.checkout_a.join(".dshide"), b"secret*\n").unwrap();
+    fs::write(fixture.checkout_a.join(".dsprivate"), b"secret*\n").unwrap();
     fs::write(fixture.checkout_a.join("secret.bin"), PRIVATE_SENTINEL).unwrap();
     fs::write(fixture.checkout_a.join("visible.txt"), b"before crash\n").unwrap();
     seal_commit(
@@ -842,8 +842,8 @@ fn assert_public_object_store(remote: &Path, sentinel: &[u8]) {
             "private sentinel entered Git"
         );
         assert!(
-            !contains_bytes(&output.stdout, b".dshide"),
-            ".dshide entered Git"
+            !contains_bytes(&output.stdout, b".dsprivate"),
+            ".dsprivate entered Git"
         );
     }
 }

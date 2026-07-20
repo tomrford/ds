@@ -108,12 +108,12 @@ async fn write_commit(
 
 async fn write_private_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
     let hidden_path = path("secrets/.env");
-    let dshide_path = path(".dshide");
+    let dsprivate_path = path(".dsprivate");
     let hidden_values = vec![
         b"DEVSPACE_PRIVATE_SENTINEL=first\0\xff".to_vec(),
         b"DEVSPACE_PRIVATE_SENTINEL=second\0\xfe".to_vec(),
     ];
-    let dshide = write_file(store, &dshide_path, b"/secrets/.env\n").await;
+    let dsprivate = write_file(store, &dsprivate_path, b"/secrets/.env\n").await;
     let mut parent = store.root_commit_id().clone();
     for (index, hidden) in hidden_values.iter().enumerate() {
         let hidden_value = write_file(store, &hidden_path, hidden).await;
@@ -129,7 +129,7 @@ async fn write_private_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
             store,
             RepoPath::root(),
             vec![
-                (".dshide", dshide.clone()),
+                (".dsprivate", dsprivate.clone()),
                 ("secrets", TreeValue::Tree(secrets_tree)),
                 ("visible.txt", visible_value),
             ],
@@ -254,7 +254,7 @@ async fn hidden_bytes_never_enter_fresh_sidecar() {
             .is_none()
     );
     assert!(
-        projected_value(&projection, &exported.git_heads[0], ".dshide")
+        projected_value(&projection, &exported.git_heads[0], ".dsprivate")
             .await
             .is_none()
     );
@@ -290,12 +290,12 @@ async fn each_commit_uses_its_own_hidden_set() {
         10,
     )
     .await;
-    let hide_a = write_file(store, &path(".dshide"), b"secrets/secret-a\n").await;
+    let hide_a = write_file(store, &path(".dsprivate"), b"secrets/secret-a\n").await;
     let second_tree = write_tree(
         store,
         RepoPath::root(),
         vec![
-            (".dshide", hide_a),
+            (".dsprivate", hide_a),
             ("secrets", TreeValue::Tree(secrets_tree.clone())),
         ],
     )
@@ -308,12 +308,12 @@ async fn each_commit_uses_its_own_hidden_set() {
         11,
     )
     .await;
-    let hide_b = write_file(store, &path(".dshide"), b"secrets/secret-b\n").await;
+    let hide_b = write_file(store, &path(".dsprivate"), b"secrets/secret-b\n").await;
     let third_tree = write_tree(
         store,
         RepoPath::root(),
         vec![
-            (".dshide", hide_b),
+            (".dsprivate", hide_b),
             ("secrets", TreeValue::Tree(secrets_tree)),
         ],
     )
@@ -392,7 +392,7 @@ async fn each_commit_uses_its_own_hidden_set() {
     );
     for git_id in mapped.values() {
         assert!(
-            projected_value(&projection, git_id, ".dshide")
+            projected_value(&projection, git_id, ".dsprivate")
                 .await
                 .is_none()
         );
@@ -427,8 +427,8 @@ async fn hidden_directory_is_pruned_before_negation_can_reinclude_a_child() {
         RepoPath::root(),
         vec![
             (
-                ".dshide",
-                write_file(store, &path(".dshide"), b"private/\n!private/keep.txt\n").await,
+                ".dsprivate",
+                write_file(store, &path(".dsprivate"), b"private/\n!private/keep.txt\n").await,
             ),
             ("private", TreeValue::Tree(private_tree)),
             (
@@ -465,7 +465,7 @@ async fn hidden_directory_is_pruned_before_negation_can_reinclude_a_child() {
 }
 
 #[tokio::test]
-async fn conflicted_dshide_fails_closed_with_the_commit_id() {
+async fn conflicted_dsprivate_fails_closed_with_the_commit_id() {
     let temp = tempfile::tempdir().unwrap();
     let settings = settings();
     let repository = MachineRepository::init(temp.path().join("native"), &settings)
@@ -476,8 +476,8 @@ async fn conflicted_dshide_fails_closed_with_the_commit_id() {
         store,
         RepoPath::root(),
         vec![(
-            ".dshide",
-            write_file(store, &path(".dshide"), b"left\n").await,
+            ".dsprivate",
+            write_file(store, &path(".dsprivate"), b"left\n").await,
         )],
     )
     .await;
@@ -485,8 +485,8 @@ async fn conflicted_dshide_fails_closed_with_the_commit_id() {
         store,
         RepoPath::root(),
         vec![(
-            ".dshide",
-            write_file(store, &path(".dshide"), b"right\n").await,
+            ".dsprivate",
+            write_file(store, &path(".dsprivate"), b"right\n").await,
         )],
     )
     .await;
@@ -507,11 +507,11 @@ async fn conflicted_dshide_fails_closed_with_the_commit_id() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, ProjectionError::ConflictedDshide(id) if id == head));
+    assert!(matches!(error, ProjectionError::ConflictedDsprivate(id) if id == head));
 }
 
 #[tokio::test]
-async fn directory_at_dshide_fails_closed_with_the_commit_id() {
+async fn directory_at_dsprivate_fails_closed_with_the_commit_id() {
     let temp = tempfile::tempdir().unwrap();
     let settings = settings();
     let repository = MachineRepository::init(temp.path().join("native"), &settings)
@@ -520,17 +520,17 @@ async fn directory_at_dshide_fails_closed_with_the_commit_id() {
     let store = repository.repo().store();
     let policy_tree = write_tree(
         store,
-        RepoPath::from_internal_string(".dshide").unwrap(),
+        RepoPath::from_internal_string(".dsprivate").unwrap(),
         vec![(
             "pattern",
-            write_file(store, &path(".dshide/pattern"), b"secret").await,
+            write_file(store, &path(".dsprivate/pattern"), b"secret").await,
         )],
     )
     .await;
     let root = write_tree(
         store,
         RepoPath::root(),
-        vec![(".dshide", TreeValue::Tree(policy_tree))],
+        vec![(".dsprivate", TreeValue::Tree(policy_tree))],
     )
     .await;
     let head = write_commit(
@@ -550,7 +550,7 @@ async fn directory_at_dshide_fails_closed_with_the_commit_id() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, ProjectionError::InvalidDshideEntry(id) if id == head));
+    assert!(matches!(error, ProjectionError::InvalidDsprivateEntry(id) if id == head));
 }
 
 #[tokio::test]
@@ -608,8 +608,8 @@ async fn full_tree_scan_finds_a_planted_public_leak() {
         RepoPath::root(),
         vec![
             (
-                ".dshide",
-                write_file(projection.store(), &path(".dshide"), b"also planted").await,
+                ".dsprivate",
+                write_file(projection.store(), &path(".dsprivate"), b"also planted").await,
             ),
             ("secrets", TreeValue::Tree(leaked_tree)),
         ],
@@ -629,7 +629,7 @@ async fn full_tree_scan_finds_a_planted_public_leak() {
             .scan_hidden_paths(&public, &hidden_set)
             .await
             .unwrap(),
-        [path(".dshide"), path("secrets/.env")]
+        [path(".dsprivate"), path("secrets/.env")]
     );
 }
 

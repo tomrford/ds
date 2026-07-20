@@ -13,10 +13,10 @@ repository Durable Object:
 `GitProjection` owns a rebuildable bare-Git sidecar backed by jj's Git backend.
 It translates commits between a stock native `SimpleBackend` store and Git
 without making the sidecar authoritative. Export resolves each commit's root
-`.dshide` blob as a gitignore matcher, caches matchers by `FileId`, prunes
+`.dsprivate` blob as a gitignore matcher, caches matchers by `FileId`, prunes
 matching directories without descent and filters matching leaves before
-reading them. The root `.dshide` is always excluded. Export rejects conflicts,
-non-file root `.dshide` entries and Git links with typed errors. Import is
+reading them. The root `.dsprivate` is always excluded. Export rejects conflicts,
+non-file root `.dsprivate` entries and Git links with typed errors. Import is
 unfiltered and rejects Git links before asking the simple backend to encode a
 tree.
 
@@ -72,7 +72,7 @@ ancestry and a durable projection state first.
 ## Verification
 
 The normal Rust tests pin the gitignore matcher behavior, resolve different
-`.dshide` blobs across one history walk, prove filtering before leaf reads,
+`.dsprivate` blobs across one history walk, prove filtering before leaf reads,
 scan every blob in a fresh sidecar for binary private sentinels, rebuild a
 deleted sidecar from durable mapping rows, and reject a Git link without
 changing the native operation head.

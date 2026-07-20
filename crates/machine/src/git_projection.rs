@@ -28,7 +28,7 @@ use jj_lib::tree_merge::MergeOptions;
 use thiserror::Error;
 
 const STORE_DIR: &str = "store";
-const DSHIDE: &str = ".dshide";
+const DSPRIVATE: &str = ".dsprivate";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitMapping {
@@ -502,7 +502,7 @@ fn scan_tree<'a>(
         let tree = store.get_tree(path.to_owned(), tree_id).await?;
         for entry in tree.entries_non_recursive() {
             let entry_path = path.join(entry.name());
-            if is_root_dshide(path, entry.name()) {
+            if is_root_dsprivate(path, entry.name()) {
                 leaked.push(entry_path);
                 continue;
             }
@@ -620,7 +620,7 @@ fn copy_tree<'a>(
                 let excluded = match entry.value() {
                     TreeValue::Tree(_) => hidden_set.matcher.matches_dir(&entry_path),
                     _ => {
-                        is_root_dshide(path, entry.name())
+                        is_root_dsprivate(path, entry.name())
                             || hidden_set.matcher.matches_file(&entry_path)
                     }
                 };
@@ -699,12 +699,13 @@ async fn resolve_hidden_set(
         commit.root_tree.clone(),
         ConflictLabels::from_merge(commit.conflict_labels.clone()),
     );
-    let dshide_path = RepoPath::from_internal_string(DSHIDE).expect(".dshide is a repository path");
+    let dsprivate_path =
+        RepoPath::from_internal_string(DSPRIVATE).expect(".dsprivate is a repository path");
     let value = merged_tree
-        .path_value(dshide_path)
+        .path_value(dsprivate_path)
         .await?
         .into_resolved()
-        .map_err(|_| ProjectionError::ConflictedDshide(commit_id.clone()))?;
+        .map_err(|_| ProjectionError::ConflictedDsprivate(commit_id.clone()))?;
     let Some(value) = value else {
         return Ok(HiddenSet {
             identity: HiddenSetIdentity(None),
@@ -712,7 +713,7 @@ async fn resolve_hidden_set(
         });
     };
     let TreeValue::File { id, .. } = value else {
-        return Err(ProjectionError::InvalidDshideEntry(commit_id.clone()));
+        return Err(ProjectionError::InvalidDsprivateEntry(commit_id.clone()));
     };
     if let Some(matcher) = cache.get(&id) {
         return Ok(HiddenSet {
@@ -721,15 +722,15 @@ async fn resolve_hidden_set(
         });
     }
     let mut bytes = Vec::new();
-    let contents = store.read_file(dshide_path, &id).await?;
+    let contents = store.read_file(dsprivate_path, &id).await?;
     jj_lib::file_util::copy_async_to_sync(contents, &mut bytes)
         .await
-        .map_err(|source| ProjectionError::ReadDshide {
+        .map_err(|source| ProjectionError::ReadDsprivate {
             commit_id: commit_id.clone(),
             source,
         })?;
     let matcher = GitIgnoreFile::empty()
-        .chain(RepoPath::root(), Path::new(DSHIDE), &bytes)
+        .chain(RepoPath::root(), Path::new(DSPRIVATE), &bytes)
         .expect("in-memory gitignore patterns have no parse errors");
     cache.insert(id.clone(), matcher.clone());
     Ok(HiddenSet {
@@ -738,8 +739,8 @@ async fn resolve_hidden_set(
     })
 }
 
-fn is_root_dshide(path: &RepoPath, name: &jj_lib::repo_path::RepoPathComponent) -> bool {
-    path.is_root() && name.as_internal_str() == DSHIDE
+fn is_root_dsprivate(path: &RepoPath, name: &jj_lib::repo_path::RepoPathComponent) -> bool {
+    path.is_root() && name.as_internal_str() == DSPRIVATE
 }
 
 #[derive(Debug, Error)]
@@ -769,12 +770,12 @@ pub enum ProjectionError {
     ConflictedCommit(CommitId),
     #[error("cannot inspect conflicted projected commit {0}")]
     ConflictedProjectedCommit(CommitId),
-    #[error("cannot export commit {0}: .dshide is conflicted")]
-    ConflictedDshide(CommitId),
-    #[error("cannot export commit {0}: .dshide is not a regular file")]
-    InvalidDshideEntry(CommitId),
-    #[error("cannot read .dshide in commit {commit_id}")]
-    ReadDshide {
+    #[error("cannot export commit {0}: .dsprivate is conflicted")]
+    ConflictedDsprivate(CommitId),
+    #[error("cannot export commit {0}: .dsprivate is not a regular file")]
+    InvalidDsprivateEntry(CommitId),
+    #[error("cannot read .dsprivate in commit {commit_id}")]
+    ReadDsprivate {
         commit_id: CommitId,
         #[source]
         source: std::io::Error,
@@ -811,7 +812,7 @@ mod tests {
 
     fn matcher(bytes: &[u8]) -> Arc<GitIgnoreFile> {
         GitIgnoreFile::empty()
-            .chain(RepoPath::root(), Path::new(DSHIDE), bytes)
+            .chain(RepoPath::root(), Path::new(DSPRIVATE), bytes)
             .unwrap()
     }
 
@@ -820,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn dshide_gitignore_semantics_are_canonical() {
+    fn dsprivate_gitignore_semantics_are_canonical() {
         let anchored = matcher(b"/root-only\nunanchored\n");
         assert!(anchored.matches_file(repo_path("root-only")));
         assert!(!anchored.matches_file(repo_path("nested/root-only")));

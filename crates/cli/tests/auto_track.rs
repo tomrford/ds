@@ -116,17 +116,17 @@ async fn ordinary_snapshot_tracks_gitignored_hidden_file_and_sealed_change() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
     let checkout = checkout(temp.path(), &config, "hidden-file").await;
-    fs::write(checkout.join(".gitignore"), "*.env\n.dshide\n").unwrap();
-    fs::write(checkout.join(".dshide"), "*.env\n").unwrap();
+    fs::write(checkout.join(".gitignore"), "*.env\n.dsprivate\n").unwrap();
+    fs::write(checkout.join(".dsprivate"), "*.env\n").unwrap();
     fs::write(checkout.join("secret.env"), "private\n").unwrap();
 
     let tracked = ds(
         &checkout,
         &config,
-        &["file", "list", ".dshide", "secret.env"],
+        &["file", "list", ".dsprivate", "secret.env"],
     );
     assert!(tracked.status.success(), "{}", stderr(&tracked));
-    assert_eq!(stdout(&tracked), ".dshide\nsecret.env\n");
+    assert_eq!(stdout(&tracked), ".dsprivate\nsecret.env\n");
 
     let sealed = ds(&checkout, &config, &["new", "-m", "after secret"]);
     assert!(sealed.status.success(), "{}", stderr(&sealed));
@@ -145,7 +145,7 @@ async fn ordinary_snapshot_tracks_files_beneath_hidden_directory() {
     let config = write_cli_config(temp.path());
     let checkout = checkout(temp.path(), &config, "hidden-directory").await;
     fs::write(checkout.join(".gitignore"), "private/\n").unwrap();
-    fs::write(checkout.join(".dshide"), "private/\n").unwrap();
+    fs::write(checkout.join(".dsprivate"), "private/\n").unwrap();
     fs::create_dir(checkout.join("private")).unwrap();
     fs::write(checkout.join("private/secret"), "private\n").unwrap();
 
@@ -160,20 +160,20 @@ async fn removing_hidden_pattern_keeps_file_tracked() {
     let config = write_cli_config(temp.path());
     let checkout = checkout(temp.path(), &config, "hidden-removal").await;
     fs::write(checkout.join(".gitignore"), "secret.env\n").unwrap();
-    fs::write(checkout.join(".dshide"), "secret.env\n").unwrap();
+    fs::write(checkout.join(".dsprivate"), "secret.env\n").unwrap();
     fs::write(checkout.join("secret.env"), "private\n").unwrap();
     let tracked = ds(&checkout, &config, &["file", "list", "secret.env"]);
     assert!(tracked.status.success(), "{}", stderr(&tracked));
     assert_eq!(stdout(&tracked), "secret.env\n");
 
-    fs::write(checkout.join(".dshide"), "").unwrap();
+    fs::write(checkout.join(".dsprivate"), "").unwrap();
     let still_tracked = ds(&checkout, &config, &["file", "list", "secret.env"]);
     assert!(still_tracked.status.success(), "{}", stderr(&still_tracked));
     assert_eq!(stdout(&still_tracked), "secret.env\n");
 }
 
 #[tokio::test]
-async fn missing_dshide_leaves_gitignored_files_untracked() {
+async fn missing_dsprivate_leaves_gitignored_files_untracked() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
     let checkout = checkout(temp.path(), &config, "no-hidden-policy").await;
@@ -192,11 +192,15 @@ fn plain_jj_repository_gets_no_hidden_auto_tracking() {
     let plain = temp.path().join("plain");
     let initialized = ds(temp.path(), &config, &["git", "init", "plain"]);
     assert!(initialized.status.success(), "{}", stderr(&initialized));
-    fs::write(plain.join(".gitignore"), ".dshide\nsecret.env\n").unwrap();
-    fs::write(plain.join(".dshide"), "secret.env\n").unwrap();
+    fs::write(plain.join(".gitignore"), ".dsprivate\nsecret.env\n").unwrap();
+    fs::write(plain.join(".dsprivate"), "secret.env\n").unwrap();
     fs::write(plain.join("secret.env"), "private\n").unwrap();
 
-    let untracked = ds(&plain, &config, &["file", "list", ".dshide", "secret.env"]);
+    let untracked = ds(
+        &plain,
+        &config,
+        &["file", "list", ".dsprivate", "secret.env"],
+    );
     assert!(untracked.status.success(), "{}", stderr(&untracked));
     assert_eq!(stdout(&untracked), "");
 }

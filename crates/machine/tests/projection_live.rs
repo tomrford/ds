@@ -68,8 +68,8 @@ async fn write_private_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
         b"LIVE_PROJECTION_PRIVATE=first\0\xff".to_vec(),
         b"LIVE_PROJECTION_PRIVATE=second\0\xfe".to_vec(),
     ];
-    let dshide_path = RepoPathBuf::from_internal_string(".dshide").unwrap();
-    let dshide = write_file(store, &dshide_path, b"/secrets/.env\n").await;
+    let dsprivate_path = RepoPathBuf::from_internal_string(".dsprivate").unwrap();
+    let dsprivate = write_file(store, &dsprivate_path, b"/secrets/.env\n").await;
     let mut parent = store.root_commit_id().clone();
     for (index, hidden) in hidden_values.iter().enumerate() {
         let hidden_value = write_file(store, &hidden_path, hidden).await;
@@ -94,8 +94,8 @@ async fn write_private_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
                 RepoPath::root(),
                 BackendTree::from_sorted_entries(vec![
                     (
-                        RepoPathComponentBuf::new(".dshide".to_owned()).unwrap(),
-                        dshide.clone(),
+                        RepoPathComponentBuf::new(".dsprivate".to_owned()).unwrap(),
+                        dsprivate.clone(),
                     ),
                     (
                         RepoPathComponentBuf::new("secrets".to_owned()).unwrap(),

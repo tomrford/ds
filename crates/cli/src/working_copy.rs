@@ -22,7 +22,7 @@ use jj_lib::workspace::{
     default_working_copy_factory,
 };
 
-const DSHIDE: &str = ".dshide";
+const DSPRIVATE: &str = ".dsprivate";
 
 pub(crate) fn wrap_workspace_loader(inner: Box<dyn WorkspaceLoader>) -> Box<dyn WorkspaceLoader> {
     Box::new(DevspaceWorkspaceLoader { inner })
@@ -210,7 +210,7 @@ impl LockedWorkingCopy for LockedDevspaceWorkingCopy {
 }
 
 fn hidden_track_matcher(root: &Path) -> Result<Option<HiddenTrackMatcher>, SnapshotError> {
-    let path = root.join(DSHIDE);
+    let path = root.join(DSPRIVATE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -221,7 +221,7 @@ fn hidden_track_matcher(root: &Path) -> Result<Option<HiddenTrackMatcher>, Snaps
             });
         }
     };
-    let matcher = GitIgnoreFile::empty().chain(RepoPath::root(), Path::new(DSHIDE), &bytes)?;
+    let matcher = GitIgnoreFile::empty().chain(RepoPath::root(), Path::new(DSPRIVATE), &bytes)?;
     Ok(Some(HiddenTrackMatcher { matcher }))
 }
 
@@ -232,7 +232,7 @@ struct HiddenTrackMatcher {
 
 impl Matcher for HiddenTrackMatcher {
     fn matches(&self, file: &RepoPath) -> bool {
-        file.as_internal_file_string() == DSHIDE || hidden_file_matches(&self.matcher, file)
+        file.as_internal_file_string() == DSPRIVATE || hidden_file_matches(&self.matcher, file)
     }
 
     fn visit(&self, _dir: &RepoPath) -> Visit {
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn force_tracking_includes_children_of_a_hidden_directory() {
         let matcher = GitIgnoreFile::empty()
-            .chain(RepoPath::root(), Path::new(DSHIDE), b"private/\n")
+            .chain(RepoPath::root(), Path::new(DSPRIVATE), b"private/\n")
             .unwrap();
         let matcher = HiddenTrackMatcher { matcher };
         assert!(matcher.matches(RepoPath::from_internal_string("private/secret").unwrap()));

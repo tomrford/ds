@@ -6,13 +6,13 @@ consumers, not from the machine owner or the cloud authority.
 
 ## Policy model
 
-The hidden set is per-commit content. A file named `.dshide` at the repository
+The hidden set is per-commit content. A file named `.dsprivate` at the repository
 root contains gitignore patterns. It is part of each commit's tree, so the
 hidden set branches, merges and conflicts through ordinary jj machinery, and
 every descendant inherits its parent's set until a commit changes it. Nested
-`.dshide` files are ordinary content and may themselves match the root policy.
+`.dsprivate` files are ordinary content and may themselves match the root policy.
 
-`.dshide` is itself always hidden. This rule is fixed and not expressed inside
+`.dsprivate` is itself always hidden. This rule is fixed and not expressed inside
 the file.
 
 Patterns use the semantics of jj-lib's `GitIgnoreFile`, backed by gix-ignore.
@@ -22,8 +22,8 @@ handling. Directories are hideable. An excluded directory is pruned without
 descent, so a later negation cannot re-include a child beneath it. Gitignore
 syntax has no parse-error state.
 
-The hidden-set identity is the `FileId` of the root `.dshide` blob, or `None`
-when the commit has no `.dshide`. A conflicted `.dshide`, or a root `.dshide`
+The hidden-set identity is the `FileId` of the root `.dsprivate` blob, or `None`
+when the commit has no `.dsprivate`. A conflicted `.dsprivate`, or a root `.dsprivate`
 entry that is not a regular file, fails export closed for that commit. The
 executable bit is allowed. Nothing is projected until the conflict or entry
 type is repaired.
@@ -34,16 +34,16 @@ commit, serialized and replicated like any other.
 
 ## User contract
 
-Edit the root `.dshide` file to change the hidden set. Every snapshot in a
-Devspace checkout force-tracks `.dshide` itself and all working-copy files its
+Edit the root `.dsprivate` file to change the hidden set. Every snapshot in a
+Devspace checkout force-tracks `.dsprivate` itself and all working-copy files its
 current contents match, including files beneath matched directories. An
 existing gitignored secret therefore becomes canonical as soon as its pattern
 is present for the next ordinary command or explicit snapshot.
 
-`.dshide` is not an ignore file: matching a path versions it privately and
+`.dsprivate` is not an ignore file: matching a path versions it privately and
 hides it from Git. Keep hidden paths covered by gitignore as well so plain-Git
 collaborators do not commit their local copies. Devspace does not edit or infer
-`.dshide` policy from `.gitignore`.
+`.dsprivate` policy from `.gitignore`.
 
 Removing a pattern does not untrack matching content or delete it from native
 history. Gitignore the path, then run `ds file untrack <path>` to stop tracking
@@ -52,13 +52,13 @@ Git publication from descendants of that commit.
 
 ## Projection
 
-Export resolves each commit's matcher from that commit's root `.dshide` and
-caches matchers by `FileId`. `.dshide` itself is always excluded. Matching
+Export resolves each commit's matcher from that commit's root `.dsprivate` and
+caches matchers by `FileId`. `.dsprivate` itself is always excluded. Matching
 files and symlinks are removed before their objects are read into Git
 (filter-before-read); matching directories are pruned without descent;
 directories made empty by filtering are omitted. Before push, the projected
 tree is walked in full under the canonical head's matcher and any matching
-path or root `.dshide` is reported as a leak. Export fails closed on any
+path or root `.dsprivate` is reported as a leak. Export fails closed on any
 conflict in an exported commit. Exporting around an unresolved hidden conflict
 would silently publish a deletion of the public side, a public effect nobody
 chose, so publication always waits for an explicit resolution.
@@ -70,7 +70,7 @@ commits keep the bytes they published.
 ## Journal binding
 
 Projection states bind each published Git object to one private canonical
-commit and the identity of the `.dshide` blob under which it was exported.
+commit and the identity of the `.dsprivate` blob under which it was exported.
 Fetch interprets a seed under the hidden set recorded by its exact state; when
 ancestry reaches a Git object recorded through several bookmarks, the newest
 state per bookmark must agree on one private commit and hidden-set identity,
@@ -80,7 +80,7 @@ or the seed is ambiguous and fails closed.
 
 Fetch lifts imported public commits onto private lineage (see
 `git-fetch.md`). Because lifting replays each public delta onto the merged
-private parents, `.dshide` and all hidden values flow to lifted commits
+private parents, `.dsprivate` and all hidden values flow to lifted commits
 structurally: fetched changes inherit the hidden rules of the lineage they
 grew from.
 
@@ -97,8 +97,8 @@ Devspace tolerates this and never rewrites remote history:
 - resolution is an ordinary child change; if the private value wins, the next
   push publishes a deletion of the path, never the private bytes
 
-A `.dshide` file pushed by a plain-git collaborator is the same case:
-`.dshide` is always hidden, so it produces the same labeled conflict and
+A `.dsprivate` file pushed by a plain-git collaborator is the same case:
+`.dsprivate` is always hidden, so it produces the same labeled conflict and
 warning rather than a special code path.
 
 The guarantee is therefore: Devspace never adds hidden bytes to a Git object;

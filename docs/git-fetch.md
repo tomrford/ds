@@ -52,7 +52,7 @@ C:
    merged tree and the imported commit's metadata.
 
 Because hidden paths are absent from every public tree, the merged private
-parents supply their values unchanged: hidden content, including `.dshide`
+parents supply their values unchanged: hidden content, including `.dsprivate`
 itself, flows to lifted commits structurally. A public edit at a hidden path
 becomes a native jj conflict exactly as `hidden.md` specifies; a Git merge
 lifts by merging all public parents and all private parents separately and
@@ -107,7 +107,7 @@ traversal plus labeled rejection, not conflict-term filtering.
 ## Open items
 
 - The journal route, its Worker schema and the fault-matrix coverage: lost
-  responses at fetch-mutation, cursor races, policy-bearing (`.dshide`)
+  responses at fetch-mutation, cursor races, policy-bearing (`.dsprivate`)
   commits, rewritten refs, ambiguous multi-bookmark seeds, octopus merges and
   hidden parent disagreement.
 - Adversarial depth testing for recursive tree translation.

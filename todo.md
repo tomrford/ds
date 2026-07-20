@@ -18,9 +18,13 @@
   in-flight machine is not fenced; it can push the old URL or lose its batch
   mid-flight. Failure is loud and the new registration stays consistent, but
   proper remote-generation fencing belongs in production hardening.
-- Rename `.dshide` before any external users exist: with auto-tracking the
-  file means "version privately, hide from Git", so `.dshide` reads misleadingly
-  like an ignore file; `.dsprivate` or similar. Mechanical cutover, decided, not
-  yet scheduled.
+- `ds context` (grepo parity): external-context management inside ds-managed
+  repos; v1 has it, v3 does not. Config belongs in a committed `devspace.toml`.
+- `devspace.toml` (committed, public): setup hooks (`pnpm install` on add) and
+  context config. Ruling: three config lifecycles stay separate — committed
+  `devspace.toml` for public repo conventions, `.dsprivate` for
+  devspace-shared/Git-hidden content, machine store for user-local state.
+  Auto-executing hooks from repo content is the agent-plants-a-hook threat;
+  execution needs confirmation or server-side arming, design open.
 - `ds skill` surface (v1 parity): agent-facing usage docs incl. the private-file
   model, once docs stabilise. Needed before T3 dogfooding.
