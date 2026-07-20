@@ -410,10 +410,14 @@ async fn prepare_updates(
                 }
 
                 let mut import_mappings = base_import.clone();
+                // Accepted journal mappings are durable receipts: they bound
+                // the import depth walk, keeping deep-history pushes
+                // incremental.
                 let imported = projection
-                    .import_reachable(
+                    .import_reachable_with_stops(
                         repository.repo().store(),
                         std::slice::from_ref(&git_head),
+                        &base_import,
                         &mut import_mappings,
                     )
                     .await

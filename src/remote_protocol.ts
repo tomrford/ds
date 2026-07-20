@@ -21,16 +21,31 @@ export class RemoteProtocolError extends Error {
 }
 
 export function decodeRemoteName(value: unknown): string {
+  // Remote names appear as single Git ref components in the machine's
+  // observation refs, so registration enforces git-check-ref-format's
+  // single-component rules; the fetch transport shares this contract.
   if (
     typeof value !== "string" ||
     value.length === 0 ||
+    value.startsWith("-") ||
+    value.startsWith(".") ||
+    value.endsWith(".") ||
+    value.endsWith(".lock") ||
+    value.includes("..") ||
+    value.includes("@{") ||
+    value === "@" ||
     [...value].some((character) => {
       const code = character.codePointAt(0) ?? 0;
-      return code < 0x20 || code === 0x7f || (code >= 0xd800 && code <= 0xdfff);
+      return (
+        code <= 0x20 ||
+        code === 0x7f ||
+        (code >= 0xd800 && code <= 0xdfff) ||
+        "~^:?*[\\/".includes(character)
+      );
     })
   ) {
     throw new RemoteProtocolError(
-      "remote name must be a non-empty string without control characters",
+      "remote name must be a valid single-component Git ref name",
       "invalid-remote-name",
     );
   }

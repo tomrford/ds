@@ -1926,6 +1926,13 @@ describe("remote registry", () => {
       expect((await putRemote(repository, incarnation, `ok-${url.length}`, url)).status).toBe(200);
     }
 
+    for (const name of ["has space", "-leading-dash", "a..b", "slash/ed", "end.lock", "@", "col:on"]) {
+      expect(await putRemote(repository, incarnation, name, "/tmp/refname.git")).toMatchObject({
+        status: 400,
+        body: { code: "invalid-remote-name" },
+      });
+    }
+
     const maxName = "n".repeat(MAX_PROJECTION_NAME_BYTES);
     expect((await putRemote(repository, incarnation, maxName, "/tmp/name.git")).status).toBe(200);
     expect(await putRemote(repository, incarnation, `${maxName}n`, "/tmp/name.git")).toMatchObject({

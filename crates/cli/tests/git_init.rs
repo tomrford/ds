@@ -183,6 +183,10 @@ fn init_surfaces_the_typed_import_depth_limit_and_todo() {
     let source = fixture.root.join("deep-source");
     run_git(["init", "-b", "main", path(&source)]);
     configure_git_identity(&source);
+    // Auto-maintenance can detach mid-loop across a thousand commits and race
+    // reference reads; the fixture disables it for determinism.
+    git_worktree(&source, &["config", "gc.auto", "0"]);
+    git_worktree(&source, &["config", "maintenance.auto", "false"]);
     for index in 0..=MAX_IMPORT_COMMIT_DEPTH {
         git_worktree(
             &source,

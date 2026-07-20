@@ -14,10 +14,11 @@
 - `ds git push` reports "up to date" from the journal cursor without observing
   the remote, so an externally moved ref goes unnoticed until a real push or
   fetch. Revisit when fetch lands.
-- Remote repoint racing an in-flight push: the journal is cleared but the
-  in-flight machine is not fenced; it can push the old URL or lose its batch
-  mid-flight. Failure is loud and the new registration stays consistent, but
-  proper remote-generation fencing belongs in production hardening.
+- Remote repoint racing an in-flight push OR fetch: the journal is cleared but
+  the in-flight machine is not fenced; a push can hit the old URL or lose its
+  batch, and a fetch begun against the old URL can be recorded as history from
+  the new registration (cursor-less refs especially). Remote-generation
+  binding validated transactionally fixes both; production hardening.
 - `ds context` (grepo parity): external-context management inside ds-managed
   repos; v1 has it, v3 does not. Keeps grepo's existing committed `.repos` /
   `.lock` files and syntax; not folded into any devspace config file.

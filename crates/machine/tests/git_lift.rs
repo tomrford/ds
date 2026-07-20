@@ -587,6 +587,22 @@ async fn seed_selection_rejects_ambiguity_and_rewritten_refs_and_allows_scratch(
         Err(GitLiftError::RefRewritten { .. })
     ));
 
+    // A receipt recorded through ANOTHER remote is not lineage for this one:
+    // it must not enter the stop set, or lifting would strand at a commit
+    // with no private parent mapping. Import proceeds from scratch instead.
+    let mut foreign_state = state_mapping("main", &ancestor, &public, &private_a, 1);
+    foreign_state.remote = "upstream".to_owned();
+    let foreign = select_seeds(
+        &projection,
+        &fetched,
+        &snapshot(vec![foreign_state], Vec::new()),
+        &receipts,
+    )
+    .await
+    .unwrap();
+    assert_eq!(foreign.seeds().count(), 0);
+    assert_eq!(foreign.stop_set().rows().count(), 0);
+
     let scratch = select_seeds(
         &projection,
         &fetched,

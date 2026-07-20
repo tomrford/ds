@@ -210,9 +210,21 @@ pub async fn select_seeds(
         }
     }
 
+    // Stops must correspond to SELECTED lineage: a repository-wide receipt
+    // recorded through another remote has no private parent mapping here, so
+    // stopping at it would strand lifting; unseeded ancestry imports from
+    // scratch instead (re-importing reproduces the identical public shadow,
+    // so receipt immutability holds).
+    let stops = seeds
+        .iter()
+        .map(|(git_id, seed)| CommitMapping {
+            git_id: git_id.clone(),
+            canonical_id: seed.public_commit_id.clone(),
+        })
+        .collect::<Vec<_>>();
     Ok(SeedSelection {
         seeds,
-        stop_set: ImportMappings::from_rows(receipts.rows())?,
+        stop_set: ImportMappings::from_rows(stops)?,
         ancestry_by_ref,
     })
 }
