@@ -3,8 +3,8 @@
 mod fetch;
 
 pub use fetch::{
-    FetchDiagnostic, FetchError, FetchErrorKind, FetchReport, RemoteHeadsError, fetch,
-    ls_remote_heads,
+    FetchDiagnostic, FetchError, FetchErrorKind, FetchReport, RemoteHead, RemoteHeadsError, fetch,
+    ls_remote_head, ls_remote_heads,
 };
 
 use std::collections::BTreeMap;

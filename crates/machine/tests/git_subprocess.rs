@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 
 use devspace_machine::{
     GitOid, GitProcessEnvironment, GitProcessMode, LeaseUpdate, PushErrorKind, PushRefStatus,
-    QualifiedRef, RemoteUrl, push,
+    QualifiedRef, RemoteUrl, ls_remote_head, push,
 };
 use tempfile::TempDir;
 
@@ -165,6 +165,34 @@ fn transport_failure_is_typed_complete_and_structurally_redacted() {
         "{rendered}"
     );
     assert!(rendered.contains("<remote>"), "{rendered}");
+}
+
+#[test]
+fn remote_head_observation_reports_the_symbolic_branch_and_empty_remote() {
+    let fixture = Fixture::new();
+    let remote_url = RemoteUrl::new(fixture.remote.to_string_lossy());
+    assert_eq!(
+        ls_remote_head(&remote_url, &fixture.environment).unwrap(),
+        None
+    );
+
+    let main = qualified("main");
+    fixture.seed(&[(&main, fixture.commits[0])]);
+    run_git(
+        &fixture.environment,
+        [
+            "--git-dir",
+            path(&fixture.remote),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+    );
+    let head = ls_remote_head(&remote_url, &fixture.environment)
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.branch, "main");
+    assert_eq!(head.oid, fixture.commits[0]);
 }
 
 struct Fixture {

@@ -57,6 +57,12 @@ pub struct RemoteHeadsError {
     pub stderr_excerpt: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteHead {
+    pub branch: String,
+    pub oid: GitOid,
+}
+
 impl fmt::Display for RemoteHeadsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -194,6 +200,39 @@ pub fn ls_remote_heads(
     })
 }
 
+pub fn ls_remote_head(
+    remote_url: &RemoteUrl,
+    environment: &GitProcessEnvironment,
+) -> Result<Option<RemoteHead>, RemoteHeadsError> {
+    let spec = ls_remote_head_command(remote_url, environment);
+    let result = run(&spec);
+    let (head, parse_error) = match result.as_ref() {
+        Ok(output) if output.status.success() => match parse_remote_head(&output.stdout) {
+            Ok(head) => (head, None),
+            Err(error) => (None, Some(error)),
+        },
+        _ => (None, None),
+    };
+    if result.as_ref().is_ok_and(|output| output.status.success()) && parse_error.is_none() {
+        return Ok(head);
+    }
+    let mut stderr = Vec::new();
+    if let Ok(output) = &result {
+        stderr.extend_from_slice(&output.stderr);
+    }
+    if let Err(error) = &result {
+        stderr.extend_from_slice(error.as_bytes());
+    }
+    if let Some(error) = parse_error {
+        stderr.extend_from_slice(error.as_bytes());
+    }
+    Err(RemoteHeadsError {
+        command: spec.safe_shape,
+        exit_code: result.as_ref().ok().and_then(|output| output.status.code()),
+        stderr_excerpt: redact_stderr(&stderr, remote_url, environment),
+    })
+}
+
 fn empty_fetch_error(
     sidecar_git_dir: &Path,
     remote_name: &str,
@@ -311,6 +350,32 @@ fn ls_remote_heads_command(
     }
 }
 
+fn ls_remote_head_command(
+    remote_url: &RemoteUrl,
+    environment: &GitProcessEnvironment,
+) -> CommandSpec {
+    let args = vec![
+        OsString::from("ls-remote"),
+        OsString::from("--symref"),
+        OsString::from("--"),
+        OsString::from(remote_url.expose()),
+        OsString::from("HEAD"),
+    ];
+    let safe_args = vec![
+        "ls-remote".to_owned(),
+        "--symref".to_owned(),
+        "--".to_owned(),
+        "<remote>".to_owned(),
+        "HEAD".to_owned(),
+    ];
+    CommandSpec {
+        program: environment.git_executable.clone(),
+        args,
+        environment: command_environment(environment),
+        safe_shape: safe_command_shape(&environment.git_executable, &safe_args),
+    }
+}
+
 fn observation_refs(
     remote_name: &str,
     bookmarks: &[String],
@@ -376,6 +441,60 @@ fn parse_remote_heads(bytes: &[u8]) -> Result<BTreeMap<String, GitOid>, String> 
             Ok((bookmark.to_owned(), oid))
         })
         .collect()
+}
+
+fn parse_remote_head(bytes: &[u8]) -> Result<Option<RemoteHead>, String> {
+    if bytes.len() > MAX_OBSERVATION_BYTES {
+        return Err(format!(
+            "Git observation exceeded the {MAX_OBSERVATION_BYTES}-byte limit"
+        ));
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let mut branch = None;
+    let mut oid = None;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let line = std::str::from_utf8(line)
+            .map_err(|_| "Git returned a non-UTF-8 HEAD observation".to_owned())?;
+        if let Some(value) = line.strip_prefix("ref: ") {
+            let (reference, name) = value
+                .split_once(char::is_whitespace)
+                .ok_or_else(|| "Git returned a malformed HEAD symref".to_owned())?;
+            if name.trim() != "HEAD" {
+                return Err("Git returned a malformed HEAD symref".to_owned());
+            }
+            let name = reference
+                .strip_prefix("refs/heads/")
+                .ok_or_else(|| "Git remote HEAD does not point to a branch".to_owned())?;
+            QualifiedRef::from_bookmark(name).map_err(|error| error.to_string())?;
+            branch = Some(name.to_owned());
+            continue;
+        }
+        let (value, name) = line
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| "Git returned a malformed HEAD observation".to_owned())?;
+        if name.trim() != "HEAD" {
+            return Err("Git returned a malformed HEAD observation".to_owned());
+        }
+        if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("SHA-256 Git remotes are not supported".to_owned());
+        }
+        oid = Some(
+            GitOid::from_hex(value)
+                .map_err(|_| "Git returned an invalid HEAD object ID".to_owned())?,
+        );
+    }
+    match (branch, oid) {
+        (Some(branch), Some(oid)) => Ok(Some(RemoteHead { branch, oid })),
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err("Git remote HEAD is detached; it must point to a branch".to_owned()),
+        (Some(_), None) => Err("Git remote HEAD did not advertise an object ID".to_owned()),
+    }
 }
 
 fn parse_oid_refs(bytes: &[u8]) -> Result<BTreeMap<String, GitOid>, String> {
@@ -502,5 +621,23 @@ mod tests {
         assert_eq!(heads["main"], GitOid([0x11; 20]));
         assert_eq!(heads["topic/nested"], GitOid([0x22; 20]));
         assert!(parse_remote_heads(&vec![b'x'; MAX_OBSERVATION_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn parses_symbolic_remote_head_and_rejects_sha256() {
+        let bytes = format!("ref: refs/heads/main\tHEAD\n{}\tHEAD\n", "11".repeat(20));
+        assert_eq!(
+            parse_remote_head(bytes.as_bytes()).unwrap(),
+            Some(RemoteHead {
+                branch: "main".to_owned(),
+                oid: GitOid([0x11; 20]),
+            })
+        );
+        let sha256 = format!("ref: refs/heads/main\tHEAD\n{}\tHEAD\n", "11".repeat(32));
+        assert_eq!(
+            parse_remote_head(sha256.as_bytes()).unwrap_err(),
+            "SHA-256 Git remotes are not supported"
+        );
+        assert_eq!(parse_remote_head(b"").unwrap(), None);
     }
 }

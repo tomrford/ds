@@ -4,6 +4,7 @@ mod boundary_sync;
 mod checkout;
 mod daemon;
 mod git;
+mod init;
 mod remove;
 mod repo;
 mod sync;

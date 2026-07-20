@@ -1,4 +1,4 @@
-mod fetch;
+pub(crate) mod fetch;
 mod projection_sidecar;
 mod push;
 
@@ -130,8 +130,19 @@ async fn remote_add(
     let entry = checkout_entry(ui, command).await?;
     let store = MachineStore::platform_default().map_err(display_error)?;
     let config = store.load_config().map_err(display_error)?;
+    register_remote(&config, &entry, name, url)?;
+    writeln!(ui.status(), "Added Git remote `{name}`.")?;
+    Ok(())
+}
+
+pub(crate) fn register_remote(
+    config: &devspace_machine::MachineConfig,
+    entry: &CatalogEntry,
+    name: &str,
+    url: &str,
+) -> Result<(), CommandError> {
     let transport = ProjectionTransport::new(
-        &config,
+        config,
         entry.identity.repository_id.as_str(),
         parse_hex(
             entry.identity.incarnation.as_str(),
@@ -142,7 +153,6 @@ async fn remote_add(
     cloud_runtime()?
         .block_on(transport.set_remote(name, url))
         .map_err(display_error)?;
-    writeln!(ui.status(), "Added Git remote `{name}`.")?;
     Ok(())
 }
 

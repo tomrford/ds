@@ -18,6 +18,31 @@ names. With no bookmark arguments, fetch imports every advertised remote head.
 The command runs ordinary repository sync first and holds the repository sync
 lock through transport, journal mutation and native view update.
 
+## Initialize from a remote
+
+`ds init` creates a cloud repository and checkout from an existing Git remote:
+
+```text
+ds init <git-url> [<directory>] [--name <name>]
+```
+
+The command is remote-only and online-only. It does not convert an existing
+local Git repository in place. The repository name defaults to the remote URL
+basename without a trailing `.git`, and the checkout directory defaults to
+`./<name>`.
+
+Initialization composes the repository creation, remote registry, empty native
+materialization, checkout creation and fetch paths. It discovers the symbolic
+remote HEAD with `git ls-remote --symref`, imports every advertised head, tracks
+the HEAD bookmark at `origin`, and leaves a new empty working-copy change on
+top. Empty remotes use `ds repo new` instead. SHA-256 Git remotes are not
+supported.
+
+Repository creation uses the same durable idempotency intent as `ds repo new`.
+A retry after a lost cloud response resumes that intent. A later failure keeps
+the created cloud repository visible in the error; clean it up with `ds repo`
+before rerunning `ds init`.
+
 ## Seed selection
 
 For each fetched ref, the machine walks backwards from the exact fetched Git

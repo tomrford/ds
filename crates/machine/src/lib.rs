@@ -55,8 +55,8 @@ pub use git_projection::{
 pub use git_subprocess::{
     CommandDiagnostic, FetchDiagnostic, FetchError, FetchErrorKind, FetchReport, GitOid,
     GitOidParseError, GitProcessEnvironment, GitProcessMode, LeaseUpdate, PushError, PushErrorKind,
-    PushRefReport, PushRefStatus, PushReport, QualifiedRef, QualifiedRefError, RemoteHeadsError,
-    RemoteUrl, fetch, ls_remote_heads, push,
+    PushRefReport, PushRefStatus, PushReport, QualifiedRef, QualifiedRefError, RemoteHead,
+    RemoteHeadsError, RemoteUrl, fetch, ls_remote_head, ls_remote_heads, push,
 };
 pub use http_transport::HttpTransport;
 pub use install::{InstalledPack, PackInstallError};

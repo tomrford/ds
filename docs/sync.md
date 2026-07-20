@@ -4,6 +4,19 @@ Stock jj repositories on 2 machines can diverge offline and converge through
 the Cloudflare authority without losing acknowledged state. Git projection is
 a separate subsystem described in [`git-projection.md`](git-projection.md).
 
+## Commands and connectivity
+
+Repository work is offline-first: ordinary jj-compatible commands operate on
+the local checkout, while `ds sync`, the daemon and command-boundary sync move
+native state to and from the cloud. `ds add` creates another checkout from a
+local machine repository or resolves and clones it on first use. `ds remove`
+discards a checkout while retaining its machine repository. `ds git fetch` and
+`ds git push` own the explicit public Git boundary.
+
+Two creation commands are online-only: `ds repo new <name>` creates an empty
+cloud repository, and `ds init <git-url> [<directory>]` creates one by importing
+an existing Git remote. `ds init` does not convert a local Git working copy.
+
 ## Native repository boundary
 
 `devspace-machine` initializes and reloads a repository through jj-lib 0.42.0.

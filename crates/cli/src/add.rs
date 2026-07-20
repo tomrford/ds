@@ -44,6 +44,17 @@ pub(crate) struct AddArgs {
     json: bool,
 }
 
+impl AddArgs {
+    pub(crate) fn for_init(repo: &RepositoryName, path: PathBuf) -> Self {
+        Self {
+            repo: repo.as_str().to_owned(),
+            path,
+            revision: RevisionArg::from("root()".to_owned()),
+            json: false,
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct AddedCheckout<'a> {
     root: &'a Path,

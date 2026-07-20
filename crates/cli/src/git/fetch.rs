@@ -15,6 +15,7 @@ use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 use jj_lib::repo::Repo as _;
+use jj_lib::settings::UserSettings;
 
 use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
 use crate::sync::{LockedSyncRun, run_sync_entry_locked};
@@ -67,7 +68,28 @@ pub(super) async fn fetch_bookmarks(
         Err(error) => return Err(user_error(error)),
     };
 
-    let repository = MachineRepository::open(&entry.native_repository_path, command.settings())
+    fetch_entry(
+        ui,
+        command.settings(),
+        &store,
+        &entry,
+        bookmark_names,
+        remote_name,
+    )
+    .await?;
+    drop(sync_guard);
+    Ok(())
+}
+
+pub(crate) async fn fetch_entry(
+    ui: &mut Ui,
+    settings: &UserSettings,
+    store: &MachineStore,
+    entry: &CatalogEntry,
+    bookmark_names: Vec<String>,
+    remote_name: String,
+) -> Result<Vec<String>, CommandError> {
+    let repository = MachineRepository::open(&entry.native_repository_path, settings)
         .await
         .map_err(display_error)?;
     let config = store.load_config().map_err(display_error)?;
@@ -81,11 +103,9 @@ pub(super) async fn fetch_bookmarks(
             .map_err(display_error)?;
     let cloud = HttpTransport::new(&config, entry.identity.repository_id.as_str(), incarnation)
         .map_err(display_error)?;
-    let (projection, rebuilt_projection) = open_or_create_projection(
-        &store.repository_projection_path(&entry.identity),
-        command.settings(),
-    )
-    .map_err(user_error)?;
+    let (projection, rebuilt_projection) =
+        open_or_create_projection(&store.repository_projection_path(&entry.identity), settings)
+            .map_err(user_error)?;
     if rebuilt_projection {
         writeln!(
             ui.warning_default(),
@@ -96,8 +116,8 @@ pub(super) async fn fetch_bookmarks(
     let runtime = cloud_runtime()?;
     let outcome = runtime
         .block_on(fetch_with_cloud(
-            &store,
-            &entry,
+            store,
+            entry,
             &repository,
             &projection,
             journal,
@@ -114,11 +134,11 @@ pub(super) async fn fetch_bookmarks(
             outcome.polluted_paths.join(", ")
         )?;
     }
-    for line in outcome.lines {
+    let lines = outcome.lines;
+    for line in &lines {
         writeln!(ui.status(), "{line}")?;
     }
-    drop(sync_guard);
-    Ok(())
+    Ok(lines)
 }
 
 struct FetchOutcome {
@@ -551,6 +571,13 @@ fn lift_error(error: GitLiftError) -> String {
         GitLiftError::AmbiguousSeed { git_oid } => format!(
             "Git object {} has ambiguous private seed lineage",
             GitOid(git_oid)
+        ),
+        GitLiftError::Projection(devspace_machine::ProjectionError::ImportCommitDepthLimit {
+            depth,
+            limit,
+            commit_id,
+        }) => format!(
+            "Git import commit depth {depth} at {commit_id} exceeds the safety limit of {limit}; see the import depth limit item in todo.md"
         ),
         other => other.to_string(),
     }
