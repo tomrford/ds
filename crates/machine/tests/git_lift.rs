@@ -276,6 +276,14 @@ async fn pollution_uses_tombstones_natural_conflicts_and_deletion_cleanup() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        result
+            .polluted_paths
+            .iter()
+            .map(|path| path.as_internal_file_string())
+            .collect::<Vec<_>>(),
+        ["hidden", "secret"]
+    );
     let added_lift = &result.states[0].canonical_commit_id;
     let hidden = value(store, added_lift, "hidden").await;
     assert!(!hidden.is_resolved());

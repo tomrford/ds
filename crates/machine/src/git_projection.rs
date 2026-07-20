@@ -529,30 +529,14 @@ async fn translate_reachable(
                     }
                     if let Some(target_id) = source_to_target.get(&source_id) {
                         match target.backend().read_commit(target_id).await {
+                            // An accepted mapping stops the walk unconditionally.
+                            // Fetch-recorded mappings legitimately bind conflicted
+                            // lifted commits to public history that already carries
+                            // bytes at hidden paths; the no-new-hidden-bytes
+                            // guarantee is enforced where Git objects are CREATED
+                            // (filter-before-read) and on the head scan before
+                            // push, never on reuse.
                             Ok(_) => {
-                                if matches!(direction, TranslationDirection::Export) {
-                                    let source_commit =
-                                        source.backend().read_commit(&source_id).await?;
-                                    let hidden_set = resolve_hidden_set(
-                                        source,
-                                        &source_id,
-                                        &source_commit,
-                                        &mut cache.hidden_sets,
-                                    )
-                                    .await?;
-                                    if source_commit.root_tree.as_resolved().is_none() {
-                                        return Err(ProjectionError::ConflictedCommit(source_id));
-                                    }
-                                    let leaked =
-                                        scan_hidden_paths(target, target_id, &hidden_set).await?;
-                                    if !leaked.is_empty() {
-                                        return Err(ProjectionError::StaleMapping {
-                                            canonical_id: source_id,
-                                            git_id: target_id.clone(),
-                                            leaked,
-                                        });
-                                    }
-                                }
                                 reached_pairs.insert(source_id.clone(), target_id.clone());
                                 states.insert(source_id, true);
                                 continue;

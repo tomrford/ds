@@ -3,9 +3,20 @@
 Fetch moves public Git history into canonical native history: it imports new
 remote commits as raw public shadows, then lifts them onto private lineage so
 hidden content and private ancestry are preserved. The semantics follow
-`hidden.md`; the lifting algorithm and conflict behavior are proven by the
-fetch probe against a real remote. This document specifies the product
-implementation.
+`hidden.md`.
+
+## Command
+
+The command is available only in a Devspace checkout:
+
+```text
+ds git fetch [--remote <name>] [-b <bookmark> ...]
+```
+
+The default remote is `origin`. Bookmark arguments are literal Git branch
+names. With no bookmark arguments, fetch imports every advertised remote head.
+The command runs ordinary repository sync first and holds the repository sync
+lock through transport, journal mutation and native view update.
 
 ## Seed selection
 
@@ -115,14 +126,36 @@ returns that recorded response without inserting states again. No separate
 fetch cursor exists: the projection activation cursor pages journal changes
 and the per-ref cursor identifies the last accepted state.
 
-The machine uploads and confirms both the raw public and lifted private
-object closures through ordinary sync before calling the mutation, so the
-durability gate holds. A lost response is replayed safely under the same
-fetch ID.
+The machine uploads and confirms both the raw public and lifted private object
+closures before calling the mutation, so the durability gate holds. A lost
+response is replayed safely under the same fetch ID.
 
 The first version reads seed state from the existing paged projection
 snapshot; a bounded exact-lookup read (by Git ID list) is a later
 optimization, not a correctness surface.
+
+## Native view update and recovery
+
+After the journal accepts a fetch, one jj transaction described
+`fetch from <remote>` updates each `<bookmark>@<remote>` target from the
+journal cursor. Existing tracked remote bookmarks propagate into their local
+bookmarks through jj-lib's ref-target merge: an unchanged local bookmark
+fast-forwards, concurrent local and remote movement produces a conflicted
+bookmark, and no commit is discarded. Newly observed remote bookmarks remain
+untracked and do not create or move a local bookmark.
+
+The journal cursor is the source of truth for this update. An up-to-date Git
+observation still repairs a missing or stale native remote bookmark. If the
+process stops after `record_fetch` but before committing the view transaction,
+the next fetch performs that repair without another journal mutation.
+
+## Pollution warning
+
+Lifting reports every conflict at a path hidden by the applicable hidden set,
+including both inserted tombstones and natural merge conflicts. Fetch prints
+one prominent warning listing those paths. The warning states that public
+bytes remain on the Git remote until its history is rewritten externally;
+resolving the native conflict does not erase already-published Git objects.
 
 ## Exporter interaction
 

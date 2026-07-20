@@ -21,7 +21,7 @@ const DEVELOPMENT_SECRET: &str = "git-push-development-secret";
 const PRIVATE_SENTINEL: &[u8] = b"DEVSPACE_PRIVATE_SENTINEL\0\xff";
 
 #[tokio::test]
-async fn devspace_checkout_fences_unowned_git_commands_before_contacting_git() {
+async fn devspace_checkout_owns_fetch_and_fences_unowned_git_commands() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("machine");
     fs::create_dir_all(&home).unwrap();
@@ -37,9 +37,17 @@ async fn devspace_checkout_fences_unowned_git_commands_before_contacting_git() {
     let fetch = ds(&checkout, &home, &config, &["git", "fetch"]);
     assert_eq!(fetch.status.code(), Some(1));
     assert!(
-        stderr(&fetch).contains("fetch` is not yet implemented"),
+        !stderr(&fetch).contains("not yet implemented"),
         "{}",
         stderr(&fetch)
+    );
+
+    let literal_fetch = ds(&checkout, &home, &config, &["git", "fetch", "-b", "a..b"]);
+    assert_eq!(literal_fetch.status.code(), Some(1));
+    assert!(
+        stderr(&literal_fetch).contains("bookmark is not a valid Git branch name"),
+        "{}",
+        stderr(&literal_fetch)
     );
 
     let export = ds(&checkout, &home, &config, &["git", "export"]);
@@ -56,6 +64,25 @@ async fn devspace_checkout_fences_unowned_git_commands_before_contacting_git() {
         stderr(&broad_push).contains("does not support `all`"),
         "{}",
         stderr(&broad_push)
+    );
+
+    let store = machine_store(&home);
+    let entry = store
+        .resolve(&RepositoryName::parse("git-fence").unwrap())
+        .unwrap()
+        .unwrap();
+    store
+        .unregister_repository(
+            &RepositoryName::parse("git-fence").unwrap(),
+            &entry.identity,
+        )
+        .unwrap();
+    let unregistered = ds(&checkout, &home, &config, &["git", "fetch", "-b", "main"]);
+    assert_eq!(unregistered.status.code(), Some(1));
+    assert!(
+        stderr(&unregistered).contains("repository-not-registered"),
+        "{}",
+        stderr(&unregistered)
     );
 }
 
@@ -131,6 +158,7 @@ async fn git_push_holds_the_repository_sync_lock_after_sync_completes() {
     server.join().unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("no such Git remote `origin`"));
+    assert!(stderr(&output).contains("remote-not-found"));
     assert!(stderr(&output).contains("Rebuilt the local Git projection sidecar"));
     GitProjection::open(&projection_path, &settings()).unwrap();
     drop(store.try_lock_repository_sync(&entry.identity).unwrap());

@@ -1,3 +1,4 @@
+mod fetch;
 mod projection_sidecar;
 mod push;
 
@@ -46,9 +47,22 @@ pub(crate) async fn run_git(ui: &mut Ui, command: &CommandHelper) -> Result<(), 
             crate::boundary_sync::suppress();
             push::push_bookmarks(ui, command, bookmarks, remote).await
         }
-        Some(("fetch", _)) => Err(user_error(
-            "`ds git fetch` is not yet implemented; Devspace owns the Git boundary in native checkouts.",
-        )),
+        Some(("fetch", fetch_matches)) => {
+            reject_command_line_values(fetch_matches, &["branches", "remotes"], "git fetch")?;
+            let bookmarks = raw_values(fetch_matches, "branches");
+            let remotes = raw_values(fetch_matches, "remotes");
+            if remotes.len() > 1 {
+                return Err(user_error(
+                    "`ds git fetch` accepts exactly one `--remote <name>` value.",
+                ));
+            }
+            let remote = remotes
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| DEFAULT_REMOTE.to_owned());
+            crate::boundary_sync::suppress();
+            fetch::fetch_bookmarks(ui, command, bookmarks, remote).await
+        }
         Some((name, _)) => Err(owned_boundary_error(name)),
         None => Err(owned_boundary_error("")),
     }
@@ -61,7 +75,7 @@ fn owned_boundary_error(subcommand: &str) -> CommandError {
         format!("`ds git {subcommand}`")
     };
     user_error(format!(
-        "{command} is unavailable in a Devspace checkout; Devspace owns the Git boundary. Use `ds git remote add`, `ds git remote list`, or `ds git push -b <bookmark>`."
+        "{command} is unavailable in a Devspace checkout; Devspace owns the Git boundary. Use `ds git remote add`, `ds git remote list`, `ds git fetch`, or `ds git push -b <bookmark>`."
     ))
 }
 

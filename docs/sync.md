@@ -435,8 +435,8 @@ sync` do not create another boundary.
 
 `ds git` owns the Git boundary in Devspace checkouts. Its remote registry and
 bookmark push commands replace stock jj Git behavior; all other Git subcommands
-are fenced, with fetch identified as not implemented. `ds git push` suppresses
-the detached command-boundary notification because it runs the same in-process
+are fenced. `ds git fetch` and `ds git push` suppress the detached
+command-boundary notification because they run the same in-process
 sync work unit under the repository sync lock before projection or Git contact.
 
 The daemon holds one machine-local singleton lock. It removes a stale socket,

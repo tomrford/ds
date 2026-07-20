@@ -241,7 +241,7 @@ async fn push_with_cloud(
                     Ok(_) => return Err("projection journal left the push pending".to_owned()),
                     Err(_error) if remote_moved(&prepared.leases, &report) => {
                         return Err(
-                            "remote ref moved outside devspace; fetch is not yet implemented"
+                            "remote ref moved outside devspace; fetch it before retrying the push"
                                 .to_owned(),
                         );
                     }
@@ -537,7 +537,7 @@ fn export_mapping(mapping: &ProjectionMapping) -> CommitMapping {
     }
 }
 
-async fn load_projection_snapshot(
+pub(super) async fn load_projection_snapshot(
     journal: &ProjectionTransport,
 ) -> Result<ProjectionSnapshot, String> {
     let mut snapshot = journal
@@ -560,7 +560,7 @@ async fn load_projection_snapshot(
     Ok(snapshot)
 }
 
-fn overlapping_pending(
+pub(super) fn overlapping_pending(
     snapshot: &ProjectionSnapshot,
     remote: &str,
     bookmarks: &BTreeSet<&str>,
@@ -579,7 +579,7 @@ fn overlapping_pending(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn recover_pending_batch(
+pub(super) async fn recover_pending_batch(
     repository: &MachineRepository,
     projection: &GitProjection,
     journal: &ProjectionTransport,
@@ -624,7 +624,7 @@ async fn recover_pending_batch(
         Ok(result) if result.outcome.as_deref() == Some("accepted") => Ok(()),
         Ok(_) => Err("projection recovery did not accept the replayed batch".to_owned()),
         Err(_) if remote_moved(&leases, &report) => {
-            Err("remote ref moved outside devspace; fetch is not yet implemented".to_owned())
+            Err("remote ref moved outside devspace; fetch it before retrying the push".to_owned())
         }
         Err(error) => Err(error.to_string()),
     }
@@ -843,14 +843,14 @@ fn remote_moved(
     })
 }
 
-fn find_remote<'a>(
+pub(super) fn find_remote<'a>(
     remotes: &'a [RegisteredRemote],
     name: &str,
 ) -> Result<&'a RegisteredRemote, String> {
     remotes
         .iter()
         .find(|remote| remote.name == name)
-        .ok_or_else(|| format!("no such Git remote `{name}`"))
+        .ok_or_else(|| format!("remote-not-found: no such Git remote `{name}`"))
 }
 
 fn failpoint_enabled(name: &str) -> bool {
@@ -949,5 +949,13 @@ mod tests {
         assert_eq!(mappings[0], parent);
         assert_eq!(mappings[1].canonical_id, canonical_head);
         assert_eq!(mappings[1].git_id, git_head);
+    }
+
+    #[test]
+    fn unknown_remote_uses_the_worker_error_code() {
+        assert_eq!(
+            find_remote(&[], "origin").unwrap_err(),
+            "remote-not-found: no such Git remote `origin`"
+        );
     }
 }

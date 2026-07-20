@@ -53,9 +53,10 @@ pub use git_projection::{
     MAX_IMPORT_TREE_ENTRIES, ProjectionError,
 };
 pub use git_subprocess::{
-    CommandDiagnostic, GitOid, GitOidParseError, GitProcessEnvironment, GitProcessMode,
-    LeaseUpdate, PushError, PushErrorKind, PushRefReport, PushRefStatus, PushReport, QualifiedRef,
-    QualifiedRefError, RemoteUrl, push,
+    CommandDiagnostic, FetchDiagnostic, FetchError, FetchErrorKind, FetchReport, GitOid,
+    GitOidParseError, GitProcessEnvironment, GitProcessMode, LeaseUpdate, PushError, PushErrorKind,
+    PushRefReport, PushRefStatus, PushReport, QualifiedRef, QualifiedRefError, RemoteHeadsError,
+    RemoteUrl, fetch, ls_remote_heads, push,
 };
 pub use http_transport::HttpTransport;
 pub use install::{InstalledPack, PackInstallError};

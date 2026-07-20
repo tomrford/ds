@@ -1,4 +1,11 @@
-//! Lease-protected atomic pushes through Git's credential and transport stack.
+//! Git fetch and lease-protected push through Git's credential and transport stack.
+
+mod fetch;
+
+pub use fetch::{
+    FetchDiagnostic, FetchError, FetchErrorKind, FetchReport, RemoteHeadsError, fetch,
+    ls_remote_heads,
+};
 
 use std::collections::BTreeMap;
 use std::env;

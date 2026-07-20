@@ -50,6 +50,7 @@ pub struct GitSeed {
 pub struct SeedSelection {
     seeds: BTreeMap<CommitId, GitSeed>,
     stop_set: ImportMappings,
+    ancestry_by_ref: BTreeMap<(String, String), BTreeSet<CommitId>>,
 }
 
 impl SeedSelection {
@@ -73,6 +74,7 @@ impl SeedSelection {
         Ok(Self {
             seeds: by_git,
             stop_set: ImportMappings::from_rows(stops)?,
+            ancestry_by_ref: BTreeMap::new(),
         })
     }
 
@@ -82,6 +84,16 @@ impl SeedSelection {
 
     pub fn stop_set(&self) -> &ImportMappings {
         &self.stop_set
+    }
+
+    pub fn reaches(&self, remote: &str, bookmark: &str, git_oid: &[u8; 20]) -> bool {
+        self.ancestry_by_ref
+            .get(&(remote.to_owned(), bookmark.to_owned()))
+            .is_some_and(|ancestry| ancestry.contains(&CommitId::new(git_oid.to_vec())))
+    }
+
+    pub fn seed_for(&self, git_oid: &[u8; 20]) -> Option<&GitSeed> {
+        self.seeds.get(&CommitId::new(git_oid.to_vec()))
     }
 }
 
@@ -96,6 +108,7 @@ pub struct LiftedCommitState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiftResult {
     pub states: Vec<LiftedCommitState>,
+    pub polluted_paths: BTreeSet<jj_lib::repo_path::RepoPathBuf>,
 }
 
 /// Select every receipt-backed seed reached from the fetched heads.
@@ -120,10 +133,15 @@ pub async fn select_seeds(
         .map(|row| (row.git_id, row.canonical_id))
         .collect::<BTreeMap<_, _>>();
     let mut seeds = BTreeMap::new();
+    let mut ancestry_by_ref = BTreeMap::new();
 
     for fetched_ref in fetched {
         let head_id = CommitId::new(fetched_ref.head.to_vec());
         let ancestry = git_ancestry(projection, &head_id).await?;
+        ancestry_by_ref.insert(
+            (fetched_ref.remote.clone(), fetched_ref.bookmark.clone()),
+            ancestry.clone(),
+        );
         if let Some(cursor) = snapshot.cursors.iter().find(|cursor| {
             cursor.remote == fetched_ref.remote && cursor.bookmark == fetched_ref.bookmark
         }) && !ancestry.contains(&CommitId::new(cursor.git_oid.to_vec()))
@@ -195,6 +213,7 @@ pub async fn select_seeds(
     Ok(SeedSelection {
         seeds,
         stop_set: ImportMappings::from_rows(receipts.rows())?,
+        ancestry_by_ref,
     })
 }
 
@@ -258,6 +277,7 @@ pub async fn lift_imported(
         .await?;
 
     let mut states = Vec::with_capacity(imported.len());
+    let mut polluted_paths = BTreeSet::new();
     let mut hidden_cache = HiddenSetCache::default();
     for mapping in imported {
         let public_id = &mapping.canonical_id;
@@ -298,6 +318,7 @@ pub async fn lift_imported(
         let polluted =
             apply_pollution_tombstones(store, rebased, &private_base, &public_tree, &hidden_set)
                 .await?;
+        polluted_paths.extend(hidden_conflict_paths(&polluted, &hidden_set).await?);
         let (root_tree, labels) = polluted.into_tree_ids_and_labels();
         let lifted = BackendCommit {
             parents: lifted_parents,
@@ -328,7 +349,24 @@ pub async fn lift_imported(
             hidden_set_id: hidden_set.identity().clone(),
         });
     }
-    Ok(LiftResult { states })
+    Ok(LiftResult {
+        states,
+        polluted_paths,
+    })
+}
+
+async fn hidden_conflict_paths(
+    tree: &MergedTree,
+    hidden_set: &crate::HiddenSet,
+) -> Result<BTreeSet<jj_lib::repo_path::RepoPathBuf>, GitLiftError> {
+    let mut paths = BTreeSet::new();
+    for (path, value) in tree.entries() {
+        let value = value?;
+        if hidden_set.hides_file(&path) && value.into_resolved().is_err() {
+            paths.insert(path);
+        }
+    }
+    Ok(paths)
 }
 
 async fn load_commits(

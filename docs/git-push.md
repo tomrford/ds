@@ -12,13 +12,13 @@ The Git boundary is available only in Devspace checkouts:
 ```text
 ds git remote add <name> <url>
 ds git remote list
+ds git fetch [--remote <name>] [-b <bookmark> ...]
 ds git push -b <bookmark> [-b <bookmark> ...] [--remote <name>]
 ```
 
 The default remote is `origin`. Bookmark arguments are literal Git branch names,
-not patterns. Fetch, tags, push options and the remaining stock jj Git commands
-are fenced because the native store is not Git-backed. `ds git fetch` reports
-that fetch is not implemented.
+not patterns. Tags, push options and the remaining stock jj Git commands are
+fenced because the native store is not Git-backed.
 
 The repository Durable Object owns the remote registry, so a fresh recovery
 machine resolves the same remote without inheriting another machine's Git
@@ -76,8 +76,8 @@ Every non-empty batch uses:
 
 After every attempt, successful or not, `git ls-remote --refs` observes all
 requested refs. An atomic-capability or remote-policy rejection fails the whole
-batch. A lease rejection reports `remote ref moved outside devspace; fetch is
-not yet implemented`.
+batch. A lease rejection tells the operator to fetch the remote move before
+retrying the push.
 
 The subprocess wrapper retains one structured report entry for every requested
 ref, including refs Git did not mention. If remote observation fails, the
