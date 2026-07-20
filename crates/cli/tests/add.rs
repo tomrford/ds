@@ -18,6 +18,8 @@ use jj_lib::settings::UserSettings;
 use jj_lib::workspace::{Workspace, WorkspaceLoadError, default_working_copy_factories};
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
+mod support_fs;
+
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
 const MACHINE_ID: &str = "12121212121212121212121212121212";
 
@@ -762,7 +764,7 @@ async fn add_rejects_registered_workspace_at_a_different_revision() {
     let new = ds(&destination, &config, &["new", "-m", "working copy"]);
     assert!(new.status.success(), "{}", stderr(&new));
     let matching_parent = commit_id(&destination, &config, "@-");
-    fs::remove_dir_all(&destination).unwrap();
+    support_fs::remove_dir_all(&destination);
 
     let mismatch = add(
         temp.path(),
@@ -802,7 +804,7 @@ async fn add_rebuilds_after_completed_checkout_is_removed() {
         &destination,
     );
     fs::write(destination.join("untracked"), "discarded").unwrap();
-    fs::remove_dir_all(&destination).unwrap();
+    support_fs::remove_dir_all(&destination);
 
     let second = add_json(
         temp.path(),

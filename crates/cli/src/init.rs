@@ -140,6 +140,7 @@ pub(crate) async fn init_repository(
         .await
         .map_err(|error| post_registration_error(user_error(error), &incomplete()))?;
     drop(sync_guard);
+    crate::git_shim::ensure(&checkout_path);
 
     writeln!(ui.status(), "Repository: {name}")?;
     writeln!(ui.status(), "Remote: {ORIGIN} -> {}", args.git_url)?;

@@ -111,6 +111,7 @@ pub(crate) async fn remove_checkout(
         if !owned_directory_matches(&path, &target.owner).map_err(|_| not_checkout(&path))? {
             return Err(not_checkout(&path));
         }
+        crate::git_shim::remove_guard(&path);
         fs::remove_dir_all(&path).map_err(|error| {
             user_error(format!(
                 "Failed to delete checkout directory {}: {error}",

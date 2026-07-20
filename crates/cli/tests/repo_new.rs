@@ -20,6 +20,8 @@ use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
 use jj_lib::simple_op_store::SimpleOpStore;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
+mod support_fs;
+
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
 
 fn settings() -> UserSettings {
@@ -527,7 +529,7 @@ async fn repo_new_attaches_two_independent_checkouts_to_one_machine_repository()
             .clone();
     assert_eq!(operation_after_collisions, operation_before_collisions);
 
-    fs::remove_dir_all(&first_path).unwrap();
+    support_fs::remove_dir_all(&first_path);
     assert!(entry.native_repository_path.exists());
     let surviving = ds(
         &second_path,

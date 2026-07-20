@@ -133,6 +133,7 @@ impl WorkspaceLoaderFactory for DevspaceWorkspaceLoaderFactory {
             let loader = DefaultWorkspaceLoaderFactory.create(workspace_root)?;
             crate::boundary_sync::record_repository_path(loader.repo_path());
             if crate::checkout::read_checkout_owner(workspace_root).is_ok() {
+                crate::boundary_sync::record_checkout(workspace_root);
                 Ok(crate::working_copy::wrap_workspace_loader(loader))
             } else {
                 Ok(loader)

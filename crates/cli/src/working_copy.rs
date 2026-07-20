@@ -225,7 +225,7 @@ impl LockedWorkingCopy for LockedDevspaceWorkingCopy {
 
 fn hidden_track_matcher(root: &Path) -> Result<Option<HiddenTrackMatcher>, SnapshotError> {
     let mut hidden = HiddenTrackMatcher::default();
-    discover_hidden_paths(
+    discover_hidden_paths_into(
         root,
         RepoPath::root(),
         &GitIgnoreFile::empty(),
@@ -237,6 +237,19 @@ fn hidden_track_matcher(root: &Path) -> Result<Option<HiddenTrackMatcher>, Snaps
     } else {
         Ok(Some(hidden))
     }
+}
+
+pub(crate) fn discover_hidden_paths(root: &Path) -> Result<BTreeSet<RepoPathBuf>, SnapshotError> {
+    let mut hidden = HiddenTrackMatcher::default();
+    discover_hidden_paths_into(
+        root,
+        RepoPath::root(),
+        &GitIgnoreFile::empty(),
+        &GitIgnoreFile::empty(),
+        &mut hidden,
+    )?;
+    hidden.files.extend(hidden.directories);
+    Ok(hidden.files)
 }
 
 #[derive(Debug, Default)]
@@ -271,7 +284,7 @@ impl Matcher for HiddenTrackMatcher {
     }
 }
 
-fn discover_hidden_paths(
+fn discover_hidden_paths_into(
     disk_dir: &Path,
     dir: &RepoPath,
     inherited_hidden: &Arc<GitIgnoreFile>,
@@ -336,7 +349,7 @@ fn discover_hidden_paths(
             if hidden.matches_dir(&path) {
                 result.directories.insert(path);
             } else if !gitignore.matches_dir(&path) {
-                discover_hidden_paths(&entry.path(), &path, &hidden, &gitignore, result)?;
+                discover_hidden_paths_into(&entry.path(), &path, &hidden, &gitignore, result)?;
             }
         } else if hidden.matches_file(&path) {
             result.files.insert(path);

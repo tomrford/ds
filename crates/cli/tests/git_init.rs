@@ -34,6 +34,11 @@ async fn init_materializes_history_tracks_head_round_trips_and_converges_a_secon
         b"feature\n"
     );
     assert!(!checkout.join("ignored.txt").exists());
+    assert!(checkout.join(".git").is_dir());
+    assert_eq!(
+        git_ls_files(&checkout),
+        [".gitignore", "feature.txt", "visible.txt"]
+    );
     let log = fixture.ds(
         &checkout,
         &["log", "-r", "main::", "-T", "description.first_line()"],
@@ -350,6 +355,20 @@ fn assert_history_count(fixture: &LiveFixture, checkout: &Path, expected: usize)
     );
     assert!(log.status.success(), "{}", stderr(&log));
     assert_eq!(stdout(&log).lines().count(), expected, "{}", stdout(&log));
+}
+
+fn git_ls_files(checkout: &Path) -> Vec<String> {
+    let output = Command::new("git")
+        .current_dir(checkout)
+        .args(["ls-files"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 fn configure_machine(root: &Path, machine_id: String) {

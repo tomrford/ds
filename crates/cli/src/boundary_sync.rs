@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -22,6 +22,15 @@ const DAEMON_RETRY_DELAYS: [Duration; 4] = [
 struct BoundarySyncState {
     suppressed: bool,
     repositories: BTreeMap<RepositoryName, PathBuf>,
+    checkouts: BTreeSet<PathBuf>,
+}
+
+pub(crate) fn record_checkout(path: &Path) {
+    state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .checkouts
+        .insert(path.to_owned());
 }
 
 fn state() -> &'static Mutex<BoundarySyncState> {
@@ -66,18 +75,22 @@ pub(crate) fn suppress() {
 }
 
 pub(crate) fn spawn_recorded() {
-    if std::env::var_os(BOUNDARY_SYNC_ENV).is_some_and(|value| value == "0") {
-        return;
-    }
-    let repositories = {
+    let (suppressed, repositories, checkouts) = {
         let mut state = state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.suppressed {
-            return;
-        }
-        std::mem::take(&mut state.repositories)
+        (
+            state.suppressed,
+            std::mem::take(&mut state.repositories),
+            std::mem::take(&mut state.checkouts),
+        )
     };
+    for checkout in checkouts {
+        crate::git_shim::ensure(&checkout);
+    }
+    if suppressed || std::env::var_os(BOUNDARY_SYNC_ENV).is_some_and(|value| value == "0") {
+        return;
+    }
     let Ok(executable) = std::env::current_exe() else {
         return;
     };

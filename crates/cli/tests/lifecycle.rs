@@ -15,6 +15,8 @@ use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::settings::UserSettings;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
+mod support_fs;
+
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
 const MACHINE_ID: &str = "12121212121212121212121212121212";
 
@@ -580,7 +582,7 @@ async fn remove_forgets_a_workspace_when_its_directory_was_already_gone() {
     let path = temp.path().join("checkout");
     let added = add_checkout(temp.path(), &config, "missing-directory", "root()", &path);
     let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
-    fs::remove_dir_all(&path).unwrap();
+    support_fs::remove_dir_all(&path);
 
     let output = remove_checkout(temp.path(), &config, &path);
     assert!(output.status.success(), "{}", stderr(&output));

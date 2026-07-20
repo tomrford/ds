@@ -1,14 +1,24 @@
 # Open items
 
-- Colliding-alias handling: a user jj alias named like a ds-added command
-  (e.g. `aliases.init`) is shadowed and makes every `ds` invocation print
-  jj-cli's "Cannot define an alias that overrides the built-in command"
-  warning. Config layering cannot delete keys and we will NOT carry a
-  jj-cli patch (V2 lesson). Two-part fix: (1) `ds doctor`-style overlap
-  detection with an actionable ds-branded message (works now); (2) silence
-  jj's own warning via an upstreamed resolved-config transform hook on
-  CliRunner, consumed at the next jj bump. Non-colliding user aliases
-  (`ds bump` etc.) already work through inherited jj config.
+- Colliding-alias handling: IMPLEMENTABLE NOW without forking. jj-cli's
+  warning (cli_util.rs:3857, resolve_aliases) keys off alias-NAME presence
+  in the merged config; values, --quiet, and layer shadowing are all dead
+  ends — but `CliRunner::add_extra_config_migration` with a
+  ConfigMigrationRule::custom runs BEFORE alias validation and can delete
+  ds-colliding `aliases.*` keys from every layer. Use the self-disarming
+  variant (only the last migrate pass prints descriptions) for full
+  silence, pin with a CLI test (colliding alias → clean stderr) so a jj
+  bump that shifts the sequence fails loudly. Pair with `ds doctor`
+  reporting shadowed aliases on demand. Also send the ~10-line upstream PR
+  (`suppress_alias_override_warning(names)`) to make it boring forever.
+- Machine enrolment endgame: devices become first-class server citizens —
+  gh-style device-flow handshake registers the CLI, server issues the
+  machine identity (replacing client-generated machine_id) and holds the
+  display name. Current design threads a principal type end-to-end so this
+  is a swap, not a rework. Pairs with retiring the shared secret.
+- CLI verb taxonomy under review: inventory + rename options in
+  ~/code/devspace-command-inventory.md (outside checkout, Tom editing).
+  `ds repo list` implementation HELD until verbs are decided.
 - `ds init` overload: bare `ds init` in a directory should create a blank
   cloud repo named after it plus the first checkout in place (repo new +
   add composed) — the "start working here" verb. `ds init <git-url>` keeps

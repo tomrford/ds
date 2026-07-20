@@ -225,6 +225,8 @@ pub(crate) async fn add_checkout(
             })?;
     }
 
+    crate::git_shim::ensure(&requested_path);
+
     let checkout = AddedCheckout {
         root: &requested_path,
         repo: name.as_str(),
