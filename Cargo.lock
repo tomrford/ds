@@ -708,6 +708,7 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "devspace-kernel",
+ "futures 0.3.32",
  "jj-lib",
  "reqwest",
  "serde",

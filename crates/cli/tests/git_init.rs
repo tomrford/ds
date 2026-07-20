@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MAX_IMPORT_COMMIT_DEPTH, MachineConfig, MachineId, MachineRepository,
-    MachineStore, RepositoryName, SharedSecret,
+    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
+    RepositoryName, SharedSecret,
 };
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 
@@ -178,30 +178,53 @@ fn init_replays_the_creation_intent_after_a_lost_cloud_response() {
 
 #[test]
 #[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
-fn init_surfaces_the_typed_import_depth_limit_and_todo() {
-    let fixture = LiveFixture::new("depth");
-    let source = fixture.root.join("deep-source");
-    run_git(["init", "-b", "main", path(&source)]);
-    configure_git_identity(&source);
-    // Auto-maintenance can detach mid-loop across a thousand commits and race
-    // reference reads; the fixture disables it for determinism.
-    git_worktree(&source, &["config", "gc.auto", "0"]);
-    git_worktree(&source, &["config", "maintenance.auto", "false"]);
-    for index in 0..=MAX_IMPORT_COMMIT_DEPTH {
-        git_worktree(
-            &source,
-            &["commit", "--allow-empty", "-m", &format!("commit {index}")],
-        );
-    }
-    let remote = fixture.root.join("deep.git");
-    run_git(["clone", "--bare", path(&source), path(&remote)]);
+fn init_imports_deep_history_through_receipt_pages_and_retries_after_page_crash() {
+    const COMMITS: usize = 60;
+    let fixture = LiveFixture::new("paged-history");
+    let remote = fixture.linear_remote(COMMITS);
+    let checkout = fixture.root.join("deep-checkout");
+    let mut command = fixture.init_command(&remote, &checkout, None);
+    let output = command
+        .env("DEVSPACE_HTTP_TEST_HOOKS", "1")
+        .env("DEVSPACE_TEST_RECEIPT_PAGE_SIZE", "16")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_history_count(&fixture, &checkout, COMMITS);
+    assert_eq!(
+        fs::read(checkout.join("visible.txt")).unwrap(),
+        b"history\n"
+    );
+    let status = fixture.ds(&checkout, &["status"]);
+    assert!(status.status.success(), "{}", stderr(&status));
 
-    let output = fixture.init(&remote, &fixture.root.join("deep-checkout"), None);
-    assert_eq!(output.status.code(), Some(1));
-    let error = stderr(&output);
-    assert!(error.contains("Git import commit depth"), "{error}");
-    assert!(error.contains("exceeds the safety limit"), "{error}");
-    assert!(error.contains("todo.md"), "{error}");
+    let retry_fixture = LiveFixture::new("paged-retry");
+    let retry_remote = retry_fixture.linear_remote(COMMITS);
+    let retry_checkout = retry_fixture.root.join("retry-checkout");
+    let mut failed = retry_fixture.init_command(&retry_remote, &retry_checkout, None);
+    let failed = failed
+        .env("DEVSPACE_HTTP_TEST_HOOKS", "1")
+        .env("DEVSPACE_TEST_RECEIPT_PAGE_SIZE", "16")
+        .env("DEVSPACE_FAILPOINT", "after_receipt_page")
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(86), "{}", stderr(&failed));
+
+    let mut retried = ds_command(&retry_checkout, &retry_fixture.home, &retry_fixture.config);
+    let retried = retried
+        .env("DEVSPACE_HTTP_TEST_HOOKS", "1")
+        .env("DEVSPACE_TEST_RECEIPT_PAGE_SIZE", "16")
+        .args(["git", "fetch"])
+        .output()
+        .unwrap();
+    assert!(retried.status.success(), "{}", stderr(&retried));
+    assert_history_count(&retry_fixture, &retry_checkout, COMMITS);
+    let positioned = retry_fixture.ds(&retry_checkout, &["new", "main@origin"]);
+    assert!(positioned.status.success(), "{}", stderr(&positioned));
+    assert_eq!(
+        fs::read(retry_checkout.join("visible.txt")).unwrap(),
+        b"history\n"
+    );
 }
 
 struct LiveFixture {
@@ -263,6 +286,25 @@ impl LiveFixture {
         remote
     }
 
+    fn linear_remote(&self, commits: usize) -> PathBuf {
+        assert!(commits > 0);
+        let source = self.root.join(format!("{}-source", self.name));
+        run_git(["init", "-b", "main", path(&source)]);
+        configure_git_identity(&source);
+        fs::write(source.join("visible.txt"), b"history\n").unwrap();
+        git_worktree(&source, &["add", "visible.txt"]);
+        git_worktree(&source, &["commit", "-m", "commit 0"]);
+        for index in 1..commits {
+            git_worktree(
+                &source,
+                &["commit", "--allow-empty", "-m", &format!("commit {index}")],
+            );
+        }
+        let remote = self.root.join(format!("{}.git", self.name));
+        run_git(["clone", "--bare", path(&source), path(&remote)]);
+        remote
+    }
+
     fn init(&self, remote: &Path, checkout: &Path, name: Option<&str>) -> Output {
         self.init_command(remote, checkout, name).output().unwrap()
     }
@@ -292,6 +334,22 @@ impl LiveFixture {
             .await
             .unwrap()
     }
+}
+
+fn assert_history_count(fixture: &LiveFixture, checkout: &Path, expected: usize) {
+    let log = fixture.ds(
+        checkout,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "root()..main@origin",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    );
+    assert!(log.status.success(), "{}", stderr(&log));
+    assert_eq!(stdout(&log).lines().count(), expected, "{}", stdout(&log));
 }
 
 fn configure_machine(root: &Path, machine_id: String) {

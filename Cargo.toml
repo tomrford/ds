@@ -13,6 +13,7 @@ blake2 = "0.10.6"
 clap = { version = "=4.6.2", features = ["derive"] }
 dunce = "=1.0.5"
 getrandom = "=0.4.3"
+futures = "=0.3.32"
 jj-cli = "=0.42.0"
 jj-lib = { version = "=0.42.0", default-features = false, features = ["git"] }
 prost = "=0.14.3"

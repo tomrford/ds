@@ -75,14 +75,18 @@ const fetchRefSchema = z.strictObject({
   proposedState: nonNegativeSafeIntegerSchema.nullable(),
 });
 
-const recordFetchSchema = z.strictObject({
-  incarnation: shortIdSchema("incarnation"),
-  fetchId: shortIdSchema("fetchId"),
-  machineId: shortIdSchema("machineId"),
-  remote: nameSchema("remote"),
-  refs: z.array(fetchRefSchema).min(1).max(MAX_PROJECTION_REFS),
-  receipts: z.array(fetchReceiptSchema).max(MAX_FETCH_RECEIPTS),
-});
+const recordFetchSchema = z
+  .strictObject({
+    incarnation: shortIdSchema("incarnation"),
+    fetchId: shortIdSchema("fetchId"),
+    machineId: shortIdSchema("machineId"),
+    remote: nameSchema("remote"),
+    refs: z.array(fetchRefSchema).max(MAX_PROJECTION_REFS),
+    receipts: z.array(fetchReceiptSchema).max(MAX_FETCH_RECEIPTS),
+  })
+  .refine((request) => request.refs.length !== 0 || request.receipts.length !== 0, {
+    error: "fetch request must include refs or receipts",
+  });
 
 const claimProjectionBatchSchema = z.strictObject({
   incarnation: shortIdSchema("incarnation"),
@@ -220,6 +224,12 @@ export function compareNullableBytes(
 function parseProjection<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
   if (result.success) return result.data;
+  if (result.error.issues.some((issue) => issue.message === "fetch request must include refs or receipts")) {
+    throw new ProjectionProtocolError(
+      "fetch request must include refs or receipts",
+      "fetch-empty",
+    );
+  }
   if (result.error.issues.some((issue) => issue.path.includes("hiddenSetId"))) {
     throw new ProjectionProtocolError(
       "hiddenSetId must be null or 128 lowercase hex characters",

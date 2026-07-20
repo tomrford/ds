@@ -27,7 +27,11 @@ use super::{
 };
 
 const AFTER_FETCH_RECORD_FAILPOINT: &str = "after_fetch_record_before_view";
+const AFTER_RECEIPT_PAGE_FAILPOINT: &str = "after_receipt_page";
 const LOST_FETCH_RECORD_RESPONSE_FAILPOINT: &str = "lost_fetch_record_response_once";
+const RECEIPT_PAGE_SIZE: usize = 4_096;
+const HTTP_TEST_HOOKS_ENV: &str = "DEVSPACE_HTTP_TEST_HOOKS";
+const TEST_RECEIPT_PAGE_SIZE_ENV: &str = "DEVSPACE_TEST_RECEIPT_PAGE_SIZE";
 
 pub(super) async fn fetch_bookmarks(
     ui: &mut Ui,
@@ -250,16 +254,7 @@ async fn fetch_with_cloud(
         )
         .await?;
 
-        let fetch_id = new_fetch_id()?;
-        record_fetch_with_retry(
-            &cloud,
-            fetch_id,
-            machine_id,
-            remote_name,
-            &fetch_refs,
-            &new_receipts,
-        )
-        .await?;
+        record_fetch_pages(&cloud, machine_id, remote_name, &fetch_refs, &new_receipts).await?;
         if failpoint_enabled(AFTER_FETCH_RECORD_FAILPOINT) {
             std::process::exit(86);
         }
@@ -276,6 +271,61 @@ async fn fetch_with_cloud(
             .map(|path| path.as_internal_file_string().to_owned())
             .collect(),
     })
+}
+
+async fn record_fetch_pages(
+    journal: &HttpTransport,
+    machine_id: [u8; 16],
+    remote: &str,
+    refs: &[FetchRef],
+    receipts: &[FetchReceipt],
+) -> Result<(), String> {
+    let pages = fetch_pages(refs, receipts, receipt_page_size());
+    let last = pages.len() - 1;
+    for (index, (page_refs, page_receipts)) in pages.into_iter().enumerate() {
+        record_fetch_with_retry(
+            journal,
+            new_fetch_id()?,
+            machine_id,
+            remote,
+            page_refs,
+            page_receipts,
+        )
+        .await?;
+        if index != last && failpoint_enabled(AFTER_RECEIPT_PAGE_FAILPOINT) {
+            std::process::exit(86);
+        }
+    }
+    Ok(())
+}
+
+fn fetch_pages<'a>(
+    refs: &'a [FetchRef],
+    receipts: &'a [FetchReceipt],
+    page_size: usize,
+) -> Vec<(&'a [FetchRef], &'a [FetchReceipt])> {
+    assert!(page_size > 0);
+    if receipts.is_empty() {
+        return vec![(refs, receipts)];
+    }
+    let mut pages = receipts
+        .chunks(page_size)
+        .map(|page| (&[][..], page))
+        .collect::<Vec<_>>();
+    pages.last_mut().expect("non-empty receipt chunks").0 = refs;
+    pages
+}
+
+fn receipt_page_size() -> usize {
+    if std::env::var_os(HTTP_TEST_HOOKS_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+        && let Some(size) = std::env::var(TEST_RECEIPT_PAGE_SIZE_ENV)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        && size > 0
+    {
+        return size;
+    }
+    RECEIPT_PAGE_SIZE
 }
 
 async fn record_fetch_with_retry(
@@ -523,13 +573,10 @@ fn lift_error(error: GitLiftError) -> String {
             "Git object {} has ambiguous private seed lineage",
             GitOid(git_oid)
         ),
-        GitLiftError::Projection(devspace_machine::ProjectionError::ImportCommitDepthLimit {
-            depth,
+        GitLiftError::Projection(devspace_machine::ProjectionError::ImportCommitLimit {
+            actual,
             limit,
-            commit_id,
-        }) => format!(
-            "Git import commit depth {depth} at {commit_id} exceeds the safety limit of {limit}; see the import depth limit item in todo.md"
-        ),
+        }) => format!("Git import has {actual} commits, exceeding the safety limit of {limit}"),
         other => other.to_string(),
     }
 }
@@ -723,6 +770,34 @@ mod tests {
         let (first, second) = server.join().unwrap();
         assert_eq!(request_body(&first), request_body(&second));
         assert!(request_body(&second).contains(&"22".repeat(16)));
+    }
+
+    #[test]
+    fn receipt_pages_put_refs_only_on_the_final_transaction() {
+        let refs = vec![FetchRef {
+            bookmark: "main".to_owned(),
+            observed_git_oid: [1; 20],
+            expected_cursor_oid: None,
+            states: Vec::new(),
+            proposed_state: None,
+        }];
+        let page_size = 3;
+        let receipts = (0..page_size * 3 + 1)
+            .map(|index| FetchReceipt {
+                git_oid: [index as u8 + 1; 20],
+                public_commit_id: [index as u8 + 1; 64],
+            })
+            .collect::<Vec<_>>();
+
+        let pages = fetch_pages(&refs, &receipts, page_size);
+
+        assert_eq!(pages.len(), 4);
+        assert!(pages[..3].iter().all(|(page_refs, _)| page_refs.is_empty()));
+        assert_eq!(pages[3].0, refs);
+        assert_eq!(
+            pages.iter().map(|(_, page)| page.len()).collect::<Vec<_>>(),
+            [3, 3, 3, 1]
+        );
     }
 
     fn snapshot_with_cursors<const N: usize>(

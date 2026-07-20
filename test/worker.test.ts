@@ -1195,6 +1195,65 @@ describe("Git fetch journal", () => {
     });
   });
 
+  it("records receipt-only pages without moving projection state and replays verbatim", async () => {
+    const repository = "fetch-receipt-page";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
+    const [publicCommitId, otherPublicCommitId] = await installProjectionCommits(repository);
+    const gitOid = "c1".repeat(20);
+    const request = fetchRequest(
+      incarnation,
+      "c2".repeat(16),
+      machine,
+      [],
+      [{ gitOid, publicCommitId }],
+    );
+    const result = {
+      status: 200,
+      body: { fetchId: "c2".repeat(16), activationCursor: 0 },
+    };
+
+    expect(await projectionRequest(repository, "git/fetches", request)).toEqual(result);
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 0,
+      cursors: [],
+      mappings: [],
+    });
+    expect(
+      await runInDurableObject(
+        await repositoryStub(repository, incarnation),
+        (_instance, state) =>
+          state.storage.sql
+            .exec<{ public_commit_id: ArrayBuffer }>(
+              "SELECT public_commit_id FROM git_receipts WHERE git_oid = ?",
+              exactTestBuffer(gitOid),
+            )
+            .one().public_commit_id,
+      ),
+    ).toEqual(exactTestBuffer(publicCommitId));
+
+    expect(await projectionRequest(repository, "git/fetches", request)).toEqual(result);
+    expect(
+      await projectionRequest(repository, "git/fetches", {
+        ...request,
+        receipts: [{ gitOid, publicCommitId: otherPublicCommitId }],
+      }),
+    ).toMatchObject({ status: 409, body: { code: "fetch-request-mismatch" } });
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "c3".repeat(16),
+          machine,
+          [],
+          [{ gitOid, publicCommitId: otherPublicCommitId }],
+        ),
+      ),
+    ).toMatchObject({ status: 409, body: { code: "git-receipt-conflict" } });
+  });
+
   it("rejects stale cursors in both directions without mutating the journal", async () => {
     const repository = "fetch-stale";
     await initializeProjectionRepository(repository, incarnation);
@@ -1593,8 +1652,12 @@ describe("Git fetch journal", () => {
       await projectionRequest(repository, "git/fetches", { ...valid, unexpected: true }),
     ).toMatchObject({ status: 400, body: { code: "invalid-fetch-request" } });
     expect(
-      await projectionRequest(repository, "git/fetches", { ...valid, refs: [] }),
-    ).toMatchObject({ status: 400, body: { code: "invalid-fetch-request" } });
+      await projectionRequest(repository, "git/fetches", {
+        ...valid,
+        refs: [],
+        receipts: [],
+      }),
+    ).toMatchObject({ status: 400, body: { code: "fetch-empty" } });
 
     const tooManyRefs = Array.from({ length: MAX_PROJECTION_REFS + 1 }, (_, index) =>
       fetchRef(`ref-${index}`, gitOid, null, [], null),

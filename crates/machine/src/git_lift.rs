@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use futures::StreamExt as _;
 use jj_lib::backend::{Commit as BackendCommit, CommitId, CopyId, FileId, TreeValue};
+use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
@@ -11,7 +13,9 @@ use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
 use thiserror::Error;
 
-use crate::git_projection::{HiddenSetCache, resolve_hidden_set_for_tree};
+use crate::git_projection::{
+    HiddenSetCache, NoAncestryStops, resolve_hidden_set_for_tree, walk_ancestry_bounded,
+};
 use crate::{
     CommitMapping, GitProjection, HiddenSetIdentity, ImportMappings, MachineRepository,
     ProjectionError, ProjectionSnapshot,
@@ -233,32 +237,14 @@ async fn git_ancestry(
     projection: &GitProjection,
     head: &CommitId,
 ) -> Result<BTreeSet<CommitId>, GitLiftError> {
-    let store = projection.store();
-    let mut seen = BTreeSet::new();
-    let mut deepest = BTreeMap::<CommitId, usize>::new();
-    let mut pending = vec![(head.clone(), 1_usize)];
-    while let Some((id, depth)) = pending.pop() {
-        if id == *store.root_commit_id() {
-            continue;
-        }
-        if depth > crate::git_projection::MAX_IMPORT_COMMIT_DEPTH {
-            return Err(GitLiftError::Projection(
-                ProjectionError::ImportCommitDepthLimit {
-                    commit_id: id,
-                    depth,
-                    limit: crate::git_projection::MAX_IMPORT_COMMIT_DEPTH,
-                },
-            ));
-        }
-        seen.insert(id.clone());
-        if deepest.get(&id).is_some_and(|seen| *seen >= depth) {
-            continue;
-        }
-        deepest.insert(id.clone(), depth);
-        let commit = store.backend().read_commit(&id).await?;
-        pending.extend(commit.parents.into_iter().map(|parent| (parent, depth + 1)));
-    }
-    Ok(seen)
+    Ok(walk_ancestry_bounded(
+        projection.store(),
+        std::slice::from_ref(head),
+        &mut NoAncestryStops,
+        crate::git_projection::MAX_IMPORT_TOTAL_COMMITS,
+    )
+    .await?
+    .reached)
 }
 
 /// Lift newly imported public shadows onto the selected private lineage.
@@ -321,16 +307,31 @@ pub async fn lift_imported(
         );
         let rebased = MergedTree::merge(Merge::from_vec(vec![
             (private_base.clone(), "lifted parents".to_owned()),
-            (public_base, "public parents".to_owned()),
+            (public_base.clone(), "public parents".to_owned()),
             (public_tree.clone(), "public commit".to_owned()),
         ]))
         .await?;
         let hidden_set =
             resolve_hidden_set_for_tree(store, public_id, &private_base, &mut hidden_cache).await?;
-        let polluted =
-            apply_pollution_tombstones(store, rebased, &private_base, &public_tree, &hidden_set)
-                .await?;
-        polluted_paths.extend(hidden_conflict_paths(&polluted, &hidden_set).await?);
+        let polluted = apply_pollution_tombstones(
+            store,
+            rebased,
+            &public_base,
+            &private_base,
+            &public_tree,
+            &hidden_set,
+        )
+        .await?;
+        polluted_paths.extend(
+            hidden_conflict_paths(
+                &polluted,
+                &public_base,
+                &private_base,
+                &public_tree,
+                &hidden_set,
+            )
+            .await?,
+        );
         let (root_tree, labels) = polluted.into_tree_ids_and_labels();
         let lifted = BackendCommit {
             parents: lifted_parents,
@@ -369,13 +370,25 @@ pub async fn lift_imported(
 
 async fn hidden_conflict_paths(
     tree: &MergedTree,
+    public_base: &MergedTree,
+    private_base: &MergedTree,
+    public_tree: &MergedTree,
     hidden_set: &crate::HiddenSet,
 ) -> Result<BTreeSet<jj_lib::repo_path::RepoPathBuf>, GitLiftError> {
     let mut paths = BTreeSet::new();
-    for (path, value) in tree.entries() {
-        let value = value?;
-        if hidden_set.hides_file(&path) && value.into_resolved().is_err() {
-            paths.insert(path);
+    // Public deltas are the normal source of pollution. The private-base diff
+    // is the targeted fallback for an unchanged public path that was already
+    // conflicted in the lifted parent merge.
+    for relevant in [public_tree, private_base] {
+        let mut diff = public_base.diff_stream(relevant, &EverythingMatcher);
+        while let Some(entry) = diff.next().await {
+            entry.values?;
+            if paths.contains(&entry.path) || !hidden_set.hides_file(&entry.path) {
+                continue;
+            }
+            if tree.path_value(&entry.path).await?.into_resolved().is_err() {
+                paths.insert(entry.path);
+            }
         }
     }
     Ok(paths)
@@ -395,13 +408,17 @@ async fn load_commits(
 async fn apply_pollution_tombstones(
     store: &std::sync::Arc<jj_lib::store::Store>,
     rebased: MergedTree,
+    public_base: &MergedTree,
     private_base: &MergedTree,
     public_tree: &MergedTree,
     hidden_set: &crate::HiddenSet,
 ) -> Result<MergedTree, GitLiftError> {
     let mut rewrites = Vec::new();
-    for (path, value) in rebased.entries() {
-        let value = value?;
+    let mut diff = public_base.diff_stream(public_tree, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        entry.values?;
+        let path = entry.path;
+        let value = rebased.path_value(&path).await?;
         let Ok(Some(clean_value)) = value.into_resolved() else {
             continue;
         };

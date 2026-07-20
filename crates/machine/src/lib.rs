@@ -52,8 +52,8 @@ pub use git_lift::{
 };
 pub use git_projection::{
     CommitMapping, ExportMappings, ExportResult, GitProjection, HiddenSet, HiddenSetIdentity,
-    ImportMappings, ImportResult, MAX_IMPORT_COMMIT_DEPTH, MAX_IMPORT_HEADS, MAX_IMPORT_TREE_DEPTH,
-    MAX_IMPORT_TREE_ENTRIES, ProjectionError,
+    ImportMappings, ImportResult, MAX_IMPORT_HEADS, MAX_IMPORT_TOTAL_COMMITS,
+    MAX_IMPORT_TREE_DEPTH, MAX_IMPORT_TREE_ENTRIES, ProjectionError,
 };
 pub use git_subprocess::{
     CommandDiagnostic, FetchDiagnostic, FetchError, FetchErrorKind, FetchReport, GitOid,

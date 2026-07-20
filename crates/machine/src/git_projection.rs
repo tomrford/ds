@@ -31,10 +31,10 @@ use thiserror::Error;
 const STORE_DIR: &str = "store";
 const DSPRIVATE: &str = ".dsprivate";
 
-/// Current import safety limits, aligned with the projection request's 256-ref
-/// and 8,192-state bounds. These are safety limits, not production quotas.
+/// Current import safety limits. These are sanity ceilings, not transaction
+/// bounds or production quotas.
 pub const MAX_IMPORT_HEADS: usize = 256;
-pub const MAX_IMPORT_COMMIT_DEPTH: usize = 1_024;
+pub const MAX_IMPORT_TOTAL_COMMITS: usize = 1_048_576;
 pub const MAX_IMPORT_TREE_DEPTH: usize = 256;
 pub const MAX_IMPORT_TREE_ENTRIES: usize = 8_192;
 
@@ -367,7 +367,6 @@ impl GitProjection {
         }
         let expected = mappings.by_git.clone();
         let mut computed = BTreeMap::new();
-        validate_import_commit_depth(&self.store, git_heads, &stop_at.by_git).await?;
         let translated = translate_reachable(
             &self.store,
             canonical_store,
@@ -428,38 +427,6 @@ impl GitProjection {
     }
 }
 
-async fn validate_import_commit_depth(
-    source: &Arc<Store>,
-    heads: &[CommitId],
-    stop_at: &BTreeMap<CommitId, CommitId>,
-) -> Result<(), ProjectionError> {
-    let mut deepest = BTreeMap::<CommitId, usize>::new();
-    let mut pending = heads
-        .iter()
-        .cloned()
-        .map(|id| (id, 1_usize))
-        .collect::<Vec<_>>();
-    while let Some((id, depth)) = pending.pop() {
-        if id == *source.root_commit_id() || stop_at.contains_key(&id) {
-            continue;
-        }
-        if depth > MAX_IMPORT_COMMIT_DEPTH {
-            return Err(ProjectionError::ImportCommitDepthLimit {
-                commit_id: id,
-                depth,
-                limit: MAX_IMPORT_COMMIT_DEPTH,
-            });
-        }
-        if deepest.get(&id).is_some_and(|seen| *seen >= depth) {
-            continue;
-        }
-        deepest.insert(id.clone(), depth);
-        let commit = source.backend().read_commit(&id).await?;
-        pending.extend(commit.parents.into_iter().map(|parent| (parent, depth + 1)));
-    }
-    Ok(())
-}
-
 struct TranslationResult {
     target_heads: Vec<CommitId>,
     new_pairs: Vec<(CommitId, CommitId)>,
@@ -472,9 +439,125 @@ enum TranslationDirection {
     Import,
 }
 
-enum Visit {
-    Enter { id: CommitId, depth: usize },
+enum AncestryVisit {
+    Enter(CommitId),
     Exit(CommitId),
+}
+
+pub(crate) trait AncestryStops {
+    async fn contains(&mut self, id: &CommitId) -> Result<bool, ProjectionError>;
+}
+
+pub(crate) struct NoAncestryStops;
+
+impl AncestryStops for NoAncestryStops {
+    async fn contains(&mut self, _id: &CommitId) -> Result<bool, ProjectionError> {
+        Ok(false)
+    }
+}
+
+pub(crate) struct AncestryWalk {
+    pub(crate) reached: BTreeSet<CommitId>,
+    parent_first: Vec<(CommitId, BackendCommit)>,
+}
+
+pub(crate) async fn walk_ancestry_bounded(
+    store: &Arc<Store>,
+    heads: &[CommitId],
+    stops: &mut impl AncestryStops,
+    limit: usize,
+) -> Result<AncestryWalk, ProjectionError> {
+    let mut states = BTreeMap::<CommitId, bool>::new();
+    let mut reached = BTreeSet::new();
+    let mut commits = BTreeMap::<CommitId, BackendCommit>::new();
+    let mut parent_first = Vec::new();
+    let mut read_count = 0;
+
+    for head in heads {
+        let mut stack = vec![AncestryVisit::Enter(head.clone())];
+        while let Some(visit) = stack.pop() {
+            match visit {
+                AncestryVisit::Enter(id) => {
+                    if id == *store.root_commit_id() {
+                        continue;
+                    }
+                    match states.get(&id) {
+                        Some(true) => continue,
+                        Some(false) => return Err(ProjectionError::CommitCycle(id)),
+                        None => {}
+                    }
+                    reached.insert(id.clone());
+                    if stops.contains(&id).await? {
+                        states.insert(id, true);
+                        continue;
+                    }
+                    if read_count >= limit {
+                        return Err(ProjectionError::ImportCommitLimit {
+                            actual: read_count + 1,
+                            limit,
+                        });
+                    }
+                    let commit = store.backend().read_commit(&id).await?;
+                    read_count += 1;
+                    states.insert(id.clone(), false);
+                    commits.insert(id.clone(), commit.clone());
+                    stack.push(AncestryVisit::Exit(id));
+                    for parent in commit.parents.iter().rev() {
+                        stack.push(AncestryVisit::Enter(parent.clone()));
+                    }
+                }
+                AncestryVisit::Exit(id) => {
+                    if states.get(&id) == Some(&true) {
+                        continue;
+                    }
+                    let commit = commits
+                        .remove(&id)
+                        .ok_or_else(|| ProjectionError::MissingStagedCommit(id.clone()))?;
+                    states.insert(id.clone(), true);
+                    parent_first.push((id, commit));
+                }
+            }
+        }
+    }
+    Ok(AncestryWalk {
+        reached,
+        parent_first,
+    })
+}
+
+struct TranslationStops<'a> {
+    target: &'a Arc<Store>,
+    source_to_target: &'a mut BTreeMap<CommitId, CommitId>,
+    stop_at: Option<&'a BTreeMap<CommitId, CommitId>>,
+    reached_pairs: &'a mut BTreeMap<CommitId, CommitId>,
+}
+
+impl AncestryStops for TranslationStops<'_> {
+    async fn contains(&mut self, source_id: &CommitId) -> Result<bool, ProjectionError> {
+        if let Some(target_id) = self.stop_at.and_then(|stops| stops.get(source_id)) {
+            self.target.backend().read_commit(target_id).await?;
+            record_mapping(
+                self.source_to_target,
+                source_id.clone(),
+                target_id.clone(),
+                "Git commit stop",
+            )?;
+            self.reached_pairs
+                .insert(source_id.clone(), target_id.clone());
+            return Ok(true);
+        }
+        let Some(target_id) = self.source_to_target.get(source_id).cloned() else {
+            return Ok(false);
+        };
+        match self.target.backend().read_commit(&target_id).await {
+            Ok(_) => {
+                self.reached_pairs.insert(source_id.clone(), target_id);
+                Ok(true)
+            }
+            Err(jj_lib::backend::BackendError::ObjectNotFound { .. }) => Ok(false),
+            Err(source) => Err(source.into()),
+        }
+    }
 }
 
 async fn translate_reachable(
@@ -486,159 +569,87 @@ async fn translate_reachable(
     expected: Option<&BTreeMap<CommitId, CommitId>>,
     direction: TranslationDirection,
 ) -> Result<TranslationResult, ProjectionError> {
-    let mut states = BTreeMap::<CommitId, bool>::new();
-    let mut commits = BTreeMap::<CommitId, BackendCommit>::new();
     let mut cache = TranslationCache::default();
     let mut new_pairs = Vec::new();
     let mut reached_pairs = BTreeMap::new();
+    let limit = match direction {
+        TranslationDirection::Import => MAX_IMPORT_TOTAL_COMMITS,
+        TranslationDirection::Export => usize::MAX,
+    };
+    let walk = walk_ancestry_bounded(
+        source,
+        source_heads,
+        &mut TranslationStops {
+            target,
+            source_to_target,
+            stop_at,
+            reached_pairs: &mut reached_pairs,
+        },
+        limit,
+    )
+    .await?;
 
-    for head in source_heads {
-        let mut stack = vec![Visit::Enter {
-            id: head.clone(),
-            depth: 1,
-        }];
-        while let Some(visit) = stack.pop() {
-            match visit {
-                Visit::Enter {
-                    id: source_id,
-                    depth,
-                } => {
-                    if source_id == *source.root_commit_id() {
-                        continue;
-                    }
-                    if matches!(direction, TranslationDirection::Import)
-                        && depth > MAX_IMPORT_COMMIT_DEPTH
-                    {
-                        return Err(ProjectionError::ImportCommitDepthLimit {
-                            commit_id: source_id,
-                            depth,
-                            limit: MAX_IMPORT_COMMIT_DEPTH,
-                        });
-                    }
-                    if let Some(target_id) = stop_at.and_then(|stops| stops.get(&source_id)) {
-                        target.backend().read_commit(target_id).await?;
-                        record_mapping(
-                            source_to_target,
-                            source_id.clone(),
-                            target_id.clone(),
-                            "Git commit stop",
-                        )?;
-                        reached_pairs.insert(source_id.clone(), target_id.clone());
-                        states.insert(source_id, true);
-                        continue;
-                    }
-                    if let Some(target_id) = source_to_target.get(&source_id) {
-                        match target.backend().read_commit(target_id).await {
-                            // An accepted mapping stops the walk unconditionally.
-                            // Fetch-recorded mappings legitimately bind conflicted
-                            // lifted commits to public history that already carries
-                            // bytes at hidden paths; the no-new-hidden-bytes
-                            // guarantee is enforced where Git objects are CREATED
-                            // (filter-before-read) and on the head scan before
-                            // push, never on reuse.
-                            Ok(_) => {
-                                reached_pairs.insert(source_id.clone(), target_id.clone());
-                                states.insert(source_id, true);
-                                continue;
-                            }
-                            Err(jj_lib::backend::BackendError::ObjectNotFound { .. }) => {}
-                            Err(source) => return Err(source.into()),
-                        }
-                    }
-                    match states.get(&source_id) {
-                        Some(true) => continue,
-                        Some(false) => return Err(ProjectionError::CommitCycle(source_id)),
-                        None => {}
-                    }
-                    let commit = source.backend().read_commit(&source_id).await?;
-                    states.insert(source_id.clone(), false);
-                    commits.insert(source_id.clone(), commit.clone());
-                    stack.push(Visit::Exit(source_id));
-                    for parent_id in commit.parents.iter().rev() {
-                        stack.push(Visit::Enter {
-                            id: parent_id.clone(),
-                            depth: depth + 1,
-                        });
-                    }
-                }
-                Visit::Exit(source_id) => {
-                    if states.get(&source_id) == Some(&true) {
-                        continue;
-                    }
-                    let source_commit = commits
-                        .remove(&source_id)
-                        .ok_or_else(|| ProjectionError::MissingStagedCommit(source_id.clone()))?;
-                    let parents = source_commit
-                        .parents
-                        .iter()
-                        .map(|parent_id| {
-                            mapped_commit_id(source, target, source_to_target, parent_id)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let hidden_set = match direction {
-                        TranslationDirection::Export => Some(
-                            resolve_hidden_set(
-                                source,
-                                &source_id,
-                                &source_commit,
-                                &mut cache.hidden_sets,
-                            )
-                            .await?,
-                        ),
-                        TranslationDirection::Import => None,
-                    };
-                    let source_tree_id = source_commit
-                        .root_tree
-                        .as_resolved()
-                        .ok_or_else(|| ProjectionError::ConflictedCommit(source_id.clone()))?;
-                    let context = TreeCopyContext {
-                        source,
-                        target,
-                        hidden_set: hidden_set.as_ref(),
-                        direction,
-                    };
-                    let target_tree_id = copy_tree(
-                        &context,
-                        RepoPath::root(),
-                        source_tree_id,
-                        &HiddenChain::empty(),
-                        &mut cache,
-                        0,
-                    )
-                    .await?;
-                    let target_commit = BackendCommit {
-                        parents,
-                        predecessors: Vec::new(),
-                        root_tree: jj_lib::merge::Merge::resolved(target_tree_id),
-                        conflict_labels: jj_lib::merge::Merge::resolved(String::new()),
-                        change_id: source_commit.change_id,
-                        description: source_commit.description,
-                        author: source_commit.author,
-                        committer: source_commit.committer,
-                        secure_sig: None,
-                    };
-                    let target_id = target.write_commit(target_commit, None).await?.id().clone();
-                    if let Some(expected_id) = expected.and_then(|rows| rows.get(&source_id))
-                        && expected_id != &target_id
-                    {
-                        return Err(ProjectionError::ConflictingMapping {
-                            source_name: "Git commit",
-                            source_id,
-                            existing: expected_id.clone(),
-                            proposed: target_id,
-                        });
-                    }
-                    if record_mapping(
-                        source_to_target,
-                        source_id.clone(),
-                        target_id.clone(),
-                        "source commit",
-                    )? {
-                        new_pairs.push((source_id.clone(), target_id));
-                    }
-                    states.insert(source_id, true);
-                }
-            }
+    for (source_id, source_commit) in walk.parent_first {
+        let parents = source_commit
+            .parents
+            .iter()
+            .map(|parent_id| mapped_commit_id(source, target, source_to_target, parent_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let hidden_set = match direction {
+            TranslationDirection::Export => Some(
+                resolve_hidden_set(source, &source_id, &source_commit, &mut cache.hidden_sets)
+                    .await?,
+            ),
+            TranslationDirection::Import => None,
+        };
+        let source_tree_id = source_commit
+            .root_tree
+            .as_resolved()
+            .ok_or_else(|| ProjectionError::ConflictedCommit(source_id.clone()))?;
+        let context = TreeCopyContext {
+            source,
+            target,
+            hidden_set: hidden_set.as_ref(),
+            direction,
+        };
+        let target_tree_id = copy_tree(
+            &context,
+            RepoPath::root(),
+            source_tree_id,
+            &HiddenChain::empty(),
+            &mut cache,
+            0,
+        )
+        .await?;
+        let target_commit = BackendCommit {
+            parents,
+            predecessors: Vec::new(),
+            root_tree: jj_lib::merge::Merge::resolved(target_tree_id),
+            conflict_labels: jj_lib::merge::Merge::resolved(String::new()),
+            change_id: source_commit.change_id,
+            description: source_commit.description,
+            author: source_commit.author,
+            committer: source_commit.committer,
+            secure_sig: None,
+        };
+        let target_id = target.write_commit(target_commit, None).await?.id().clone();
+        if let Some(expected_id) = expected.and_then(|rows| rows.get(&source_id))
+            && expected_id != &target_id
+        {
+            return Err(ProjectionError::ConflictingMapping {
+                source_name: "Git commit",
+                source_id,
+                existing: expected_id.clone(),
+                proposed: target_id,
+            });
+        }
+        if record_mapping(
+            source_to_target,
+            source_id.clone(),
+            target_id.clone(),
+            "source commit",
+        )? {
+            new_pairs.push((source_id.clone(), target_id));
         }
     }
 
@@ -1126,12 +1137,8 @@ pub enum ProjectionError {
     },
     #[error("Git import has {actual} input heads, exceeding the safety limit of {limit}")]
     ImportHeadLimit { actual: usize, limit: usize },
-    #[error("Git import commit depth {depth} at {commit_id} exceeds the safety limit of {limit}")]
-    ImportCommitDepthLimit {
-        commit_id: CommitId,
-        depth: usize,
-        limit: usize,
-    },
+    #[error("Git import has {actual} commits, exceeding the safety limit of {limit}")]
+    ImportCommitLimit { actual: usize, limit: usize },
     #[error("Git import tree depth {depth} at {path:?} exceeds the safety limit of {limit}")]
     ImportTreeDepthLimit {
         path: RepoPathBuf,

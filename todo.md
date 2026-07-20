@@ -45,22 +45,6 @@
   some collaborators, not all). Design item, unscheduled.
 - `ds skill` surface (v1 parity): agent-facing usage docs incl. the private-file
   model, once docs stabilise. Needed before T3 dogfooding.
-- Import depth limit (MAX_IMPORT_COMMIT_DEPTH 1,024) blocks `ds init` of
-  real histories; raising it needs paged/streaming import so one fetch
-  transaction stays bounded. Decide before dogfooding a repo deeper than the
-  limit (this repo qualifies).
-- Projection idempotency journals grow forever: `projection_fetch_results`
-  (one row per fetch) and `projection_batch_results` are never pruned. Port
-  the head-store retention + quota pattern (the `*_at_ms` columns exist for
-  it). Do early in checkpoint 8, before dogfood data accumulates.
-- `projection_states` scaling: no index on `(remote, bookmark)` or
-  `pending_batch_id`, and `requireUnambiguousFetchLineage` re-runs a
-  full-table `GROUP BY` per fetched OID — hoist the CTE once per request and
-  add the two indexes. Pair with the retention work.
-- Lift full-tree scans: `apply_pollution_tombstones` and
-  `hidden_conflict_paths` walk every tree entry per lifted commit; drive both
-  from the public base→tree `MergedTree` diff stream instead. Pair with the
-  import-depth raise — same dogfood gate.
 - Auto-track discovery walk never sees jj's base ignores (global
   `core.excludesFile`): a globally-ignored directory is descended by our walk
   but pruned by jj's, so hidden matches inside it silently diverge from the

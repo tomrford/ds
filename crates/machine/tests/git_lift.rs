@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use devspace_machine::{
     CommitMapping, FetchedGitRef, GitLiftError, GitProjection, GitSeed, ImportMappings,
-    MAX_IMPORT_COMMIT_DEPTH, MAX_IMPORT_HEADS, MAX_IMPORT_TREE_DEPTH, MAX_IMPORT_TREE_ENTRIES,
+    MAX_IMPORT_HEADS, MAX_IMPORT_TOTAL_COMMITS, MAX_IMPORT_TREE_DEPTH, MAX_IMPORT_TREE_ENTRIES,
     MachineRepository, ProjectionCursor, ProjectionError, ProjectionMapping, ProjectionSnapshot,
     SeedSelection, TOMBSTONE_A, TOMBSTONE_B, lift_imported, select_seeds,
 };
@@ -299,6 +299,98 @@ async fn pollution_uses_tombstones_natural_conflicts_and_deletion_cleanup() {
         .unwrap()
         .unwrap();
     assert_eq!(bytes(store, "secret", &clean).await, b"private");
+}
+
+#[tokio::test]
+async fn pollution_diff_keeps_a_large_untouched_sibling_subtree() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings())
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+
+    let names = (0..128)
+        .map(|index| format!("entry-{index:03}"))
+        .collect::<Vec<_>>();
+    let mut deep_entries = Vec::with_capacity(names.len());
+    for name in &names {
+        deep_entries.push((
+            name.as_str(),
+            file(store, &format!("untouched/deep/{name}"), b"same").await,
+        ));
+    }
+    let deep = tree(store, "untouched/deep", deep_entries).await;
+    let untouched = tree(store, "untouched", vec![("deep", TreeValue::Tree(deep))]).await;
+    let public_base_tree = tree(
+        store,
+        "",
+        vec![
+            ("untouched", TreeValue::Tree(untouched.clone())),
+            ("visible", file(store, "visible", b"base").await),
+        ],
+    )
+    .await;
+    let private_base_tree = tree(
+        store,
+        "",
+        vec![
+            (".dsprivate", file(store, ".dsprivate", b"/hidden\n").await),
+            ("untouched", TreeValue::Tree(untouched.clone())),
+            ("visible", file(store, "visible", b"base").await),
+        ],
+    )
+    .await;
+    let public_seed = commit(
+        store,
+        vec![store.root_commit_id().clone()],
+        public_base_tree,
+        42,
+    )
+    .await;
+    let private_seed = commit(
+        store,
+        vec![store.root_commit_id().clone()],
+        private_base_tree,
+        43,
+    )
+    .await;
+    let arriving_tree = tree(
+        store,
+        "",
+        vec![
+            ("hidden", file(store, "hidden", b"public").await),
+            ("untouched", TreeValue::Tree(untouched)),
+            ("visible", file(store, "visible", b"base").await),
+        ],
+    )
+    .await;
+    let arriving = commit(store, vec![public_seed.clone()], arriving_tree, 44).await;
+    let lifted = lift_imported(
+        &repository,
+        &[mapping(44, arriving)],
+        &selection(GitSeed {
+            git_oid: [42; 20],
+            public_commit_id: public_seed,
+            canonical_commit_id: private_seed,
+            hidden_set_id: devspace_machine::HiddenSetIdentity::from_projection_id(None),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let lifted_id = &lifted.states[0].canonical_commit_id;
+    let conflict = value(store, lifted_id, "hidden").await;
+    let removed = conflict.removes().next().unwrap().as_ref().unwrap();
+    assert_eq!(bytes(store, "hidden", removed).await, TOMBSTONE_A);
+    let untouched_value = value(store, lifted_id, "untouched/deep/entry-127")
+        .await
+        .into_resolved()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        bytes(store, "untouched/deep/entry-127", &untouched_value).await,
+        b"same"
+    );
 }
 
 #[tokio::test]
@@ -896,19 +988,15 @@ async fn import_bounds_fail_with_typed_errors() {
         Err(ProjectionError::ImportTreeDepthLimit { .. })
     ));
 
-    let empty = tree(git, "", Vec::new()).await;
-    let mut parent = git.root_commit_id().clone();
-    for index in 0..=MAX_IMPORT_COMMIT_DEPTH {
-        parent = commit(git, vec![parent], empty.clone(), index as u8).await;
-    }
-    assert!(matches!(
-        projection
-            .import_reachable(
-                repository.repo().store(),
-                &[parent],
-                &mut ImportMappings::default()
-            )
-            .await,
-        Err(ProjectionError::ImportCommitDepthLimit { .. })
-    ));
+    assert_eq!(
+        ProjectionError::ImportCommitLimit {
+            actual: MAX_IMPORT_TOTAL_COMMITS + 1,
+            limit: MAX_IMPORT_TOTAL_COMMITS,
+        }
+        .to_string(),
+        format!(
+            "Git import has {} commits, exceeding the safety limit of {MAX_IMPORT_TOTAL_COMMITS}",
+            MAX_IMPORT_TOTAL_COMMITS + 1
+        )
+    );
 }

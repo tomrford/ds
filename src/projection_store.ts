@@ -580,28 +580,30 @@ export class ProjectionStore {
           );
         }
         this.requireReplayCapacity("fetch");
-        // 2. Fetch observes the exact last accepted state for every ref.
-        this.requireExpectedCursors(
-          request.remote,
-          request.refs.map((ref) => ({
-            bookmark: ref.bookmark,
-            expected: ref.expectedCursorOid,
-          })),
-          "fetch-cursor-stale",
-        );
+        if (request.refs.length !== 0) {
+          // 2. Fetch observes the exact last accepted state for every ref.
+          this.requireExpectedCursors(
+            request.remote,
+            request.refs.map((ref) => ({
+              bookmark: ref.bookmark,
+              expected: ref.expectedCursorOid,
+            })),
+            "fetch-cursor-stale",
+          );
 
-        // 3. Push recovery owns any ref it has quarantined.
-        const pendingBookmarks = this.pendingPushBookmarks(
-          request.remote,
-          request.refs.map((ref) => ref.bookmark),
-        );
-        for (const ref of request.refs) {
-          if (pendingBookmarks.has(ref.bookmark)) {
-            throw new ProjectionStoreError(
-              `fetch overlaps a pending push for ${request.remote}/${ref.bookmark}`,
-              409,
-              "fetch-overlaps-pending-push",
-            );
+          // 3. Push recovery owns any ref it has quarantined.
+          const pendingBookmarks = this.pendingPushBookmarks(
+            request.remote,
+            request.refs.map((ref) => ref.bookmark),
+          );
+          for (const ref of request.refs) {
+            if (pendingBookmarks.has(ref.bookmark)) {
+              throw new ProjectionStoreError(
+                `fetch overlaps a pending push for ${request.remote}/${ref.bookmark}`,
+                409,
+                "fetch-overlaps-pending-push",
+              );
+            }
           }
         }
 
@@ -610,6 +612,13 @@ export class ProjectionStore {
           for (const state of ref.states) {
             this.requireDurableState(state, "fetch-commit-not-durable");
           }
+        }
+        for (const receipt of request.receipts) {
+          this.requireDurableCommit(
+            "public",
+            receipt.publicCommitId,
+            "fetch-commit-not-durable",
+          );
         }
 
         // 5. Receipts are immutable, including duplicate entries in this request.
@@ -632,9 +641,11 @@ export class ProjectionStore {
           }
         }
 
-        // 7. One Git object has one private lineage across current bookmark tips.
-        this.requireUnambiguousFetchLineage(request);
-        this.requireFetchCursorCapacity(request);
+        if (request.refs.length !== 0) {
+          // 7. One Git object has one private lineage across current bookmark tips.
+          this.requireUnambiguousFetchLineage(request);
+          this.requireFetchCursorCapacity(request);
+        }
 
         const existingStateIds = new Map<string, number>();
         for (const ref of request.refs) {
@@ -695,10 +706,12 @@ export class ProjectionStore {
             proposedStateId,
           );
         }
-        this.sql.exec(
-          "UPDATE projection_meta SET activation_cursor = ? WHERE singleton = 1",
-          activation,
-        );
+        if (request.refs.length !== 0) {
+          this.sql.exec(
+            "UPDATE projection_meta SET activation_cursor = ? WHERE singleton = 1",
+            activation,
+          );
+        }
         this.sql.exec(
           `INSERT INTO projection_fetch_results
            (fetch_id, remote, request_hash, activation_cursor, created_at_ms)
@@ -992,32 +1005,36 @@ export class ProjectionStore {
       ["canonical", state.canonicalCommitId],
       ["public", state.publicCommitId],
     ] as const) {
-      if (id.every((byte) => byte === 0)) {
+      this.requireDurableCommit(label, id, code);
+    }
+  }
+
+  private requireDurableCommit(label: string, id: Uint8Array, code?: string) {
+    if (id.every((byte) => byte === 0)) {
+      throw new ProjectionStoreError(
+        `${label} commit ${toHex(id)} is not cloud durable`,
+        409,
+        code ?? "projection-commit-not-durable",
+      );
+    }
+    const commitId = exactBuffer(id);
+    const missing = this.findMissingReachableObject(commitId);
+    if (missing !== undefined) {
+      const missingId = toHex(new Uint8Array(missing.id));
+      if (missing.kind === KIND.commit && missingId === toHex(id)) {
         throw new ProjectionStoreError(
           `${label} commit ${toHex(id)} is not cloud durable`,
           409,
           code ?? "projection-commit-not-durable",
         );
       }
-      const commitId = exactBuffer(id);
-      const missing = this.findMissingReachableObject(commitId);
-      if (missing !== undefined) {
-        const missingId = toHex(new Uint8Array(missing.id));
-        if (missing.kind === KIND.commit && missingId === toHex(id)) {
-          throw new ProjectionStoreError(
-            `${label} commit ${toHex(id)} is not cloud durable`,
-            409,
-            code ?? "projection-commit-not-durable",
-          );
-        }
-        throw new ProjectionStoreError(
-          `${label} commit ${toHex(id)} closure is missing ${KIND_BY_NUMBER[missing.kind] ?? `kind ${missing.kind}`} ${missingId}`,
-          409,
-          code ?? "projection-commit-not-durable",
-        );
-      }
-      this.markClosureComplete(commitId);
+      throw new ProjectionStoreError(
+        `${label} commit ${toHex(id)} closure is missing ${KIND_BY_NUMBER[missing.kind] ?? `kind ${missing.kind}`} ${missingId}`,
+        409,
+        code ?? "projection-commit-not-durable",
+      );
     }
+    this.markClosureComplete(commitId);
   }
 
   private findMissingReachableObject(commitId: ArrayBuffer): MissingObjectRow | undefined {
