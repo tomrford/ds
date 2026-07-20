@@ -23,7 +23,7 @@ pub(crate) enum DevspaceCommand {
     Daemon(DaemonArgs),
     /// Manage cloud repositories.
     Repo(RepoArgs),
-    #[command(hide = true)]
+    /// Manage machine synchronization.
     Sync(SyncArgs),
 }
 

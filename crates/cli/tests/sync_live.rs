@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -6,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use devspace_machine::{
     MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
-    RepositoryName, SharedSecret,
+    MachineSyncStore, RepositoryName, SharedSecret,
 };
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
@@ -17,7 +18,7 @@ const SECOND_MACHINE_ID: &str = "34343434343434343434343434343434";
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
-async fn ordinary_commands_converge_two_offline_divergent_machines() {
+async fn daemon_disabled_boundaries_converge_two_offline_divergent_machines() {
     let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
     let shared_secret =
         std::env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
@@ -32,7 +33,7 @@ async fn ordinary_commands_converge_two_offline_divergent_machines() {
     let config_b = write_cli_config(&home_b);
     let repository_name = unique_repository_name(temp.path());
 
-    let created = ds(
+    let created = ds_degraded(
         &home_a,
         &home_a,
         &config_a,
@@ -40,7 +41,7 @@ async fn ordinary_commands_converge_two_offline_divergent_machines() {
     );
     assert!(created.status.success(), "{}", stderr(&created));
     let checkout_a = home_a.join("checkout");
-    let added_a = ds(
+    let added_a = ds_degraded(
         &home_a,
         &home_a,
         &config_a,
@@ -54,12 +55,12 @@ async fn ordinary_commands_converge_two_offline_divergent_machines() {
     );
     assert!(added_a.status.success(), "{}", stderr(&added_a));
     fs::write(checkout_a.join("shared.txt"), "created on machine A\n").unwrap();
-    seal_commit(&checkout_a, &home_a, &config_a, "shared base");
-    let commit_a = commit_id(&checkout_a, &home_a, &config_a, "@-");
+    seal_commit_degraded(&checkout_a, &home_a, &config_a, "shared base");
+    let commit_a = commit_id_degraded(&checkout_a, &home_a, &config_a, "@-");
 
     assert!(
         poll_until(Duration::from_secs(60), || {
-            let output = ds(&checkout_a, &home_a, &config_a, &["status"]);
+            let output = ds_degraded(&checkout_a, &home_a, &config_a, &["status"]);
             output.status.success()
                 && stderr(&output)
                     .contains("sync: in sync with cloud as of the last successful sync")
@@ -69,7 +70,7 @@ async fn ordinary_commands_converge_two_offline_divergent_machines() {
     );
 
     let checkout_b = home_b.join("checkout");
-    let added_b = ds(
+    let added_b = ds_degraded(
         &home_b,
         &home_b,
         &config_b,
@@ -84,7 +85,7 @@ async fn ordinary_commands_converge_two_offline_divergent_machines() {
     assert!(added_b.status.success(), "{}", stderr(&added_b));
     assert!(
         poll_until(Duration::from_secs(60), || {
-            let output = repository_log(&checkout_b, &home_b, &config_b);
+            let output = repository_log_degraded(&checkout_b, &home_b, &config_b);
             output.status.success() && stdout(&output).contains(&commit_a)
         }),
         "machine B did not pull {commit_a}: {}",
@@ -103,17 +104,17 @@ async fn ordinary_commands_converge_two_offline_divergent_machines() {
         SECOND_MACHINE_ID,
         &shared_secret,
     );
-    let based_b = ds(&checkout_b, &home_b, &config_b, &["new", &commit_a]);
+    let based_b = ds_degraded(&checkout_b, &home_b, &config_b, &["new", &commit_a]);
     assert!(based_b.status.success(), "{}", stderr(&based_b));
 
     fs::write(checkout_a.join("offline-a.txt"), "offline machine A\n").unwrap();
-    seal_commit(&checkout_a, &home_a, &config_a, "offline machine A");
-    let offline_a = commit_id(&checkout_a, &home_a, &config_a, "@-");
+    seal_commit_degraded(&checkout_a, &home_a, &config_a, "offline machine A");
+    let offline_a = commit_id_degraded(&checkout_a, &home_a, &config_a, "@-");
     fs::write(checkout_b.join("offline-b.txt"), "offline machine B\n").unwrap();
-    seal_commit(&checkout_b, &home_b, &config_b, "offline machine B");
-    let offline_b = commit_id(&checkout_b, &home_b, &config_b, "@-");
+    seal_commit_degraded(&checkout_b, &home_b, &config_b, "offline machine B");
+    let offline_b = commit_id_degraded(&checkout_b, &home_b, &config_b, "@-");
 
-    let pending = ds(&checkout_a, &home_a, &config_a, &["status"]);
+    let pending = ds_degraded(&checkout_a, &home_a, &config_a, &["status"]);
     assert!(pending.status.success(), "{}", stderr(&pending));
     assert!(
         stderr(&pending).contains("pending upload"),
@@ -131,9 +132,9 @@ async fn ordinary_commands_converge_two_offline_divergent_machines() {
     let expected_commits = [offline_a.as_str(), offline_b.as_str()];
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let log_a = repository_log(&checkout_a, &home_a, &config_a);
+        let log_a = repository_log_degraded(&checkout_a, &home_a, &config_a);
         assert!(log_a.status.success(), "{}", stderr(&log_a));
-        let log_b = repository_log(&checkout_b, &home_b, &config_b);
+        let log_b = repository_log_degraded(&checkout_b, &home_b, &config_b);
         assert!(log_b.status.success(), "{}", stderr(&log_b));
         let heads_a = operation_heads(&entry_a.native_repository_path).await;
         let heads_b = operation_heads(&entry_b.native_repository_path).await;
@@ -156,7 +157,7 @@ async fn ordinary_commands_converge_two_offline_divergent_machines() {
 
     assert!(
         poll_until(Duration::from_secs(60), || {
-            let output = ds(&checkout_a, &home_a, &config_a, &["status"]);
+            let output = ds_degraded(&checkout_a, &home_a, &config_a, &["status"]);
             output.status.success()
                 && stderr(&output)
                     .contains("sync: in sync with cloud as of the last successful sync")
@@ -260,6 +261,100 @@ async fn daemon_polling_converges_without_a_machine_b_command() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
+async fn daemon_restart_drains_one_offline_commit_exactly_once() {
+    let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
+    let shared_secret =
+        std::env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("machine");
+    fs::create_dir_all(&home).unwrap();
+    configure_machine(&home, &base_url, FIRST_MACHINE_ID, &shared_secret);
+    let config = write_cli_config(&home);
+    let repository_name = unique_repository_name(temp.path());
+
+    let created = ds_without_boundary(&home, &home, &config, &["repo", "new", &repository_name]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let checkout = home.join("checkout");
+    let added = ds_without_boundary(
+        &home,
+        &home,
+        &config,
+        &[
+            "add",
+            &repository_name,
+            "-r",
+            "root()",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let synchronized = ds_without_boundary(
+        &home,
+        &home,
+        &config,
+        &["sync", "run", "--repository", &repository_name],
+    );
+    assert!(synchronized.status.success(), "{}", stderr(&synchronized));
+
+    let name = RepositoryName::parse(repository_name.clone()).unwrap();
+    let store = machine_store(&home);
+    let entry = store.resolve(&name).unwrap().unwrap();
+    let sync_store = MachineSyncStore::open(store.repository_sync_path(&entry.identity)).unwrap();
+    assert!(sync_store.load_outbox().unwrap().is_none());
+
+    let daemon = start_daemon(&home, &config);
+    assert!(
+        poll_until(Duration::from_secs(30), || fs::read_to_string(
+            store.root().join("daemon.log")
+        )
+        .is_ok_and(
+            |log| log.contains(&format!("sync `{repository_name}` completed"))
+        )),
+        "initial daemon did not complete its startup pass: {}",
+        fs::read_to_string(store.root().join("daemon.log")).unwrap_or_default()
+    );
+    drop(daemon);
+    let baseline = sync_store.load_state().unwrap();
+
+    fs::write(
+        checkout.join("one-restart-drain.txt"),
+        "one pending commit\n",
+    )
+    .unwrap();
+    seal_commit_without_boundary(
+        &checkout,
+        &home,
+        &config,
+        "one operation across daemon restart",
+    );
+    let expected_heads = operation_head_ids(&entry.native_repository_path).await;
+    assert_eq!(expected_heads.len(), 1);
+    assert_eq!(sync_store.load_state().unwrap(), baseline);
+    assert!(sync_store.load_outbox().unwrap().is_none());
+
+    let restarted = start_daemon(&home, &config);
+    assert!(
+        poll_until(Duration::from_secs(60), || {
+            let state = sync_store.load_state().unwrap();
+            state.accepted_heads == expected_heads && sync_store.load_outbox().unwrap().is_none()
+        }),
+        "restarted daemon did not drain the commit: {}",
+        fs::read_to_string(store.root().join("daemon.log")).unwrap_or_default()
+    );
+    let final_state = sync_store.load_state().unwrap();
+    assert_eq!(final_state.cloud_cursor, baseline.cloud_cursor + 1);
+    assert_eq!(final_state.accepted_heads, expected_heads);
+    assert!(sync_store.load_outbox().unwrap().is_none());
+    assert_eq!(
+        operation_heads(&entry.native_repository_path).await.len(),
+        1
+    );
+    drop(restarted);
+}
+
 fn settings() -> UserSettings {
     let mut config = StackedConfig::with_defaults();
     config.add_layer(
@@ -326,6 +421,33 @@ fn ds(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn ds_degraded(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ds"))
+        .current_dir(cwd)
+        .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
+        .env("JJ_CONFIG", config)
+        .env("DEVSPACE_BOUNDARY_SYNC", "1")
+        .env("DEVSPACE_DAEMON", "0")
+        .env("NO_COLOR", "1")
+        .env("PAGER", "cat")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn ds_without_boundary(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ds"))
+        .current_dir(cwd)
+        .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
+        .env("JJ_CONFIG", config)
+        .env("DEVSPACE_BOUNDARY_SYNC", "0")
+        .env("NO_COLOR", "1")
+        .env("PAGER", "cat")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 #[cfg(unix)]
 fn start_daemon(home: &Path, config: &Path) -> DaemonProcess {
     let socket = machine_store(home).root().join("daemon.sock");
@@ -381,6 +503,20 @@ fn seal_commit(cwd: &Path, home: &Path, config: &Path, description: &str) {
     assert!(sealed.status.success(), "{}", stderr(&sealed));
 }
 
+fn seal_commit_degraded(cwd: &Path, home: &Path, config: &Path, description: &str) {
+    let described = ds_degraded(cwd, home, config, &["describe", "-m", description]);
+    assert!(described.status.success(), "{}", stderr(&described));
+    let sealed = ds_degraded(cwd, home, config, &["new"]);
+    assert!(sealed.status.success(), "{}", stderr(&sealed));
+}
+
+fn seal_commit_without_boundary(cwd: &Path, home: &Path, config: &Path, description: &str) {
+    let described = ds_without_boundary(cwd, home, config, &["describe", "-m", description]);
+    assert!(described.status.success(), "{}", stderr(&described));
+    let sealed = ds_without_boundary(cwd, home, config, &["new"]);
+    assert!(sealed.status.success(), "{}", stderr(&sealed));
+}
+
 fn commit_id(cwd: &Path, home: &Path, config: &Path, revision: &str) -> String {
     let output = ds(
         cwd,
@@ -399,8 +535,26 @@ fn commit_id(cwd: &Path, home: &Path, config: &Path, revision: &str) -> String {
     stdout(&output).trim().to_owned()
 }
 
-fn repository_log(cwd: &Path, home: &Path, config: &Path) -> Output {
-    ds(
+fn commit_id_degraded(cwd: &Path, home: &Path, config: &Path, revision: &str) -> String {
+    let output = ds_degraded(
+        cwd,
+        home,
+        config,
+        &[
+            "log",
+            "-r",
+            revision,
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    stdout(&output).trim().to_owned()
+}
+
+fn repository_log_degraded(cwd: &Path, home: &Path, config: &Path) -> Output {
+    ds_degraded(
         cwd,
         home,
         config,
@@ -430,6 +584,18 @@ async fn operation_heads(repository_path: &Path) -> Vec<String> {
         .collect::<Vec<_>>();
     heads.sort();
     heads
+}
+
+async fn operation_head_ids(repository_path: &Path) -> BTreeSet<[u8; 64]> {
+    let repository = MachineRepository::open(repository_path, &settings())
+        .await
+        .unwrap();
+    repository
+        .current_operation_heads()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
 }
 
 fn sync_log(store: &MachineStore, repository_name: &str) -> String {

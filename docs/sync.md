@@ -424,13 +424,38 @@ frontier match the cloud and no outbox remains.
 
 ## Command-boundary recovery
 
-After each successful repository command, `ds` starts a detached
-`ds sync run --repository <name>` process. Command failures and the plumbing
-command itself do not spawn a sync pass. The engine rediscovers operations from
-jj's stock operation heads even when the sidecar has no outbox entry. It writes
-the exact head request before cloud mutation, so a later boundary can replay an
-interrupted request. The `ds status` sync line reads only the local operation
-heads, accepted heads and outbox. It does not start a transport.
+After each successful repository command, `ds` records every distinct machine
+repository it opened. It sends `sync <name>` to the machine daemon over a
+private local socket with a short bounded connect. A running daemon queues the
+repository once. If the socket is unavailable, `ds` starts `ds daemon run`
+detached, retries the notification for a bounded interval and starts a detached
+`ds sync run --repository <name>` one-shot if notification still fails. The
+command does not wait for Worker I/O. Command failures, `ds daemon` and `ds
+sync` do not create another boundary.
+
+The daemon holds one machine-local singleton lock. It removes a stale socket,
+drains every complete catalog repository on startup, processes notifications,
+polls the catalog for remote work and exits after an idle timeout. Repository
+sync still uses the existing per-repository and sidecar locks, so auto-start
+races and overlapping one-shots are harmless. The exact outbox is written
+before cloud mutation and each accepted entry is removed only after its cloud
+state is durable. SIGKILL can leave a stale socket but cannot remove native
+operations, accepted state or pending requests; restart replaces the socket and
+replays the remaining work idempotently.
+
+`DEVSPACE_DAEMON=0` selects detached one-shots at command boundaries. Windows
+uses the same degraded behavior because the daemon socket is Unix-only.
+`DEVSPACE_BOUNDARY_SYNC=0` disables all boundary work. The engine rediscovers
+operations from jj's stock operation heads even when the sidecar has no outbox,
+so re-enabling either mode at a later command boundary still converges local
+work.
+
+The single `ds status` sync line is unchanged and reads only local operation
+heads, accepted heads and the outbox. `ds sync status` reads the same state for
+every catalog repository, reports incomplete clones and pending counts, and
+adds one `daemon: running` or `daemon: not running` line from a short local
+`ping`. Neither status command constructs an HTTP transport or contacts the
+Worker.
 
 ## Warm latency
 

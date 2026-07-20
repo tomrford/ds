@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,27 @@ fn ds_boundary(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output 
         .unwrap()
 }
 
+fn ds_degraded_boundary(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
+    ds_command(cwd, home, config)
+        .env("DEVSPACE_BOUNDARY_SYNC", "1")
+        .env("DEVSPACE_DAEMON", "0")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn ds_auto_start_boundary(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
+    ds_command(cwd, home, config)
+        .env("DEVSPACE_BOUNDARY_SYNC", "1")
+        .env("DEVSPACE_DAEMON_TEST_HOOKS", "1")
+        .env("DEVSPACE_DAEMON_TEST_POLL_MS", "10000")
+        .env("DEVSPACE_DAEMON_TEST_IDLE_MS", "250")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 fn ds_command(cwd: &Path, home: &Path, config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
     command
@@ -118,6 +139,30 @@ async fn local_repository(root: &Path, name: &str, base_url: &str) -> CatalogEnt
     MachineRepository::init(&entry.native_repository_path, &settings())
         .await
         .unwrap();
+    entry
+}
+
+async fn catalog_repository(
+    root: &Path,
+    name: &str,
+    identity_byte: u8,
+    complete: bool,
+) -> CatalogEntry {
+    let entry = machine_store(root)
+        .register_repository(
+            RepositoryName::parse(name).unwrap(),
+            RepositoryIdentity::new(
+                RepositoryId::parse(format!("{identity_byte:02x}").repeat(32)).unwrap(),
+                RepositoryIncarnation::parse(format!("{:02x}", identity_byte + 1).repeat(16))
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+    if complete {
+        MachineRepository::init(&entry.native_repository_path, &settings())
+            .await
+            .unwrap();
+    }
     entry
 }
 
@@ -345,8 +390,93 @@ async fn status_reports_local_sync_state_even_when_boundary_sync_is_disabled() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn successful_repository_command_spawns_a_silent_detached_sync() {
+async fn sync_status_snapshots_catalog_rows_and_daemon_liveness_from_local_state() {
+    let temp = tempfile::tempdir().unwrap();
+    configure_machine(
+        temp.path(),
+        "http://127.0.0.1:1",
+        FIRST_MACHINE_ID,
+        DEVELOPMENT_SECRET,
+    );
+    let config = write_cli_config(temp.path());
+    let in_sync = catalog_repository(temp.path(), "in-sync", 0x10, true).await;
+    let _incomplete = catalog_repository(temp.path(), "incomplete", 0x20, false).await;
+    let never = catalog_repository(temp.path(), "never", 0x30, true).await;
+    let pending = catalog_repository(temp.path(), "pending", 0x40, true).await;
+    let store = machine_store(temp.path());
+
+    let repository = MachineRepository::open(&pending.native_repository_path, &settings())
+        .await
+        .unwrap();
+    repository
+        .repo()
+        .start_transaction()
+        .commit("pending status fixture")
+        .await
+        .unwrap();
+
+    let accepted_heads = operation_head_ids(&in_sync.native_repository_path).await;
+    MachineSyncStore::open(store.repository_sync_path(&in_sync.identity))
+        .unwrap()
+        .save_state(&SyncState {
+            accepted_heads,
+            ..SyncState::default()
+        })
+        .unwrap();
+    let pending_head = *operation_head_ids(&pending.native_repository_path)
+        .await
+        .first()
+        .unwrap();
+    MachineSyncStore::open(store.repository_sync_path(&pending.identity))
+        .unwrap()
+        .save_outbox(
+            &PendingHeadBatch::from_transactions(vec![
+                PendingHeadTransaction {
+                    idempotency_key: [1; 16],
+                    new_head: pending_head,
+                    observed_heads: BTreeSet::new(),
+                },
+                PendingHeadTransaction {
+                    idempotency_key: [2; 16],
+                    new_head: [7; 64],
+                    observed_heads: BTreeSet::new(),
+                },
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+
+    let stopped = ds(temp.path(), temp.path(), &config, &["sync", "status"]);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert!(stdout(&stopped).is_empty());
+    assert_eq!(
+        stderr(&stopped),
+        concat!(
+            "daemon: not running\n",
+            "in-sync: pending: 0; in sync with cloud as of the last successful sync\n",
+            "incomplete: incomplete clone; pending: 0; never synchronized\n",
+            "never: pending: 1; never synchronized\n",
+            "pending: pending: 2\n",
+        )
+    );
+
+    let _locks = [in_sync, never, pending]
+        .map(|entry| store.try_lock_repository_sync(&entry.identity).unwrap());
+    let mut daemon = spawn_test_daemon(temp.path(), &config, 10_000, 60_000);
+    wait_for_path(&store.root().join("daemon.sock"));
+    let running = ds(temp.path(), temp.path(), &config, &["sync", "status"]);
+    assert!(running.status.success(), "{}", stderr(&running));
+    assert_eq!(
+        stderr(&running),
+        stderr(&stopped).replacen("daemon: not running", "daemon: running", 1)
+    );
+    stop_process(&mut daemon);
+}
+
+#[tokio::test]
+async fn daemon_opt_out_spawns_a_silent_detached_sync() {
     let temp = tempfile::tempdir().unwrap();
     let entry = local_repository(temp.path(), "boundary-offline", "http://127.0.0.1:1").await;
     let config = write_cli_config(temp.path());
@@ -366,7 +496,7 @@ async fn successful_repository_command_spawns_a_silent_detached_sync() {
     assert!(added.status.success(), "{}", stderr(&added));
 
     let started = Instant::now();
-    let output = ds_boundary(
+    let output = ds_degraded_boundary(
         &checkout,
         temp.path(),
         &config,
@@ -396,6 +526,188 @@ async fn successful_repository_command_spawns_a_silent_detached_sync() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn ordinary_read_auto_starts_the_daemon_without_waiting_for_sync() {
+    let temp = tempfile::tempdir().unwrap();
+    let _entry = local_repository(temp.path(), "auto-start", "http://127.0.0.1:1").await;
+    let config = write_cli_config(temp.path());
+    let checkout = temp.path().join("checkout");
+    let added = ds(
+        temp.path(),
+        temp.path(),
+        &config,
+        &[
+            "add",
+            "auto-start",
+            "-r",
+            "root()",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+
+    let started = Instant::now();
+    let output = ds_auto_start_boundary(
+        &checkout,
+        temp.path(),
+        &config,
+        &["log", "-r", "root()", "--no-graph"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "repository read waited for daemon startup or sync: {:?}",
+        started.elapsed()
+    );
+    for visible_output in [stdout(&output), stderr(&output)] {
+        assert!(!visible_output.contains("error sending request"));
+        assert!(!visible_output.contains("synchroniz"));
+    }
+
+    let store = machine_store(temp.path());
+    let daemon_log = store.root().join("daemon.log");
+    assert!(
+        poll_until(Duration::from_secs(3), || fs::read_to_string(&daemon_log)
+            .is_ok_and(|log| log.contains("sync `auto-start` started"))),
+        "auto-started daemon did not receive the boundary: {}",
+        fs::read_to_string(&daemon_log).unwrap_or_default()
+    );
+    assert!(
+        poll_until(Duration::from_secs(3), || fs::read_to_string(&daemon_log)
+            .is_ok_and(|log| log.contains("daemon exiting after idle timeout"))),
+        "auto-started daemon did not exit after its test idle timeout: {}",
+        fs::read_to_string(&daemon_log).unwrap_or_default()
+    );
+    assert!(!store.root().join("daemon.sock").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_daemon_start_falls_back_to_the_detached_one_shot() {
+    let temp = tempfile::tempdir().unwrap();
+    let entry = local_repository(temp.path(), "fallback", "http://127.0.0.1:1").await;
+    let config = write_cli_config(temp.path());
+    let checkout = temp.path().join("checkout");
+    let added = ds(
+        temp.path(),
+        temp.path(),
+        &config,
+        &[
+            "add",
+            "fallback",
+            "-r",
+            "root()",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    fs::create_dir(machine_store(temp.path()).root().join("daemon.sock")).unwrap();
+
+    let output = ds_auto_start_boundary(
+        &checkout,
+        temp.path(),
+        &config,
+        &["log", "-r", "root()", "--no-graph"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let sync_log = entry
+        .native_repository_path
+        .parent()
+        .unwrap()
+        .join("sync.log");
+    assert!(
+        poll_until(Duration::from_secs(3), || fs::read_to_string(&sync_log)
+            .is_ok_and(|log| log.contains("error sending request"))),
+        "lost boundary did not fall back to a one-shot: {}",
+        fs::read_to_string(&sync_log).unwrap_or_default()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigkill_and_restart_preserve_pending_local_work_and_recover_the_socket() {
+    let temp = tempfile::tempdir().unwrap();
+    let entry = local_repository(temp.path(), "kill-survival", "http://127.0.0.1:1").await;
+    let config = write_cli_config(temp.path());
+    let checkout = temp.path().join("checkout");
+    let added = ds(
+        temp.path(),
+        temp.path(),
+        &config,
+        &[
+            "add",
+            "kill-survival",
+            "-r",
+            "root()",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let store = machine_store(temp.path());
+    let socket = store.root().join("daemon.sock");
+    let daemon_log = store.root().join("daemon.log");
+    let mut daemon = spawn_test_daemon(temp.path(), &config, 10_000, 60_000);
+    wait_for_path(&socket);
+    let startup_attempts = fs::read_to_string(&daemon_log)
+        .unwrap_or_default()
+        .matches("sync `kill-survival` started")
+        .count();
+
+    fs::write(checkout.join("survives-kill.txt"), "durable local work\n").unwrap();
+    seal_commit_boundary(
+        &checkout,
+        temp.path(),
+        &config,
+        "pending across daemon kill",
+    );
+    assert!(
+        poll_until(Duration::from_secs(3), || fs::read_to_string(&daemon_log)
+            .unwrap_or_default()
+            .matches("sync `kill-survival` started")
+            .count()
+            > startup_attempts),
+        "daemon did not attempt the pending operation: {}",
+        fs::read_to_string(&daemon_log).unwrap_or_default()
+    );
+    let heads_before = operation_heads(&entry.native_repository_path).await;
+    let pending_before = ds(&checkout, temp.path(), &config, &["status"]);
+    assert!(
+        stderr(&pending_before).contains("pending upload"),
+        "{}",
+        stderr(&pending_before)
+    );
+
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    assert!(
+        socket.exists(),
+        "SIGKILL unexpectedly cleaned up the socket"
+    );
+
+    let mut restarted = spawn_test_daemon(temp.path(), &config, 10_000, 60_000);
+    assert!(
+        poll_until(Duration::from_secs(3), || {
+            let status = ds(temp.path(), temp.path(), &config, &["sync", "status"]);
+            status.status.success() && stderr(&status).starts_with("daemon: running\n")
+        }),
+        "restarted daemon did not replace the stale socket"
+    );
+    assert!(restarted.try_wait().unwrap().is_none());
+    assert_eq!(
+        operation_heads(&entry.native_repository_path).await,
+        heads_before
+    );
+    let pending_after = ds(&checkout, temp.path(), &config, &["status"]);
+    assert!(
+        stderr(&pending_after).contains("pending upload"),
+        "{}",
+        stderr(&pending_after)
+    );
+    stop_process(&mut restarted);
+}
+
 #[tokio::test]
 async fn removal_from_inside_the_checkout_still_spawns_boundary_sync() {
     let temp = tempfile::tempdir().unwrap();
@@ -418,7 +730,7 @@ async fn removal_from_inside_the_checkout_still_spawns_boundary_sync() {
 
     // Removing the checkout deletes the command's own working directory; the
     // detached sync must still run from a surviving one.
-    let output = ds_boundary(&checkout, temp.path(), &config, &["remove", "."]);
+    let output = ds_degraded_boundary(&checkout, temp.path(), &config, &["remove", "."]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!checkout.exists());
 
@@ -462,7 +774,7 @@ async fn failed_repository_command_does_not_spawn_boundary_sync() {
         .unwrap()
         .join("sync.log");
 
-    let output = ds_boundary(
+    let output = ds_degraded_boundary(
         &checkout,
         temp.path(),
         &config,
@@ -729,15 +1041,9 @@ async fn boundary_sync_uploads_machine_a_without_explicit_sync() {
         }
         assert!(
             Instant::now() < deadline,
-            "machine A boundary sync did not upload {commit_a}; sync log: {}",
-            fs::read_to_string(
-                entry_a
-                    .native_repository_path
-                    .parent()
-                    .unwrap()
-                    .join("sync.log")
-            )
-            .unwrap_or_else(|error| format!("<unavailable: {error}>"))
+            "machine A boundary sync did not upload {commit_a}; daemon log: {}",
+            fs::read_to_string(store_a.root().join("daemon.log"))
+                .unwrap_or_else(|error| format!("<unavailable: {error}>"))
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -866,6 +1172,37 @@ fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
         thread::sleep(Duration::from_millis(10));
     }
     condition()
+}
+
+#[cfg(unix)]
+fn spawn_test_daemon(root: &Path, config: &Path, poll_ms: u64, idle_ms: u64) -> Child {
+    ds_command(root, root, config)
+        .env("DEVSPACE_DAEMON_TEST_HOOKS", "1")
+        .env("DEVSPACE_DAEMON_TEST_POLL_MS", poll_ms.to_string())
+        .env("DEVSPACE_DAEMON_TEST_IDLE_MS", idle_ms.to_string())
+        .args(["daemon", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn wait_for_path(path: &Path) {
+    assert!(
+        poll_until(Duration::from_secs(3), || path.exists()),
+        "path did not appear: {}",
+        path.display()
+    );
+}
+
+#[cfg(unix)]
+fn stop_process(child: &mut Child) {
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+    }
+    child.wait().unwrap();
 }
 
 fn snapshot_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {

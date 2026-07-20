@@ -27,6 +27,8 @@ enum SyncCommand {
         #[arg(long)]
         repository: String,
     },
+    /// Show local synchronization state for every catalog repository.
+    Status,
 }
 
 pub(crate) async fn run_sync(
@@ -36,6 +38,7 @@ pub(crate) async fn run_sync(
 ) -> Result<(), CommandError> {
     match args.command {
         SyncCommand::Run { repository } => sync_repository(ui, command, repository).await,
+        SyncCommand::Status => crate::sync_status::write_catalog_status(ui, command).await,
     }
 }
 

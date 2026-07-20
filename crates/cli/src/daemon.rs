@@ -3,6 +3,7 @@ mod platform {
     use std::collections::{BTreeSet, VecDeque};
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, BufRead as _, Read as _, Write as _};
+    use std::os::fd::OwnedFd;
     use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -14,6 +15,11 @@ mod platform {
     use jj_cli::cli_util::CommandHelper;
     use jj_cli::command_error::{CommandError, user_error};
     use jj_cli::ui::Ui;
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use rustix::io::Errno;
+    use rustix::net::sockopt::socket_error;
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect, socket};
 
     use crate::checkout::reject_unsupported_global_options;
     use crate::sync::{SyncRun, run_sync_entry};
@@ -25,6 +31,60 @@ mod platform {
     const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
     const LOOP_INTERVAL: Duration = Duration::from_millis(25);
     const MAX_NOTIFICATION_BYTES: u64 = 512;
+    const CLIENT_TIMEOUT: Duration = Duration::from_millis(25);
+
+    pub(crate) const SUPPORTED: bool = true;
+
+    pub(crate) fn notify_sync(store: &MachineStore, name: &RepositoryName) -> bool {
+        let Some(mut stream) = connect_to_daemon(store) else {
+            return false;
+        };
+        writeln!(stream, "sync {name}").is_ok()
+    }
+
+    pub(crate) fn is_running(store: &MachineStore) -> bool {
+        let Some(mut stream) = connect_to_daemon(store) else {
+            return false;
+        };
+        if stream.write_all(b"ping\n").is_err() {
+            return false;
+        }
+        let mut response = String::new();
+        io::BufReader::new(stream)
+            .read_line(&mut response)
+            .is_ok_and(|bytes| bytes > 0 && response == "pong\n")
+    }
+
+    fn connect_to_daemon(store: &MachineStore) -> Option<UnixStream> {
+        let fd = socket(AddressFamily::UNIX, SocketType::STREAM, None).ok()?;
+        let flags = fcntl_getfl(&fd).ok()?;
+        fcntl_setfl(&fd, flags | OFlags::NONBLOCK).ok()?;
+        let address = SocketAddrUnix::new(store.root().join(DAEMON_SOCKET_FILE)).ok()?;
+        match connect(&fd, &address) {
+            Ok(()) => {}
+            Err(Errno::INPROGRESS) => {
+                let mut poll_fds = [PollFd::new(&fd, PollFlags::OUT)];
+                let timeout = Timespec {
+                    tv_sec: CLIENT_TIMEOUT.as_secs().try_into().ok()?,
+                    tv_nsec: CLIENT_TIMEOUT.subsec_nanos().into(),
+                };
+                if poll(&mut poll_fds, Some(&timeout)).ok()? == 0 {
+                    return None;
+                }
+                match socket_error(&fd).ok()? {
+                    Ok(()) => {}
+                    Err(_) => return None,
+                }
+            }
+            Err(_) => return None,
+        }
+        let fd: OwnedFd = fd;
+        let stream = UnixStream::from(fd);
+        stream.set_nonblocking(false).ok()?;
+        stream.set_read_timeout(Some(CLIENT_TIMEOUT)).ok()?;
+        stream.set_write_timeout(Some(CLIENT_TIMEOUT)).ok()?;
+        Some(stream)
+    }
 
     // Integration tests opt into short process timers through these hooks. They
     // are deliberately test-prefixed and have no effect unless the marker is set.
@@ -454,9 +514,20 @@ mod platform {
 
 #[cfg(not(unix))]
 mod platform {
+    use devspace_machine::{MachineStore, RepositoryName};
     use jj_cli::cli_util::CommandHelper;
     use jj_cli::command_error::{CommandError, user_error};
     use jj_cli::ui::Ui;
+
+    pub(crate) const SUPPORTED: bool = false;
+
+    pub(crate) fn notify_sync(_store: &MachineStore, _name: &RepositoryName) -> bool {
+        false
+    }
+
+    pub(crate) fn is_running(_store: &MachineStore) -> bool {
+        false
+    }
 
     #[derive(clap::Args)]
     pub(crate) struct DaemonArgs {
@@ -483,4 +554,4 @@ mod platform {
     }
 }
 
-pub(crate) use platform::{DaemonArgs, run_daemon};
+pub(crate) use platform::{DaemonArgs, SUPPORTED, is_running, notify_sync, run_daemon};

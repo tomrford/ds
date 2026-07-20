@@ -68,17 +68,31 @@ demonstrating it end to end is an open gate for machine enrolment.
 ## Offline behavior
 
 Reads and edits in an existing checkout are local jj operations against the
-machine store. After a successful repository command returns, `ds` starts a
-detached sync pass for that repository. The pass uploads local operations and
-installs cloud operations without delaying the command. Work created offline
-converges at later command boundaries that reach the Worker. jj's operation
-merge absorbs divergence created on other machines.
+machine store. After a successful repository command, `ds` notifies the
+machine sync daemon once for each repository the command opened. The local
+socket notification is bounded and the command never waits for cloud work. If
+the daemon is not running, `ds` starts it detached, retries the notification
+briefly and falls back to a detached one-shot sync if startup fails. The daemon
+drains every complete catalog repository on startup, responds to command
+notifications, polls for remote work and exits after an idle timeout. Work
+created offline converges when a later command boundary or daemon poll reaches
+the Worker. jj's operation merge absorbs divergence created on other machines.
+
+Set `DEVSPACE_DAEMON=0` to use detached one-shot sync at command boundaries.
+Windows uses this degraded mode because the local daemon socket is Unix-only.
+Set `DEVSPACE_BOUNDARY_SYNC=0` to disable daemon notification, auto-start and
+one-shots entirely. Local operations and durable pending requests remain in the
+machine store, so a later enabled boundary still converges them.
 
 `ds status` adds one local-only sync line to jj's status output. It reports
 whether the checkout has never synchronized, has operations pending upload, or
 matches the cloud heads recorded by the last successful sync. The indicator
-never contacts the Worker. `ds sync run --repository <name>` is the plumbing
-command used by detached boundary sync and manual recovery.
+never contacts the Worker. `ds sync status` gives the local picture for every
+catalog repository: incomplete clones, pending operation counts and the last
+successful-sync guidance available from the existing sidecar. Its only IPC is
+a short daemon `ping`; it never contacts the Worker. `ds sync run --repository
+<name>` remains the plumbing command used by degraded boundary sync and manual
+recovery.
 
 `ds repo new` requires connectivity because reserving a tenant-local name is a
 global operation on the directory. Offline repository creation is outside the
@@ -201,9 +215,11 @@ Deleting a fully synchronized machine copy and its sync sidecar is recoverable:
 a fresh stock repository downloads the cloud catalog, installs canonical
 objects and resolves to the exact previous operation ID and view.
 
-The same sync engine also runs safely without a daemon. At a later command
-boundary it rediscovers native operations even when no outbox hint was written,
-and it durably replays any exact head request queued by an interrupted boundary.
+The same sync engine runs in the daemon and detached one-shots. At a later
+command boundary it rediscovers native operations even when no outbox hint was
+written, and it durably replays any exact head request queued by an interrupted
+pass. Killing the daemon cannot remove native operations or its durable sync
+sidecar; restart drains the surviving work under the same per-repository lock.
 
 `GitProjection` translates between the native store and a rebuildable bare-Git
 sidecar. Exact hidden paths are removed before excluded leaves are read, and
