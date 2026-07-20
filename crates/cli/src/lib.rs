@@ -2,6 +2,7 @@ mod add;
 mod bare_workspace;
 mod boundary_sync;
 mod checkout;
+mod daemon;
 mod remove;
 mod repo;
 mod sync;
@@ -51,9 +52,10 @@ async fn restrict_bare_repository_commands(
     command: &CommandHelper,
     stock_dispatch: jj_cli::cli_util::BoxedAsyncCliDispatch<'_>,
 ) -> Result<(), CommandError> {
-    // `sync run --repository` deliberately shares jj's global option spelling,
-    // but resolves the value itself through the machine catalog.
-    if command.matches().subcommand_name() == Some("sync") {
+    // Daemon and sync plumbing are workspace-less. `sync run --repository`
+    // deliberately shares jj's global option spelling, but resolves the value
+    // itself through the machine catalog.
+    if matches!(command.matches().subcommand_name(), Some("daemon" | "sync")) {
         return stock_dispatch.call(ui, command).await;
     }
     let repository_selector = REPOSITORY_SELECTOR

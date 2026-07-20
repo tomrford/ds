@@ -9,6 +9,7 @@ use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
 
 use crate::add::{AddArgs, add_checkout};
+use crate::daemon::{DaemonArgs, run_daemon};
 use crate::remove::{RemoveArgs, remove_checkout};
 use crate::sync::{SyncArgs, run_sync};
 
@@ -18,6 +19,8 @@ pub(crate) enum DevspaceCommand {
     Add(AddArgs),
     /// Remove a disposable checkout while preserving its repository.
     Remove(RemoveArgs),
+    #[command(hide = true)]
+    Daemon(DaemonArgs),
     /// Manage cloud repositories.
     Repo(RepoArgs),
     #[command(hide = true)]
@@ -44,6 +47,10 @@ pub(crate) async fn run(
     match args {
         DevspaceCommand::Add(args) => add_checkout(ui, command, args).await,
         DevspaceCommand::Remove(args) => remove_checkout(ui, command, args).await,
+        DevspaceCommand::Daemon(args) => {
+            crate::boundary_sync::suppress();
+            run_daemon(ui, command, args).await
+        }
         DevspaceCommand::Repo(RepoArgs {
             command: RepoCommand::New { name },
         }) => create_empty_repository(ui, command, name).await,

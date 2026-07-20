@@ -1,0 +1,269 @@
+#![cfg(unix)]
+
+use std::fs;
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::net::Shutdown;
+use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use devspace_machine::{
+    CatalogEntry, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository,
+    MachineStore, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
+    SharedSecret,
+};
+use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::settings::UserSettings;
+
+const MACHINE_ID: &str = "12121212121212121212121212121212";
+const DEVELOPMENT_SECRET: &str = "cli-development-secret";
+
+#[tokio::test]
+async fn daemon_rebinds_stale_socket_is_singleton_and_serves_protocol_privately() {
+    let temp = tempfile::tempdir().unwrap();
+    configure_machine(temp.path(), "http://127.0.0.1:1");
+    let config = write_cli_config(temp.path());
+    let store = machine_store(temp.path());
+    let socket = store.root().join("daemon.sock");
+    fs::write(&socket, "stale socket sentinel\n").unwrap();
+    fs::write(store.root().join("daemon.log"), "stale log sentinel\n").unwrap();
+
+    let mut daemon = spawn_daemon(temp.path(), &config, 10_000, 10_000);
+    wait_for_socket(&socket);
+    assert_eq!(ping(&socket), "pong\n");
+
+    let second = daemon_command(temp.path(), &config, 10_000, 10_000)
+        .output()
+        .unwrap();
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert_eq!(
+        stderr(&second),
+        "The devspace daemon is already running; exiting.\n"
+    );
+
+    notify(&socket, "sync missing-repository\n");
+    let log_path = store.root().join("daemon.log");
+    assert!(
+        poll_until(Duration::from_secs(3), || read(&log_path).contains(
+            "unknown repository `missing-repository` in notification"
+        )),
+        "{}",
+        read(&log_path)
+    );
+    assert!(!read(&log_path).contains("stale log sentinel"));
+    assert!(daemon.try_wait().unwrap().is_none());
+
+    assert_eq!(
+        fs::metadata(store.root()).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let socket_metadata = fs::symlink_metadata(&socket).unwrap();
+    assert!(socket_metadata.file_type().is_socket());
+    assert_eq!(socket_metadata.permissions().mode() & 0o777, 0o600);
+
+    stop(&mut daemon);
+}
+
+#[tokio::test]
+async fn sync_notification_triggers_a_daemon_sync_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let entry = local_repository(temp.path(), "notified").await;
+    let config = write_cli_config(temp.path());
+    let socket = machine_store(temp.path()).root().join("daemon.sock");
+    let log_path = machine_store(temp.path()).root().join("daemon.log");
+    let mut daemon = spawn_daemon(temp.path(), &config, 10_000, 10_000);
+    wait_for_socket(&socket);
+
+    assert!(
+        poll_until(Duration::from_secs(3), || sync_attempts(
+            &log_path, "notified"
+        ) >= 1),
+        "startup drain did not attempt synchronization: {}",
+        read(&log_path)
+    );
+    let startup_attempts = sync_attempts(&log_path, "notified");
+    notify(&socket, "sync notified\n");
+    assert!(
+        poll_until(Duration::from_secs(3), || sync_attempts(
+            &log_path, "notified"
+        ) > startup_attempts),
+        "notification did not trigger synchronization: {}",
+        read(&log_path)
+    );
+    assert!(
+        read(&log_path).contains("error sending request"),
+        "{}",
+        read(&log_path)
+    );
+    assert!(entry.native_repository_path.is_dir());
+
+    stop(&mut daemon);
+}
+
+#[test]
+fn daemon_exits_when_idle_despite_polling_and_removes_its_socket() {
+    let temp = tempfile::tempdir().unwrap();
+    configure_machine(temp.path(), "http://127.0.0.1:1");
+    let config = write_cli_config(temp.path());
+    let store = machine_store(temp.path());
+    let socket = store.root().join("daemon.sock");
+
+    let output = daemon_command(temp.path(), &config, 20, 150)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!socket.exists());
+    assert!(read(&store.root().join("daemon.log")).contains("daemon exiting after idle timeout"));
+}
+
+fn settings() -> UserSettings {
+    let mut config = StackedConfig::with_defaults();
+    config.add_layer(
+        ConfigLayer::parse(
+            ConfigSource::User,
+            r#"
+                [user]
+                name = "Devspace Test"
+                email = "devspace@example.invalid"
+            "#,
+        )
+        .unwrap(),
+    );
+    UserSettings::from_config(config).unwrap()
+}
+
+async fn local_repository(root: &Path, name: &str) -> CatalogEntry {
+    configure_machine(root, "http://127.0.0.1:1");
+    let store = machine_store(root);
+    let entry = store
+        .register_repository(
+            RepositoryName::parse(name).unwrap(),
+            RepositoryIdentity::new(
+                RepositoryId::parse("ab".repeat(32)).unwrap(),
+                RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
+            ),
+        )
+        .unwrap();
+    MachineRepository::init(&entry.native_repository_path, &settings())
+        .await
+        .unwrap();
+    entry
+}
+
+fn machine_store(root: &Path) -> MachineStore {
+    MachineStore::new(root.join("machine-store"))
+}
+
+fn configure_machine(root: &Path, base_url: &str) {
+    machine_store(root)
+        .write_config(
+            &MachineConfig::new(
+                base_url,
+                MachineId::parse(MACHINE_ID).unwrap(),
+                SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+fn write_cli_config(root: &Path) -> PathBuf {
+    let path = root.join("jj-config.toml");
+    fs::write(
+        &path,
+        r#"
+            [user]
+            name = "Devspace Test"
+            email = "devspace@example.invalid"
+
+            [ui]
+            color = "never"
+        "#,
+    )
+    .unwrap();
+    path
+}
+
+fn daemon_command(root: &Path, config: &Path, poll_ms: u64, idle_ms: u64) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
+    command
+        .current_dir(root)
+        .env(MACHINE_STORE_OVERRIDE, root.join("machine-store"))
+        .env("JJ_CONFIG", config)
+        .env("DEVSPACE_BOUNDARY_SYNC", "0")
+        .env("DEVSPACE_DAEMON_TEST_HOOKS", "1")
+        .env("DEVSPACE_DAEMON_TEST_POLL_MS", poll_ms.to_string())
+        .env("DEVSPACE_DAEMON_TEST_IDLE_MS", idle_ms.to_string())
+        .env("NO_COLOR", "1")
+        .env("PAGER", "cat")
+        .args(["daemon", "run"]);
+    command
+}
+
+fn spawn_daemon(root: &Path, config: &Path, poll_ms: u64, idle_ms: u64) -> Child {
+    daemon_command(root, config, poll_ms, idle_ms)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+fn wait_for_socket(path: &Path) {
+    assert!(
+        poll_until(Duration::from_secs(10), || fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.file_type().is_socket())),
+        "daemon socket did not appear at {}",
+        path.display()
+    );
+}
+
+fn ping(path: &Path) -> String {
+    let mut stream = UnixStream::connect(path).unwrap();
+    stream.write_all(b"ping\n").unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    response
+}
+
+fn notify(path: &Path, line: &str) {
+    let mut stream = UnixStream::connect(path).unwrap();
+    stream.write_all(line.as_bytes()).unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+}
+
+fn sync_attempts(path: &Path, name: &str) -> usize {
+    read(path)
+        .matches(&format!("sync `{name}` started"))
+        .count()
+}
+
+fn read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|error| format!("<unavailable: {error}>"))
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn stop(child: &mut Child) {
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+    }
+    child.wait().unwrap();
+}
+
+fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    condition()
+}

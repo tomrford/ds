@@ -3,12 +3,13 @@ use std::io::Write as _;
 use std::path::Path;
 
 use devspace_machine::{
-    HttpTransport, MachineConfig, MachineRepository, MachineStore, MachineStoreError,
+    CatalogEntry, HttpTransport, MachineConfig, MachineRepository, MachineStore, MachineStoreError,
     MachineSyncStore, RepositoryIdentity, RepositoryName, SyncEngine, SyncEngineError,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
+use jj_lib::settings::UserSettings;
 
 use crate::checkout::reject_unsupported_global_options;
 
@@ -54,45 +55,62 @@ async fn sync_repository(
                 "Repository `{name}` is not present in this machine store."
             ))
         })?;
-    if !entry.native_repository_path.exists() {
-        return Err(user_error(format!(
-            "Repository `{name}` has an incomplete clone; run `ds add` again to finish it."
-        )));
-    }
-    if !crate::bare_workspace::is_stock_bare_repository(&entry.native_repository_path) {
-        return Err(user_error(format!(
-            "Repository `{name}` is registered locally, but its native repository is invalid."
-        )));
-    }
-
-    let _guard = match store.try_lock_repository_sync(&entry.identity) {
-        Ok(guard) => guard,
-        Err(MachineStoreError::RepositorySyncAlreadyLocked { .. }) => {
+    match run_sync_entry(&store, &entry, command.settings()).await {
+        Ok(SyncRun::Completed) => Ok(()),
+        Ok(SyncRun::AlreadyLocked) => {
             // A concurrent run owns the durable outbox. Operations recorded after
             // its upload phase remain local and are discovered by the next run.
             writeln!(
                 ui.status(),
                 "Repository `{name}` is already being synchronized; skipping."
             )?;
-            return Ok(());
+            Ok(())
         }
-        Err(error) => return Err(user_error(error.to_string())),
-    };
+        Err(error) => Err(user_error(error)),
+    }
+}
 
-    let config = store
-        .load_config()
-        .map_err(|error| user_error(error.to_string()))?;
-    let mut repository = MachineRepository::open(&entry.native_repository_path, command.settings())
+pub(crate) enum SyncRun {
+    Completed,
+    AlreadyLocked,
+}
+
+pub(crate) async fn run_sync_entry(
+    store: &MachineStore,
+    entry: &CatalogEntry,
+    settings: &UserSettings,
+) -> Result<SyncRun, String> {
+    let name = &entry.name;
+    if !entry.native_repository_path.exists() {
+        return Err(format!(
+            "Repository `{name}` has an incomplete clone; run `ds add` again to finish it."
+        ));
+    }
+    if !crate::bare_workspace::is_stock_bare_repository(&entry.native_repository_path) {
+        return Err(format!(
+            "Repository `{name}` is registered locally, but its native repository is invalid."
+        ));
+    }
+
+    let _guard = match store.try_lock_repository_sync(&entry.identity) {
+        Ok(guard) => guard,
+        Err(MachineStoreError::RepositorySyncAlreadyLocked { .. }) => {
+            return Ok(SyncRun::AlreadyLocked);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let config = store.load_config().map_err(|error| error.to_string())?;
+    let mut repository = MachineRepository::open(&entry.native_repository_path, settings)
         .await
-        .map_err(|error| user_error(error.to_string()))?;
+        .map_err(|error| error.to_string())?;
     run_sync_engine(
         &config,
         &entry.identity,
         &mut repository,
         &store.repository_sync_path(&entry.identity),
         &store.repository_packs_path(&entry.identity),
-    )
-    .map_err(user_error)
+    )?;
+    Ok(SyncRun::Completed)
 }
 
 pub(crate) fn run_sync_engine(

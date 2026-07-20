@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -166,6 +166,100 @@ async fn ordinary_commands_converge_two_offline_divergent_machines() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
+async fn daemon_polling_converges_without_a_machine_b_command() {
+    let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
+    let shared_secret =
+        std::env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
+    let temp = tempfile::tempdir().unwrap();
+    let home_a = temp.path().join("machine-a");
+    let home_b = temp.path().join("machine-b");
+    fs::create_dir_all(&home_a).unwrap();
+    fs::create_dir_all(&home_b).unwrap();
+    configure_machine(&home_a, &base_url, FIRST_MACHINE_ID, &shared_secret);
+    configure_machine(&home_b, &base_url, SECOND_MACHINE_ID, &shared_secret);
+    let config_a = write_cli_config(&home_a);
+    let config_b = write_cli_config(&home_b);
+    let repository_name = unique_repository_name(temp.path());
+
+    let created = ds(
+        &home_a,
+        &home_a,
+        &config_a,
+        &["repo", "new", &repository_name],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let checkout_a = home_a.join("checkout");
+    let added_a = ds(
+        &home_a,
+        &home_a,
+        &config_a,
+        &[
+            "add",
+            &repository_name,
+            "-r",
+            "root()",
+            checkout_a.to_str().unwrap(),
+        ],
+    );
+    assert!(added_a.status.success(), "{}", stderr(&added_a));
+
+    let name = RepositoryName::parse(repository_name.clone()).unwrap();
+    let store_a = machine_store(&home_a);
+    let entry_a = store_a.resolve(&name).unwrap().unwrap();
+    let store_b = machine_store(&home_b);
+    let entry_b = store_b
+        .register_repository(name, entry_a.identity.clone())
+        .unwrap();
+    MachineRepository::init(&entry_b.native_repository_path, &settings())
+        .await
+        .unwrap();
+
+    let _daemon = start_daemon(&home_b, &config_b);
+    let baseline_a = operation_heads(&entry_a.native_repository_path).await;
+    let baseline_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let heads_b = operation_heads(&entry_b.native_repository_path).await;
+        if heads_b == baseline_a {
+            break;
+        }
+        assert!(
+            Instant::now() < baseline_deadline,
+            "machine B daemon did not drain startup work; A heads: {baseline_a:?}; B heads: {heads_b:?}; daemon log: {}",
+            fs::read_to_string(store_b.root().join("daemon.log"))
+                .unwrap_or_else(|error| format!("<unavailable: {error}>"))
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    fs::write(checkout_a.join("from-daemon-a.txt"), "machine A\n").unwrap();
+    seal_commit(&checkout_a, &home_a, &config_a, "daemon polling machine A");
+    let commit_a = commit_id(&checkout_a, &home_a, &config_a, "@-");
+    let operation_a = operation_heads(&entry_a.native_repository_path)
+        .await
+        .into_iter()
+        .next()
+        .expect("machine A has an operation head");
+    assert!(!baseline_a.contains(&operation_a));
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let heads_b = operation_heads(&entry_b.native_repository_path).await;
+        if heads_b.contains(&operation_a) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "machine B did not receive operation {operation_a} for commit {commit_a} without a B command; B heads: {heads_b:?}; daemon log: {}",
+            fs::read_to_string(store_b.root().join("daemon.log"))
+                .unwrap_or_else(|error| format!("<unavailable: {error}>"))
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn settings() -> UserSettings {
     let mut config = StackedConfig::with_defaults();
     config.add_layer(
@@ -230,6 +324,46 @@ fn ds(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+#[cfg(unix)]
+fn start_daemon(home: &Path, config: &Path) -> DaemonProcess {
+    let socket = machine_store(home).root().join("daemon.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_ds"))
+        .current_dir(home)
+        .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
+        .env("JJ_CONFIG", config)
+        .env("DEVSPACE_BOUNDARY_SYNC", "0")
+        .env("DEVSPACE_DAEMON_TEST_HOOKS", "1")
+        .env("DEVSPACE_DAEMON_TEST_POLL_MS", "100")
+        .env("DEVSPACE_DAEMON_TEST_IDLE_MS", "60000")
+        .env("NO_COLOR", "1")
+        .env("PAGER", "cat")
+        .args(["daemon", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(
+        poll_until(Duration::from_secs(10), || socket.exists()),
+        "daemon socket did not appear at {}",
+        socket.display()
+    );
+    DaemonProcess(child)
+}
+
+#[cfg(unix)]
+struct DaemonProcess(Child);
+
+#[cfg(unix)]
+impl Drop for DaemonProcess {
+    fn drop(&mut self) {
+        if self.0.try_wait().unwrap().is_none() {
+            self.0.kill().unwrap();
+        }
+        self.0.wait().unwrap();
+    }
 }
 
 fn stdout(output: &Output) -> String {
