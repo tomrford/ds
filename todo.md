@@ -1,5 +1,15 @@
 # Open items
 
+- No `ds setup`/`ds login` verb: machine `config.json` (platform data dir,
+  0600, `{version, base_url, machine_id, shared_secret}`) is written by hand.
+  Needs a verb that generates the machine id, validates the URL/secret against
+  the Worker, and writes the file atomically.
+- Release binaries built inside `nix develop` link libiconv from the build
+  machine's nix store and fail on hosts without it. Fixed today by
+  `install_name_tool -change ... /usr/lib/libiconv.2.dylib` + ad-hoc codesign;
+  a real distribution story (static iconv, nix-built portable bundle, or an
+  OCI/server image for self-host) is a checkpoint-8 decision.
+
 - `ds remove` refuses a checkout that was moved with `mv`: the marker's
   workspace name no longer matches the digest of the new path, and the error
   reports "not a Devspace checkout" without naming the mismatch. Either support
