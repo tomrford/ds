@@ -113,10 +113,20 @@ interface ActiveStateRow extends Record<string, SqlStorageValue> {
   hidden_set_id: ArrayBuffer | null;
 }
 
+interface ActiveLineageRow extends Record<string, SqlStorageValue> {
+  git_oid: ArrayBuffer;
+  canonical_commit_id: ArrayBuffer;
+  hidden_set_id: ArrayBuffer | null;
+}
+
 interface MissingObjectRow extends Record<string, SqlStorageValue> {
   kind: number;
   id: ArrayBuffer;
 }
+
+const REPLAY_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+const MAX_REPLAY_RESULTS = 65_536;
+const PRUNE_BATCH = 256;
 
 class ProjectionStoreError extends Error {
   constructor(
@@ -452,8 +462,14 @@ export class ProjectionStore {
             "projection-ref-limit",
           );
         }
+        this.requireExpectedCursors(
+          request.remote,
+          request.updates.map((update) => ({
+            bookmark: update.bookmark,
+            expected: update.expectedOldOid,
+          })),
+        );
         for (const update of request.updates) {
-          this.requireExpectedCursor(request.remote, update.bookmark, update.expectedOldOid);
           for (const state of update.states) this.requireDurableState(state);
         }
         const fence = this.nextFence(meta);
@@ -470,11 +486,12 @@ export class ProjectionStore {
           const stateIds: number[] = [];
           for (const state of update.states) {
             this.storeReceipt(state.gitOid, state.publicCommitId);
-            this.sql.exec(
+            const inserted = this.sql.exec<{ state_id: number }>(
               `INSERT INTO projection_states
                (remote, bookmark, git_oid, canonical_commit_id, public_commit_id,
                 hidden_set_id, pending_batch_id, activation_seq)
-               VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+               VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+               RETURNING state_id`,
               request.remote,
               update.bookmark,
               exactBuffer(state.gitOid),
@@ -482,11 +499,8 @@ export class ProjectionStore {
               exactBuffer(state.publicCommitId),
               state.hiddenSetId === null ? null : exactBuffer(state.hiddenSetId),
               batchId,
-            );
-            stateIds.push(
-              this.sql.exec<{ id: number }>("SELECT last_insert_rowid() AS id").one()
-                .id,
-            );
+            ).one();
+            stateIds.push(inserted.state_id);
           }
           const proposedStateId =
             update.proposedState === null ? null : stateIds[update.proposedState];
@@ -533,7 +547,12 @@ export class ProjectionStore {
     const incarnation = exactBuffer(request.incarnation);
     const fetchId = exactBuffer(request.fetchId);
     const requestHash = exactBuffer(this.kernel.hash([canonicalFetchBytes(request)]));
+    const nowMs = Date.now();
     try {
+      this.ctx.storage.transactionSync(() => {
+        this.requireIncarnation(incarnation, "repository-incarnation-mismatch");
+        this.pruneExpiredFetchResults(nowMs - REPLAY_RETENTION_MS);
+      });
       return this.ctx.storage.transactionSync(() => {
         // 1. A completed fetch is the idempotency record and response payload.
         const recorded = this.fetchResult(fetchId);
@@ -560,19 +579,24 @@ export class ProjectionStore {
             "remote-not-found",
           );
         }
+        this.requireReplayCapacity("fetch");
         // 2. Fetch observes the exact last accepted state for every ref.
-        for (const ref of request.refs) {
-          this.requireExpectedCursor(
-            request.remote,
-            ref.bookmark,
-            ref.expectedCursorOid,
-            "fetch-cursor-stale",
-          );
-        }
+        this.requireExpectedCursors(
+          request.remote,
+          request.refs.map((ref) => ({
+            bookmark: ref.bookmark,
+            expected: ref.expectedCursorOid,
+          })),
+          "fetch-cursor-stale",
+        );
 
         // 3. Push recovery owns any ref it has quarantined.
+        const pendingBookmarks = this.pendingPushBookmarks(
+          request.remote,
+          request.refs.map((ref) => ref.bookmark),
+        );
         for (const ref of request.refs) {
-          if (this.hasPendingPush(request.remote, ref.bookmark)) {
+          if (pendingBookmarks.has(ref.bookmark)) {
             throw new ProjectionStoreError(
               `fetch overlaps a pending push for ${request.remote}/${ref.bookmark}`,
               409,
@@ -642,11 +666,12 @@ export class ProjectionStore {
               throw new Error("projection activation cursor exceeds the safe integer range");
             }
             activation += 1;
-            this.sql.exec(
+            const inserted = this.sql.exec<{ state_id: number }>(
               `INSERT INTO projection_states
                (remote, bookmark, git_oid, canonical_commit_id, public_commit_id,
                 hidden_set_id, pending_batch_id, activation_seq)
-               VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+               VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+               RETURNING state_id`,
               request.remote,
               ref.bookmark,
               exactBuffer(state.gitOid),
@@ -654,10 +679,8 @@ export class ProjectionStore {
               exactBuffer(state.publicCommitId),
               state.hiddenSetId === null ? null : exactBuffer(state.hiddenSetId),
               activation,
-            );
-            stateIds.push(
-              this.sql.exec<{ id: number }>("SELECT last_insert_rowid() AS id").one().id,
-            );
+            ).one();
+            stateIds.push(inserted.state_id);
           }
           const proposedStateId =
             ref.proposedState === null
@@ -677,11 +700,14 @@ export class ProjectionStore {
           activation,
         );
         this.sql.exec(
-          "INSERT INTO projection_fetch_results VALUES (?, ?, ?, ?)",
+          `INSERT INTO projection_fetch_results
+           (fetch_id, remote, request_hash, activation_cursor, created_at_ms)
+           VALUES (?, ?, ?, ?, ?)`,
           fetchId,
           request.remote,
           requestHash,
           activation,
+          nowMs,
         );
         return {
           ok: true as const,
@@ -707,6 +733,17 @@ export class ProjectionStore {
     try {
       return this.ctx.storage.transactionSync(() => {
         this.requireIncarnation(exactBuffer(request.incarnation));
+        const result = this.batchResult(batchId);
+        if (result !== undefined) {
+          return {
+            ok: true as const,
+            pending: false,
+            fence: result.final_fence,
+            outcome: result.outcome,
+          };
+        }
+        // Once retention removes a finished result, claim follows its normal
+        // non-replay path and returns projection-batch-not-found.
         const batch = this.requireBatch(batchId);
         const fence = this.nextFence(this.meta());
         this.sql.exec(
@@ -727,38 +764,52 @@ export class ProjectionStore {
   }
 
   recover(batchIdValue: unknown, value: unknown, authenticatedMachineId: string) {
-    return this.withFence(batchIdValue, value, decodeRecoverProjectionBatch, authenticatedMachineId, (batchId, request) => {
-      const replay = this.replayFinished(batchId, request);
-      if (replay !== undefined) return replay;
-      this.requireFence(batchId, request);
-      const refs = this.batchRefs(batchId);
-      this.requireObservationSet(refs, request.observations);
-      let allProposed = true;
-      let allExpected = true;
-      for (const [index, ref] of refs.entries()) {
-        const observed = request.observations[index].liveOid;
-        const proposed = ref.proposed_git_oid === null ? null : new Uint8Array(ref.proposed_git_oid);
-        const expected = ref.expected_old_oid === null ? null : new Uint8Array(ref.expected_old_oid);
-        allProposed &&= compareNullableBytes(observed, proposed) === 0;
-        allExpected &&= compareNullableBytes(observed, expected) === 0;
-      }
-      if (allProposed) return this.finish(batchId, request.fence, "accepted");
-      if (allExpected && this.isRecoveryClaimed(batchId)) {
+    return this.withFence(
+      batchIdValue,
+      value,
+      decodeRecoverProjectionBatch,
+      authenticatedMachineId,
+      (batchId, request, nowMs) => {
+        const replay = this.replayFinished(batchId, request);
+        if (replay !== undefined) return replay;
+        this.requireFence(batchId, request);
+        const refs = this.batchRefs(batchId);
+        this.requireObservationSet(refs, request.observations);
+        let allProposed = true;
+        let allExpected = true;
+        for (const [index, ref] of refs.entries()) {
+          const observed = request.observations[index].liveOid;
+          const proposed =
+            ref.proposed_git_oid === null
+              ? null
+              : new Uint8Array(ref.proposed_git_oid);
+          const expected =
+            ref.expected_old_oid === null
+              ? null
+              : new Uint8Array(ref.expected_old_oid);
+          allProposed &&= compareNullableBytes(observed, proposed) === 0;
+          allExpected &&= compareNullableBytes(observed, expected) === 0;
+        }
+        if (allProposed) {
+          return this.finish(batchId, request.fence, "accepted", nowMs);
+        }
+        if (allExpected && this.isRecoveryClaimed(batchId)) {
+          throw new ProjectionStoreError(
+            "claimed projection batch still matches its expected refs; replay the exact push before recovery",
+            409,
+            "projection-replay-required",
+          );
+        }
+        if (allExpected) {
+          return this.finish(batchId, request.fence, "aborted", nowMs);
+        }
         throw new ProjectionStoreError(
-          "claimed projection batch still matches its expected refs; replay the exact push before recovery",
+          "remote refs are mixed or ambiguous; projection batch remains quarantined",
           409,
-          "projection-replay-required",
+          "projection-remote-state-ambiguous",
         );
-      }
-      if (allExpected) {
-        return this.finish(batchId, request.fence, "aborted");
-      }
-      throw new ProjectionStoreError(
-        "remote refs are mixed or ambiguous; projection batch remains quarantined",
-        409,
-        "projection-remote-state-ambiguous",
-      );
-    });
+      },
+    );
   }
 
   private isRecoveryClaimed(batchId: ArrayBuffer) {
@@ -777,7 +828,7 @@ export class ProjectionStore {
     value: unknown,
     decode: (value: unknown) => T,
     authenticatedMachineId: string,
-    operation: (batchId: ArrayBuffer, request: T) => unknown,
+    operation: (batchId: ArrayBuffer, request: T, nowMs: number) => unknown,
   ) {
     let batchId: ArrayBuffer;
     let request: T;
@@ -788,18 +839,29 @@ export class ProjectionStore {
     } catch (error) {
       return requestFailure(error, "invalid-projection-request");
     }
+    const nowMs = Date.now();
     try {
+      this.ctx.storage.transactionSync(() => {
+        this.requireIncarnation(exactBuffer(request.incarnation));
+        this.pruneExpiredBatchResults(nowMs - REPLAY_RETENTION_MS);
+      });
       return this.ctx.storage.transactionSync(() => {
         this.requireIncarnation(exactBuffer(request.incarnation));
-        return operation(batchId, request);
+        return operation(batchId, request, nowMs);
       });
     } catch (error) {
       return this.handleExpected(error);
     }
   }
 
-  private finish(batchId: ArrayBuffer, fence: number, outcome: "accepted" | "aborted") {
+  private finish(
+    batchId: ArrayBuffer,
+    fence: number,
+    outcome: "accepted" | "aborted",
+    nowMs: number,
+  ) {
     const batch = this.requireBatch(batchId);
+    this.requireReplayCapacity("batch");
     if (outcome === "accepted") {
       let activation = this.meta().activation_cursor;
       const drafts = this.sql
@@ -859,7 +921,7 @@ export class ProjectionStore {
       batch.request_hash,
       fence,
       outcome,
-      Date.now(),
+      nowMs,
     );
     return { ok: true as const, pending: false, fence, outcome };
   }
@@ -1028,28 +1090,34 @@ export class ProjectionStore {
     );
   }
 
-  private requireExpectedCursor(
+  private requireExpectedCursors(
     remote: string,
-    bookmark: string,
-    expected: Uint8Array | null,
+    expectedCursors: Array<{ bookmark: string; expected: Uint8Array | null }>,
     code?: string,
   ) {
-    const row = this.sql
-      .exec<{ git_oid: ArrayBuffer }>(
-        `SELECT states.git_oid FROM projection_cursors AS cursors
+    const placeholders = expectedCursors.map(() => "?").join(", ");
+    const rows = this.sql
+      .exec<{ bookmark: string; git_oid: ArrayBuffer }>(
+        `SELECT cursors.bookmark, states.git_oid
+         FROM projection_cursors AS cursors
          JOIN projection_states AS states ON states.state_id = cursors.state_id
-         WHERE cursors.remote = ? AND cursors.bookmark = ?`,
+         WHERE cursors.remote = ? AND cursors.bookmark IN (${placeholders})`,
         remote,
-        bookmark,
+        ...expectedCursors.map((cursor) => cursor.bookmark),
       )
-      .toArray()[0];
-    const actual = row === undefined ? null : new Uint8Array(row.git_oid);
-    if (compareNullableBytes(actual, expected) !== 0) {
-      throw new ProjectionStoreError(
-        `projection cursor for ${remote}/${bookmark} does not match expected old Git ID`,
-        409,
-        code ?? "projection-cursor-stale",
-      );
+      .toArray();
+    const actualByBookmark = new Map(
+      rows.map((row) => [row.bookmark, new Uint8Array(row.git_oid)]),
+    );
+    for (const { bookmark, expected } of expectedCursors) {
+      const actual = actualByBookmark.get(bookmark) ?? null;
+      if (compareNullableBytes(actual, expected) !== 0) {
+        throw new ProjectionStoreError(
+          `projection cursor for ${remote}/${bookmark} does not match expected old Git ID`,
+          409,
+          code ?? "projection-cursor-stale",
+        );
+      }
     }
   }
 
@@ -1149,17 +1217,64 @@ export class ProjectionStore {
     }
   }
 
-  private hasPendingPush(remote: string, bookmark: string) {
-    return (
+  private pendingPushBookmarks(remote: string, bookmarks: string[]) {
+    const placeholders = bookmarks.map(() => "?").join(", ");
+    return new Set(
       this.sql
-        .exec<{ count: number }>(
-          `SELECT count(*) AS count FROM projection_batch_refs
-           WHERE remote = ? AND bookmark = ?`,
+        .exec<{ bookmark: string }>(
+          `SELECT bookmark FROM projection_batch_refs
+           WHERE remote = ? AND bookmark IN (${placeholders})`,
           remote,
-          bookmark,
+          ...bookmarks,
         )
-        .one().count !== 0
+        .toArray()
+        .map((row) => row.bookmark),
     );
+  }
+
+  private pruneExpiredFetchResults(cutoffMs: number) {
+    // A state-changing retry after expiry is evaluated as a new fetch and
+    // normally returns fetch-cursor-stale because the original moved its cursor.
+    this.sql.exec(
+      `DELETE FROM projection_fetch_results
+       WHERE fetch_id IN (
+         SELECT fetch_id FROM projection_fetch_results
+         WHERE created_at_ms < ?
+         ORDER BY created_at_ms
+         LIMIT ${PRUNE_BATCH}
+       )`,
+      cutoffMs,
+    );
+  }
+
+  private pruneExpiredBatchResults(cutoffMs: number) {
+    // Once a result expires, claim and recover take the non-replay path and
+    // return projection-batch-not-found because no pending batch remains.
+    this.sql.exec(
+      `DELETE FROM projection_batch_results
+       WHERE batch_id IN (
+         SELECT batch_id FROM projection_batch_results
+         WHERE finished_at_ms < ?
+         ORDER BY finished_at_ms
+         LIMIT ${PRUNE_BATCH}
+       )`,
+      cutoffMs,
+    );
+  }
+
+  private requireReplayCapacity(kind: "fetch" | "batch") {
+    const table =
+      kind === "fetch" ? "projection_fetch_results" : "projection_batch_results";
+    const count = this.sql
+      .exec<{ count: number }>(`SELECT count(*) AS count FROM ${table}`)
+      .one().count;
+    if (count >= MAX_REPLAY_RESULTS) {
+      throw new ProjectionStoreError(
+        `projection ${kind} replay result quota is exhausted`,
+        429,
+        `projection-${kind}-result-limit`,
+      );
+    }
   }
 
   private requireFetchReceiptConsistency(request: RecordFetchRequest) {
@@ -1229,23 +1344,28 @@ export class ProjectionStore {
         requested.set(key, state);
       }
     }
+    const activeByGitOid = new Map<string, ActiveLineageRow[]>();
+    const active = this.sql
+      .exec<ActiveLineageRow>(
+        `WITH newest AS (
+           SELECT remote, bookmark, max(activation_seq) AS activation_seq
+           FROM projection_states
+           WHERE pending_batch_id IS NULL
+           GROUP BY remote, bookmark
+         )
+         SELECT states.git_oid, states.canonical_commit_id, states.hidden_set_id
+         FROM projection_states AS states
+         JOIN newest USING (remote, bookmark, activation_seq)`,
+      )
+      .toArray();
+    for (const state of active) {
+      const key = toHex(new Uint8Array(state.git_oid));
+      const states = activeByGitOid.get(key);
+      if (states === undefined) activeByGitOid.set(key, [state]);
+      else states.push(state);
+    }
     for (const [gitOid, lineage] of requested) {
-      const active = this.sql
-        .exec<ActiveStateRow>(
-          `WITH newest AS (
-             SELECT remote, bookmark, max(activation_seq) AS activation_seq
-             FROM projection_states
-             WHERE pending_batch_id IS NULL
-             GROUP BY remote, bookmark
-           )
-           SELECT states.state_id, states.canonical_commit_id, states.hidden_set_id
-           FROM projection_states AS states
-           JOIN newest USING (remote, bookmark, activation_seq)
-           WHERE states.git_oid = ?`,
-          exactBuffer(hexBytes(gitOid)),
-        )
-        .toArray();
-      for (const state of active) {
+      for (const state of activeByGitOid.get(gitOid) ?? []) {
         if (
           !sameLineage(lineage, {
             canonicalCommitId: new Uint8Array(state.canonical_commit_id),
@@ -1322,12 +1442,6 @@ function sameLineage(
   return (
     equalBytes(left.canonicalCommitId, right.canonicalCommitId) &&
     compareNullableBytes(left.hiddenSetId, right.hiddenSetId) === 0
-  );
-}
-
-function hexBytes(value: string) {
-  return Uint8Array.from({ length: value.length / 2 }, (_, index) =>
-    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
   );
 }
 

@@ -1,5 +1,5 @@
 import { env, exports } from "cloudflare:workers";
-import { evictDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import jjGolden from "../crates/kernel/tests/jj_golden.txt?raw";
 import { MAX_HEAD_REQUEST_BYTES, MAX_OBSERVED_HEADS } from "../src/head_protocol";
@@ -1626,6 +1626,268 @@ describe("Git fetch journal", () => {
   });
 });
 
+describe("projection replay retention", () => {
+  const incarnation = "57".repeat(16);
+  const machine = "66".repeat(16);
+
+  it("prunes expired fetch results while retaining in-window replay", async () => {
+    const repository = "fetch-result-retention";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
+    const commits = await installProjectionCommits(repository, 6);
+    const oldRequest = fetchRequest(
+      incarnation,
+      "11".repeat(16),
+      machine,
+      [
+        fetchRef(
+          "old",
+          "21".repeat(20),
+          null,
+          [fetchState("21".repeat(20), commits[0], commits[1])],
+          0,
+        ),
+      ],
+      [{ gitOid: "21".repeat(20), publicCommitId: commits[1] }],
+    );
+    const retainedRequest = fetchRequest(
+      incarnation,
+      "12".repeat(16),
+      machine,
+      [
+        fetchRef(
+          "retained",
+          "22".repeat(20),
+          null,
+          [fetchState("22".repeat(20), commits[2], commits[3])],
+          0,
+        ),
+      ],
+      [{ gitOid: "22".repeat(20), publicCommitId: commits[3] }],
+    );
+    const sweepRequest = fetchRequest(
+      incarnation,
+      "13".repeat(16),
+      machine,
+      [
+        fetchRef(
+          "sweep",
+          "23".repeat(20),
+          null,
+          [fetchState("23".repeat(20), commits[4], commits[5])],
+          0,
+        ),
+      ],
+      [{ gitOid: "23".repeat(20), publicCommitId: commits[5] }],
+    );
+
+    expect(await projectionRequest(repository, "git/fetches", oldRequest)).toMatchObject({
+      status: 200,
+      body: { activationCursor: 1 },
+    });
+    expect(await projectionRequest(repository, "git/fetches", retainedRequest)).toMatchObject({
+      status: 200,
+      body: { activationCursor: 2 },
+    });
+    await runInDurableObject(
+      await repositoryStub(repository, incarnation),
+      (_instance, state) => {
+        state.storage.sql.exec(
+          "UPDATE projection_fetch_results SET created_at_ms = 0 WHERE fetch_id = ?",
+          exactTestBuffer("11".repeat(16)),
+        );
+      },
+    );
+
+    expect(await projectionRequest(repository, "git/fetches", sweepRequest)).toMatchObject({
+      status: 200,
+      body: { activationCursor: 3 },
+    });
+    expect(await projectionRequest(repository, "git/fetches", retainedRequest)).toEqual({
+      status: 200,
+      body: { fetchId: "12".repeat(16), activationCursor: 2 },
+    });
+    expect(await projectionRequest(repository, "git/fetches", oldRequest)).toMatchObject({
+      status: 409,
+      body: { code: "fetch-cursor-stale" },
+    });
+    expect(await projectionResultIds(repository, "projection_fetch_results", "fetch_id"))
+      .toEqual(["12".repeat(16), "13".repeat(16)]);
+  });
+
+  it("prunes expired batch results and replays retained accepted and aborted claims", async () => {
+    const repository = "batch-result-retention";
+    await initializeProjectionRepository(repository, incarnation);
+    const [canonicalCommitId, publicCommitId] =
+      await installProjectionCommits(repository);
+    const acceptedBatch = "31".repeat(16);
+    const abortedBatch = "32".repeat(16);
+    const sweepBatch = "33".repeat(16);
+    const acceptedOid = "41".repeat(20);
+    const abortedOid = "42".repeat(20);
+
+    expect(
+      await projectionRequest(
+        repository,
+        "git/pushes",
+        projectionBatch(
+          incarnation,
+          acceptedBatch,
+          machine,
+          projectionUpdate(
+            "accepted",
+            null,
+            acceptedOid,
+            canonicalCommitId,
+            publicCommitId,
+          ),
+        ),
+      ),
+    ).toMatchObject({ status: 200, body: { fence: 1 } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${acceptedBatch}/recover`, {
+        incarnation,
+        machineId: machine,
+        fence: 1,
+        observations: [{ bookmark: "accepted", liveOid: acceptedOid }],
+      }),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+
+    expect(
+      await projectionRequest(
+        repository,
+        "git/pushes",
+        projectionBatch(
+          incarnation,
+          abortedBatch,
+          machine,
+          projectionUpdate(
+            "aborted",
+            null,
+            abortedOid,
+            canonicalCommitId,
+            publicCommitId,
+          ),
+        ),
+      ),
+    ).toMatchObject({ status: 200, body: { fence: 2 } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${abortedBatch}/recover`, {
+        incarnation,
+        machineId: machine,
+        fence: 2,
+        observations: [{ bookmark: "aborted", liveOid: null }],
+      }),
+    ).toMatchObject({ status: 200, body: { outcome: "aborted" } });
+
+    await runInDurableObject(
+      await repositoryStub(repository, incarnation),
+      (_instance, state) => {
+        state.storage.sql.exec(
+          "UPDATE projection_batch_results SET finished_at_ms = 0 WHERE batch_id = ?",
+          exactTestBuffer(acceptedBatch),
+        );
+      },
+    );
+    const sweepRequest = {
+      incarnation,
+      batchId: sweepBatch,
+      machineId: machine,
+      remote: "origin",
+      updates: [
+        { bookmark: "sweep", expectedOldOid: null, states: [], proposedState: null },
+      ],
+    };
+    expect(await projectionRequest(repository, "git/pushes", sweepRequest)).toMatchObject({
+      status: 200,
+      body: { fence: 3 },
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${sweepBatch}/recover`, {
+        incarnation,
+        machineId: machine,
+        fence: 3,
+        observations: [{ bookmark: "sweep", liveOid: null }],
+      }),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+
+    expect(
+      await projectionRequest(repository, `git/pushes/${acceptedBatch}/claim`, {
+        incarnation,
+        machineId: recoveryMachine,
+      }),
+    ).toMatchObject({ status: 404, body: { code: "projection-batch-not-found" } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${abortedBatch}/claim`, {
+        incarnation,
+        machineId: recoveryMachine,
+      }),
+    ).toEqual({
+      status: 200,
+      body: { pending: false, fence: 2, outcome: "aborted" },
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${sweepBatch}/claim`, {
+        incarnation,
+        machineId: recoveryMachine,
+      }),
+    ).toEqual({
+      status: 200,
+      body: { pending: false, fence: 3, outcome: "accepted" },
+    });
+    expect(await projectionResultIds(repository, "projection_batch_results", "batch_id"))
+      .toEqual([abortedBatch, sweepBatch]);
+  });
+
+  it("enforces hard quotas for fetch and batch replay results", async () => {
+    const repository = "projection-result-quota";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
+    await seedProjectionResultQuotas(repository);
+
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "51".repeat(16),
+          machine,
+          [fetchRef("main", "61".repeat(20), null, [], null)],
+          [],
+        ),
+      ),
+    ).toMatchObject({
+      status: 429,
+      body: { code: "projection-fetch-result-limit" },
+    });
+
+    const batchId = "52".repeat(16);
+    expect(
+      await projectionRequest(repository, "git/pushes", {
+        incarnation,
+        batchId,
+        machineId: machine,
+        remote: "origin",
+        updates: [
+          { bookmark: "main", expectedOldOid: null, states: [], proposedState: null },
+        ],
+      }),
+    ).toMatchObject({ status: 200, body: { pending: true, fence: 1 } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${batchId}/recover`, {
+        incarnation,
+        machineId: machine,
+        fence: 1,
+        observations: [{ bookmark: "main", liveOid: null }],
+      }),
+    ).toMatchObject({
+      status: 429,
+      body: { code: "projection-batch-result-limit" },
+    });
+  });
+});
+
 describe("remote registry", () => {
   const incarnation = "56".repeat(16);
   const machine = "66".repeat(16);
@@ -1896,6 +2158,53 @@ describe("remote registry", () => {
     ).toBe(401);
   });
 });
+
+function exactTestBuffer(value: string): ArrayBuffer {
+  return fromHex(value).buffer as ArrayBuffer;
+}
+
+async function projectionResultIds(
+  repository: string,
+  table: "projection_fetch_results" | "projection_batch_results",
+  key: "fetch_id" | "batch_id",
+) {
+  return runInDurableObject(
+    await repositoryStub(repository),
+    (_instance, state) =>
+      state.storage.sql
+        .exec<{ id: string }>(
+          `SELECT lower(hex(${key})) AS id FROM ${table} ORDER BY id`,
+        )
+        .toArray()
+        .map((row) => row.id),
+  );
+}
+
+async function seedProjectionResultQuotas(repository: string) {
+  await runInDurableObject(await repositoryStub(repository), (_instance, state) => {
+    const digits =
+      "(VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11), (12), (13), (14), (15))";
+    const numbers = `
+      SELECT a.column1 + 16 * b.column1 + 256 * c.column1 + 4096 * d.column1 AS value
+      FROM ${digits} AS a, ${digits} AS b, ${digits} AS c, ${digits} AS d`;
+    const nowMs = Date.now();
+    state.storage.sql.exec(
+      `INSERT INTO projection_fetch_results
+       (fetch_id, remote, request_hash, activation_cursor, created_at_ms)
+       SELECT CAST(printf('fetch-%05d', value) AS BLOB), 'origin', zeroblob(64), 0, ?
+       FROM (${numbers})`,
+      nowMs,
+    );
+    state.storage.sql.exec(
+      `INSERT INTO projection_batch_results
+       (batch_id, remote, request_hash, final_fence, outcome, finished_at_ms)
+       SELECT CAST(printf('batch-%05d', value) AS BLOB), 'origin', zeroblob(64), 0,
+              'accepted', ?
+       FROM (${numbers})`,
+      nowMs,
+    );
+  });
+}
 
 function authorizationFor(machineId: string): Record<string, string> {
   return {

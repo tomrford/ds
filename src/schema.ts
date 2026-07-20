@@ -174,6 +174,11 @@ export function initializeSchema(sql: SqlStorage) {
       pending_batch_id BLOB,
       activation_seq INTEGER UNIQUE
     );
+    CREATE INDEX IF NOT EXISTS projection_states_remote_bookmark_activation
+      ON projection_states (remote, bookmark, activation_seq);
+    CREATE INDEX IF NOT EXISTS projection_states_pending_batch
+      ON projection_states (pending_batch_id)
+      WHERE pending_batch_id IS NOT NULL;
     CREATE TABLE IF NOT EXISTS projection_batch_refs (
       batch_id BLOB NOT NULL,
       position INTEGER NOT NULL,
@@ -198,6 +203,8 @@ export function initializeSchema(sql: SqlStorage) {
       outcome TEXT NOT NULL CHECK (outcome IN ('accepted', 'aborted')),
       finished_at_ms INTEGER NOT NULL
     ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS projection_batch_results_finished_at
+      ON projection_batch_results (finished_at_ms);
     CREATE TABLE IF NOT EXISTS projection_recovery_claims (
       batch_id BLOB PRIMARY KEY
     ) WITHOUT ROWID;
@@ -205,8 +212,11 @@ export function initializeSchema(sql: SqlStorage) {
       fetch_id BLOB PRIMARY KEY,
       remote TEXT NOT NULL,
       request_hash BLOB NOT NULL,
-      activation_cursor INTEGER NOT NULL CHECK (activation_cursor >= 0)
+      activation_cursor INTEGER NOT NULL CHECK (activation_cursor >= 0),
+      created_at_ms INTEGER NOT NULL
     ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS projection_fetch_results_created_at
+      ON projection_fetch_results (created_at_ms);
     CREATE TABLE IF NOT EXISTS remotes (
       name TEXT PRIMARY KEY,
       url TEXT NOT NULL
