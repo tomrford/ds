@@ -31,6 +31,13 @@ use thiserror::Error;
 const STORE_DIR: &str = "store";
 const DSPRIVATE: &str = ".dsprivate";
 
+/// Current import safety limits, aligned with the projection request's 256-ref
+/// and 8,192-state bounds. These are safety limits, not production quotas.
+pub const MAX_IMPORT_HEADS: usize = 256;
+pub const MAX_IMPORT_COMMIT_DEPTH: usize = 1_024;
+pub const MAX_IMPORT_TREE_DEPTH: usize = 256;
+pub const MAX_IMPORT_TREE_ENTRIES: usize = 8_192;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitMapping {
     pub canonical_id: CommitId,
@@ -131,6 +138,10 @@ const HIDDEN_CHAIN_DOMAIN: &[u8] = b"devspace-hidden-chain-v1";
 pub struct HiddenSetIdentity(Option<[u8; 64]>);
 
 impl HiddenSetIdentity {
+    pub fn from_projection_id(id: Option<[u8; 64]>) -> Self {
+        Self(id)
+    }
+
     pub fn to_projection_id(&self) -> Option<[u8; 64]> {
         self.0
     }
@@ -147,10 +158,29 @@ impl HiddenSet {
     pub fn identity(&self) -> &HiddenSetIdentity {
         &self.identity
     }
+
+    pub(crate) fn hides_file(&self, path: &RepoPath) -> bool {
+        if path.components().next_back().is_some_and(is_dsprivate)
+            || self.matcher.matches_file(path)
+        {
+            return true;
+        }
+        let mut ancestor = path.parent();
+        while let Some(directory) = ancestor {
+            if directory.is_root() {
+                break;
+            }
+            if self.matcher.matches_dir(directory) {
+                return true;
+            }
+            ancestor = directory.parent();
+        }
+        false
+    }
 }
 
 #[derive(Default)]
-struct HiddenSetCache {
+pub(crate) struct HiddenSetCache {
     blobs: BTreeMap<FileId, Arc<Vec<u8>>>,
     trees: BTreeMap<TreeId, Arc<Vec<RepoPathBuf>>>,
 }
@@ -289,6 +319,8 @@ impl GitProjection {
             &self.store,
             canonical_heads,
             &mut mappings.by_canonical,
+            None,
+            None,
             TranslationDirection::Export,
         )
         .await?;
@@ -311,14 +343,44 @@ impl GitProjection {
         git_heads: &[CommitId],
         mappings: &mut ImportMappings,
     ) -> Result<ImportResult, ProjectionError> {
+        self.import_reachable_with_stops(
+            canonical_store,
+            git_heads,
+            &ImportMappings::default(),
+            mappings,
+        )
+        .await
+    }
+
+    pub async fn import_reachable_with_stops(
+        &self,
+        canonical_store: &Arc<Store>,
+        git_heads: &[CommitId],
+        stop_at: &ImportMappings,
+        mappings: &mut ImportMappings,
+    ) -> Result<ImportResult, ProjectionError> {
+        if git_heads.len() > MAX_IMPORT_HEADS {
+            return Err(ProjectionError::ImportHeadLimit {
+                actual: git_heads.len(),
+                limit: MAX_IMPORT_HEADS,
+            });
+        }
+        let expected = mappings.by_git.clone();
+        let mut computed = BTreeMap::new();
+        validate_import_commit_depth(&self.store, git_heads, &stop_at.by_git).await?;
         let translated = translate_reachable(
             &self.store,
             canonical_store,
             git_heads,
-            &mut mappings.by_git,
+            &mut computed,
+            Some(&stop_at.by_git),
+            Some(&expected),
             TranslationDirection::Import,
         )
         .await?;
+        for (git_id, canonical_id) in computed {
+            record_mapping(&mut mappings.by_git, git_id, canonical_id, "Git commit")?;
+        }
         Ok(ImportResult {
             canonical_heads: translated.target_heads,
             new_mappings: translated
@@ -366,6 +428,38 @@ impl GitProjection {
     }
 }
 
+async fn validate_import_commit_depth(
+    source: &Arc<Store>,
+    heads: &[CommitId],
+    stop_at: &BTreeMap<CommitId, CommitId>,
+) -> Result<(), ProjectionError> {
+    let mut deepest = BTreeMap::<CommitId, usize>::new();
+    let mut pending = heads
+        .iter()
+        .cloned()
+        .map(|id| (id, 1_usize))
+        .collect::<Vec<_>>();
+    while let Some((id, depth)) = pending.pop() {
+        if id == *source.root_commit_id() || stop_at.contains_key(&id) {
+            continue;
+        }
+        if depth > MAX_IMPORT_COMMIT_DEPTH {
+            return Err(ProjectionError::ImportCommitDepthLimit {
+                commit_id: id,
+                depth,
+                limit: MAX_IMPORT_COMMIT_DEPTH,
+            });
+        }
+        if deepest.get(&id).is_some_and(|seen| *seen >= depth) {
+            continue;
+        }
+        deepest.insert(id.clone(), depth);
+        let commit = source.backend().read_commit(&id).await?;
+        pending.extend(commit.parents.into_iter().map(|parent| (parent, depth + 1)));
+    }
+    Ok(())
+}
+
 struct TranslationResult {
     target_heads: Vec<CommitId>,
     new_pairs: Vec<(CommitId, CommitId)>,
@@ -379,7 +473,7 @@ enum TranslationDirection {
 }
 
 enum Visit {
-    Enter(CommitId),
+    Enter { id: CommitId, depth: usize },
     Exit(CommitId),
 }
 
@@ -388,6 +482,8 @@ async fn translate_reachable(
     target: &Arc<Store>,
     source_heads: &[CommitId],
     source_to_target: &mut BTreeMap<CommitId, CommitId>,
+    stop_at: Option<&BTreeMap<CommitId, CommitId>>,
+    expected: Option<&BTreeMap<CommitId, CommitId>>,
     direction: TranslationDirection,
 ) -> Result<TranslationResult, ProjectionError> {
     let mut states = BTreeMap::<CommitId, bool>::new();
@@ -397,11 +493,38 @@ async fn translate_reachable(
     let mut reached_pairs = BTreeMap::new();
 
     for head in source_heads {
-        let mut stack = vec![Visit::Enter(head.clone())];
+        let mut stack = vec![Visit::Enter {
+            id: head.clone(),
+            depth: 1,
+        }];
         while let Some(visit) = stack.pop() {
             match visit {
-                Visit::Enter(source_id) => {
+                Visit::Enter {
+                    id: source_id,
+                    depth,
+                } => {
                     if source_id == *source.root_commit_id() {
+                        continue;
+                    }
+                    if matches!(direction, TranslationDirection::Import)
+                        && depth > MAX_IMPORT_COMMIT_DEPTH
+                    {
+                        return Err(ProjectionError::ImportCommitDepthLimit {
+                            commit_id: source_id,
+                            depth,
+                            limit: MAX_IMPORT_COMMIT_DEPTH,
+                        });
+                    }
+                    if let Some(target_id) = stop_at.and_then(|stops| stops.get(&source_id)) {
+                        target.backend().read_commit(target_id).await?;
+                        record_mapping(
+                            source_to_target,
+                            source_id.clone(),
+                            target_id.clone(),
+                            "Git commit stop",
+                        )?;
+                        reached_pairs.insert(source_id.clone(), target_id.clone());
+                        states.insert(source_id, true);
                         continue;
                     }
                     if let Some(target_id) = source_to_target.get(&source_id) {
@@ -448,7 +571,10 @@ async fn translate_reachable(
                     commits.insert(source_id.clone(), commit.clone());
                     stack.push(Visit::Exit(source_id));
                     for parent_id in commit.parents.iter().rev() {
-                        stack.push(Visit::Enter(parent_id.clone()));
+                        stack.push(Visit::Enter {
+                            id: parent_id.clone(),
+                            depth: depth + 1,
+                        });
                     }
                 }
                 Visit::Exit(source_id) => {
@@ -493,6 +619,7 @@ async fn translate_reachable(
                         source_tree_id,
                         &HiddenChain::empty(),
                         &mut cache,
+                        0,
                     )
                     .await?;
                     let target_commit = BackendCommit {
@@ -507,6 +634,16 @@ async fn translate_reachable(
                         secure_sig: None,
                     };
                     let target_id = target.write_commit(target_commit, None).await?.id().clone();
+                    if let Some(expected_id) = expected.and_then(|rows| rows.get(&source_id))
+                        && expected_id != &target_id
+                    {
+                        return Err(ProjectionError::ConflictingMapping {
+                            source_name: "Git commit",
+                            source_id,
+                            existing: expected_id.clone(),
+                            proposed: target_id,
+                        });
+                    }
                     if record_mapping(
                         source_to_target,
                         source_id.clone(),
@@ -656,8 +793,18 @@ fn copy_tree<'a>(
     source_tree_id: &'a TreeId,
     inherited_chain: &'a HiddenChain,
     cache: &'a mut TranslationCache,
+    depth: usize,
 ) -> Pin<Box<dyn Future<Output = Result<TreeId, ProjectionError>> + 'a>> {
     Box::pin(async move {
+        if matches!(context.direction, TranslationDirection::Import)
+            && depth > MAX_IMPORT_TREE_DEPTH
+        {
+            return Err(ProjectionError::ImportTreeDepthLimit {
+                path: path.to_owned(),
+                depth,
+                limit: MAX_IMPORT_TREE_DEPTH,
+            });
+        }
         if source_tree_id == context.source.empty_tree_id() {
             return Ok(context.target.empty_tree_id().clone());
         }
@@ -690,9 +837,19 @@ fn copy_tree<'a>(
             return Ok(target_tree_id.clone());
         }
 
+        let source_entries = source_tree.entries_non_recursive().collect::<Vec<_>>();
+        if matches!(context.direction, TranslationDirection::Import)
+            && source_entries.len() > MAX_IMPORT_TREE_ENTRIES
+        {
+            return Err(ProjectionError::ImportTreeWidthLimit {
+                path: path.to_owned(),
+                actual: source_entries.len(),
+                limit: MAX_IMPORT_TREE_ENTRIES,
+            });
+        }
         let mut target_entries = Vec::new();
         let mut leaf_copies = Vec::new();
-        for entry in source_tree.entries_non_recursive() {
+        for entry in source_entries {
             let entry_path = path.join(entry.name());
             if context.hidden_set.is_some() {
                 let excluded = match entry.value() {
@@ -726,7 +883,8 @@ fn copy_tree<'a>(
                     continue;
                 }
                 TreeValue::Tree(id) => {
-                    let target_id = copy_tree(context, &entry_path, id, &chain, cache).await?;
+                    let target_id =
+                        copy_tree(context, &entry_path, id, &chain, cache, depth + 1).await?;
                     if target_id == *context.target.empty_tree_id() {
                         continue;
                     }
@@ -766,8 +924,17 @@ async fn resolve_hidden_set(
         commit.root_tree.clone(),
         ConflictLabels::from_merge(commit.conflict_labels.clone()),
     );
+    resolve_hidden_set_for_tree(store, commit_id, &merged_tree, cache).await
+}
+
+pub(crate) async fn resolve_hidden_set_for_tree(
+    store: &Arc<Store>,
+    context_id: &CommitId,
+    merged_tree: &MergedTree,
+    cache: &mut HiddenSetCache,
+) -> Result<HiddenSet, ProjectionError> {
     let mut candidate_paths = BTreeSet::new();
-    for tree_id in commit.root_tree.iter() {
+    for tree_id in merged_tree.tree_ids().iter() {
         for path in
             collect_dsprivate_paths(store, RepoPath::root(), tree_id, &mut cache.trees).await?
         {
@@ -782,12 +949,12 @@ async fn resolve_hidden_set(
             .await?
             .into_resolved()
             .map_err(|_| ProjectionError::ConflictedDsprivate {
-                commit_id: commit_id.clone(),
+                commit_id: context_id.clone(),
                 path: path.clone(),
             })?;
         let Some(TreeValue::File { id, .. }) = value else {
             return Err(ProjectionError::InvalidDsprivateEntry {
-                commit_id: commit_id.clone(),
+                commit_id: context_id.clone(),
                 path: path.clone(),
             });
         };
@@ -796,7 +963,7 @@ async fn resolve_hidden_set(
 
     let mut matcher = GitIgnoreFile::empty();
     for (path, id) in &files {
-        let bytes = read_hidden_blob(store, path, id, &mut cache.blobs, commit_id).await?;
+        let bytes = read_hidden_blob(store, path, id, &mut cache.blobs, context_id).await?;
         matcher = matcher
             .chain(
                 path.parent().expect(".dsprivate has a parent directory"),
@@ -972,6 +1139,28 @@ pub enum ProjectionError {
     GitLink {
         path: RepoPathBuf,
         operation: &'static str,
+    },
+    #[error("Git import has {actual} input heads, exceeding the safety limit of {limit}")]
+    ImportHeadLimit { actual: usize, limit: usize },
+    #[error("Git import commit depth {depth} at {commit_id} exceeds the safety limit of {limit}")]
+    ImportCommitDepthLimit {
+        commit_id: CommitId,
+        depth: usize,
+        limit: usize,
+    },
+    #[error("Git import tree depth {depth} at {path:?} exceeds the safety limit of {limit}")]
+    ImportTreeDepthLimit {
+        path: RepoPathBuf,
+        depth: usize,
+        limit: usize,
+    },
+    #[error(
+        "Git import tree at {path:?} has {actual} entries, exceeding the safety limit of {limit}"
+    )]
+    ImportTreeWidthLimit {
+        path: RepoPathBuf,
+        actual: usize,
+        limit: usize,
     },
     #[error(transparent)]
     Backend(#[from] jj_lib::backend::BackendError),

@@ -1,5 +1,6 @@
 mod control_plane_client;
 mod creation_intent;
+mod git_lift;
 mod git_projection;
 mod git_subprocess;
 mod http_client;
@@ -42,9 +43,14 @@ pub use creation_intent::{
     RepositoryCreationTarget,
 };
 pub use devspace_kernel::ObjectKind;
+pub use git_lift::{
+    FetchedGitRef, GitLiftError, GitSeed, LiftResult, LiftedCommitState, SeedSelection,
+    TOMBSTONE_A, TOMBSTONE_B, lift_imported, select_seeds,
+};
 pub use git_projection::{
     CommitMapping, ExportMappings, ExportResult, GitProjection, HiddenSet, HiddenSetIdentity,
-    ImportMappings, ImportResult, ProjectionError,
+    ImportMappings, ImportResult, MAX_IMPORT_COMMIT_DEPTH, MAX_IMPORT_HEADS, MAX_IMPORT_TREE_DEPTH,
+    MAX_IMPORT_TREE_ENTRIES, ProjectionError,
 };
 pub use git_subprocess::{
     CommandDiagnostic, GitOid, GitOidParseError, GitProcessEnvironment, GitProcessMode,

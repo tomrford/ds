@@ -34,3 +34,7 @@
   some collaborators, not all). Design item, unscheduled.
 - `ds skill` surface (v1 parity): agent-facing usage docs incl. the private-file
   model, once docs stabilise. Needed before T3 dogfooding.
+- Import depth limit (MAX_IMPORT_COMMIT_DEPTH 1,024) blocks `ds init` of
+  real histories; raising it needs paged/streaming import so one fetch
+  transaction stays bounded. Decide before dogfooding a repo deeper than the
+  limit (this repo qualifies).

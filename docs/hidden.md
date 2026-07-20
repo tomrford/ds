@@ -105,15 +105,15 @@ Devspace tolerates this and never rewrites remote history:
 - the lifted commit carries a native, non-blocking jj conflict at the path
   (private value against public value); repeated public edits update the
   public side, and a public deletion leaves the private value clean
-- conflict surfaces (`ds resolve --list`, log, status) label these conflicts
-  explicitly as involving a hidden path, and fetch warns once, loudly, that
-  the bytes are public until the remote's history is rewritten externally
+- conflict surfaces present it as an ordinary jj conflict; fetch warns once,
+  loudly, that the bytes are public until the remote's history is rewritten
+  externally, and export refusal names the hidden path
 - resolution is an ordinary child change; if the private value wins, the next
   push publishes a deletion of the path, never the private bytes
 
 A `.dsprivate` file pushed by a plain-git collaborator is the same case:
-`.dsprivate` is always hidden, so it produces the same labeled conflict and
-warning rather than a special code path.
+`.dsprivate` is always hidden, so it produces the same ordinary conflict and
+warning rather than a special merge path.
 
 The guarantee is therefore: Devspace never adds hidden bytes to a Git object;
 bytes a collaborator already published remain reachable on the remote until
@@ -122,16 +122,34 @@ its history is rewritten outside Devspace.
 A public addition at a hidden path with no private seed value becomes a
 materializable modify-delete conflict against a synthetic tombstone. The
 tombstone is an internal negative merge term chosen from 2 fixed canonical
-objects so one can always be selected without colliding with the public file
-ID; hidden filtering prevents either object from reaching Git. The exact bytes
-of both objects are canonical semantics and must be defined before machines
-can lift independently. The proposed shape is 2 distinct self-describing
-sentinel texts, so a materialized conflict explains itself in the working copy
-without CLI mediation.
+file objects. Tombstone A is selected unless the public value's bytes are
+exactly tombstone A's bytes, in which case tombstone B is selected. The
+conflict therefore cannot simplify because its positive and negative terms
+are different. Hidden filtering prevents either object from reaching Git.
 
-Non-file values arriving at a hidden path follow one rule: represent a native
-conflict when the simple backend can encode both terms (files, executable
-files, symlinks); fail closed otherwise (directories, Git links).
+Tombstone A has these exact UTF-8 bytes, including LF line endings and the
+trailing newline:
+
+```text
+This conflict placeholder was inserted by Devspace.
+A collaborator published this file at a path this repository keeps
+private. The other side of this conflict is their published content;
+no private value existed here. Keep the content this file should have
+privately; deleting the file publishes a deletion on the next push.
+devspace-tombstone-v1-a
+```
+
+Tombstone B is byte-for-byte identical except for its final line:
+
+```text
+devspace-tombstone-v1-b
+```
+
+Files, executable files and symlinks arriving at hidden paths use the same
+native tombstone conflict. A public directory at a hidden path resolves per
+file: every contained file or symlink is hidden by the parent-directory rule
+and receives its own tombstone conflict. Git links fail import before simple
+backend encoding; they are the only unsupported Git tree value in this rule.
 
 ## Encryption boundary
 
@@ -142,9 +160,3 @@ trust model without adding secrecy. Server-blind end-to-end encryption is a
 separate product with different merge semantics. The boundary is direct: the
 canonical store and cloud authority see hidden content; Git storage and Git
 remotes do not.
-
-## Open items
-
-- Canonical byte definitions and selection rule for the 2 tombstone objects.
-- Hidden-path labeling in conflict surfaces needs a CLI design; the current
-  embedded runner exposes only bare-repository `log`.

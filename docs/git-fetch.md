@@ -22,6 +22,11 @@ recorded through several bookmarks, the newest state per bookmark must agree
 on one private commit and hidden-set identity; otherwise the seed is
 ambiguous and the fetch fails closed.
 
+When a ref has a cursor, its fetched head must descend from the cursor's Git
+object in the sidecar graph. A non-descendant head is a rewritten ref and
+fails closed; force-pushed history is unsupported. A ref with neither a cursor
+nor any receipt-backed seed in its ancestry imports from scratch.
+
 Pending push batches overlapping a fetched ref are recovered before import
 (see `git-projection.md`); stale no-op lineage is discarded before unrelated
 history is interpreted.
@@ -33,10 +38,12 @@ canonical objects, stopping at known raw public shadows supplied from durable
 receipts. Import is a translation boundary, not an authority: it publishes no
 operation head. Git links fail before the simple backend can encode a tree;
 submodules are unsupported. Signatures, which cannot survive translation, are
-stripped; raw Git commit data carries a secure-signature field that must be
-cleared before canonical encoding. Import enforces explicit bounds on commit
-depth, tree width and input head count, and recomputes any supplied mapping
-rather than trusting it.
+stripped; raw Git commit data carries a secure-signature field that is cleared
+before canonical encoding. Import limits one request to 256 heads, 1,024
+commits of ancestry per head, 256 levels of tree recursion and 8,192 entries
+in one tree. These are current safety limits aligned with the projection
+request bounds, not production quotas. Ordinary supplied mappings are
+recomputed and checked; only durable receipt stops terminate translation.
 
 ## Lifting
 
@@ -48,15 +55,25 @@ C:
    merge into Q;
 3. the lifted tree is the 3-term merge Q − P + C.tree — the same tree rebase
    jj itself uses;
-4. the canonical commit is written with the lifted private parents, the
+4. the applicable hidden set is resolved from Q; a conflict in any of Q's
+   `.dsprivate` files fails fetch closed;
+5. a clean public-introduced value at a hidden path that is absent from Q is
+   rewritten to the tombstone conflict defined in `hidden.md`; values supplied
+   by Q are not rewritten;
+6. the canonical commit is written with the lifted private parents, the
    merged tree and the imported commit's metadata.
 
-Because hidden paths are absent from every public tree, the merged private
-parents supply their values unchanged: hidden content, including `.dsprivate`
-itself, flows to lifted commits structurally. A public edit at a hidden path
-becomes a native jj conflict exactly as `hidden.md` specifies; a Git merge
-lifts by merging all public parents and all private parents separately and
-replaying the delta between them, preserving parent count and order.
+Where public trees omit hidden paths, the merged private parents supply their
+values unchanged: hidden content, including `.dsprivate` itself, flows to
+lifted commits structurally. A public edit at a hidden path becomes a native jj
+conflict exactly as `hidden.md` specifies; a Git merge lifts by merging all
+public parents and all private parents separately and replaying the delta
+between them, preserving parent count and order.
+
+Each lifted commit produces a parent-first state row containing its Git object,
+lifted canonical ID, raw public-shadow ID and the identity of the applicable
+hidden set resolved from Q. This identity remains deterministic even when the
+resulting lifted tree contains conflicts.
 
 Lifted results are deterministic: the same fetched commits, seeds and
 hidden-set identities produce identical canonical objects on any machine.
@@ -114,16 +131,14 @@ never needs to re-encode those commits: the fetch transaction records the
 binding between each lifted commit and its already-existing public Git
 counterpart, so export of later work stops at the mapped lifted parent.
 Export of a commit that itself carries a conflict — hidden or public — fails
-closed; hidden-involved conflicts are labeled distinctly (see `hidden.md`).
-The exporter change the fetch path requires is therefore mapping-aware
-traversal plus labeled rejection, not conflict-term filtering.
+closed. Hidden-path conflicts present as ordinary jj conflicts; the boundary
+error names the hidden path. The exporter change the fetch path requires is
+therefore mapping-aware traversal plus path-aware rejection, not conflict-term
+filtering.
 
 ## Open items
 
-- Fetch lifting coverage for policy-bearing (`.dsprivate`) commits, rewritten
-  refs, ambiguous multi-bookmark seeds, octopus merges and hidden parent
-  disagreement.
-- Adversarial depth testing for recursive tree translation.
+- Hidden disagreement between lifted parents needs dedicated coverage.
 - Non-UTF-8 names, case collisions and paths that cannot materialize on a
   client platform have no defined handling.
 - Annotated tags, replace refs, shallow history, partial clones and Git notes
