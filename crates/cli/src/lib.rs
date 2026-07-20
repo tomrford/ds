@@ -3,6 +3,7 @@ mod bare_workspace;
 mod boundary_sync;
 mod checkout;
 mod daemon;
+mod git;
 mod hidden;
 mod remove;
 mod repo;
@@ -58,6 +59,12 @@ async fn restrict_bare_repository_commands(
     // itself through the machine catalog.
     if matches!(command.matches().subcommand_name(), Some("daemon" | "sync")) {
         return stock_dispatch.call(ui, command).await;
+    }
+    if command.matches().subcommand_name() == Some("git")
+        && let Ok(loader) = command.workspace_loader()
+        && crate::checkout::read_checkout_owner(loader.workspace_root()).is_ok()
+    {
+        return git::run_git(ui, command).await;
     }
     let repository_selector = REPOSITORY_SELECTOR
         .get()

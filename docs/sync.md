@@ -433,6 +433,12 @@ detached, retries the notification for a bounded interval and starts a detached
 command does not wait for Worker I/O. Command failures, `ds daemon` and `ds
 sync` do not create another boundary.
 
+`ds git` owns the Git boundary in Devspace checkouts. Its remote registry and
+bookmark push commands replace stock jj Git behavior; all other Git subcommands
+are fenced, with fetch identified as not implemented. `ds git push` suppresses
+the detached command-boundary notification because it runs the same in-process
+sync work unit under the repository sync lock before projection or Git contact.
+
 The daemon holds one machine-local singleton lock. It removes a stale socket,
 drains every complete catalog repository on startup, processes notifications,
 polls the catalog for remote work and exits after an idle timeout. Repository
@@ -497,6 +503,11 @@ local name fails without a cloud request on this warm read path. `ds add`
 handles cloud first use by resolving the name, synchronizing a staged native
 repository and publishing the complete clone. Normal jj workspaces, including
 explicit `-R` workspace paths, continue through jj's stock loader.
+
+Inside an owned Devspace checkout, the runner intercepts the parsed `git`
+subcommand before stock dispatch. Ordinary jj workspaces continue to use stock
+Git commands. Product Git commands require a checkout; repository-targeted bare
+mode remains read-only `log` only.
 
 ## Open verification
 

@@ -76,6 +76,7 @@ pub use projection_transport::{
 pub use sync_engine::{
     CloudHeads, DownloadedPack, HeadTransactionResult, MAX_OBJECT_INVENTORY_KEYS, PackCatalogEntry,
     PackCatalogPage, PackGcError, SyncEngine, SyncEngineError, SyncTransport, TransportError,
+    upload_object_closure,
 };
 pub use sync_state::{
     MachineSyncLock, MachineSyncStore, PendingHead, PendingHeadBatch, PendingHeadTransaction,

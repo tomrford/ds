@@ -235,39 +235,7 @@ impl<'a, T: SyncTransport> SyncEngine<'a, T> {
         &mut self,
         closure: &crate::ObjectClosure,
     ) -> Result<(), SyncEngineError> {
-        let mut cloud_objects = BTreeSet::new();
-        let candidates = closure
-            .objects
-            .iter()
-            .map(|object| object.key)
-            .collect::<Vec<_>>();
-        for page in candidates.chunks(MAX_OBJECT_INVENTORY_KEYS) {
-            let installed = self.transport.inventory_objects(page).await?;
-            if !installed.iter().all(|key| page.binary_search(key).is_ok()) {
-                return Err(SyncEngineError::Inventory(
-                    "cloud returned an object that was not requested",
-                ));
-            }
-            cloud_objects.extend(installed);
-        }
-        let built = build_packs(closure, &cloud_objects, &self.packs_root, self.pack_options)?;
-        for pack in &built.packs {
-            let manifest = pack.manifest.encode();
-            self.transport.upload_manifest(pack.id, &manifest).await?;
-            for position in 0..pack.manifest.chunks().len() {
-                let bytes = fs::read(pack.directory.join(format!("{position:08}.chunk"))).map_err(
-                    |source| SyncEngineError::ReadPack {
-                        path: pack.directory.clone(),
-                        source,
-                    },
-                )?;
-                self.transport
-                    .upload_chunk(pack.id, position, &bytes)
-                    .await?;
-            }
-            self.transport.install_pack(pack.id).await?;
-        }
-        Ok(())
+        upload_object_closure(closure, &self.packs_root, self.pack_options, self.transport).await
     }
 
     async fn download_new_packs(&mut self, state: &mut SyncState) -> Result<(), SyncEngineError> {
@@ -310,6 +278,50 @@ impl<'a, T: SyncTransport> SyncEngine<'a, T> {
         }
         Ok(())
     }
+}
+
+/// Makes an already-discovered immutable object closure cloud durable.
+///
+/// Projection uses this for commit closures which are intentionally not
+/// reachable from an operation head. Inventory negotiation and pack upload are
+/// identical to the ordinary synchronization path.
+pub async fn upload_object_closure<T: SyncTransport>(
+    closure: &crate::ObjectClosure,
+    packs_root: impl AsRef<Path>,
+    pack_options: PackOptions,
+    transport: &mut T,
+) -> Result<(), SyncEngineError> {
+    let mut cloud_objects = BTreeSet::new();
+    let candidates = closure
+        .objects
+        .iter()
+        .map(|object| object.key)
+        .collect::<Vec<_>>();
+    for page in candidates.chunks(MAX_OBJECT_INVENTORY_KEYS) {
+        let installed = transport.inventory_objects(page).await?;
+        if !installed.iter().all(|key| page.binary_search(key).is_ok()) {
+            return Err(SyncEngineError::Inventory(
+                "cloud returned an object that was not requested",
+            ));
+        }
+        cloud_objects.extend(installed);
+    }
+    let built = build_packs(closure, &cloud_objects, packs_root, pack_options)?;
+    for pack in &built.packs {
+        let manifest = pack.manifest.encode();
+        transport.upload_manifest(pack.id, &manifest).await?;
+        for position in 0..pack.manifest.chunks().len() {
+            let bytes = fs::read(pack.directory.join(format!("{position:08}.chunk"))).map_err(
+                |source| SyncEngineError::ReadPack {
+                    path: pack.directory.clone(),
+                    source,
+                },
+            )?;
+            transport.upload_chunk(pack.id, position, &bytes).await?;
+        }
+        transport.install_pack(pack.id).await?;
+    }
+    Ok(())
 }
 
 fn cleanup_local_packs(packs_root: &Path) -> Result<(), PackGcError> {

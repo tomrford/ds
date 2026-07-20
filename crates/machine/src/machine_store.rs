@@ -174,6 +174,14 @@ impl MachineStore {
         self.repository_directory(identity).join("packs")
     }
 
+    /// Returns the rebuildable Git projection sidecar for one repository.
+    ///
+    /// Projection state is deliberately outside the staged native clone and
+    /// can be recreated from cloud mappings whenever this directory is absent.
+    pub fn repository_projection_path(&self, identity: &RepositoryIdentity) -> PathBuf {
+        self.repository_directory(identity).join("projection")
+    }
+
     fn repository_directory(&self, identity: &RepositoryIdentity) -> PathBuf {
         self.root
             .join("repositories")

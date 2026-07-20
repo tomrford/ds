@@ -1,131 +1,126 @@
 # Git push
 
-Devspace pushes projected public commits from the rebuildable bare sidecar to
-real Git remotes, journaled by the repository Durable Object with exact
-expected-old-OID leases (see `git-projection.md`). This document specifies the
-product push mechanism. The recoverable-push invariant and journal protocol
-are implemented and tested. The machine crate also provides the structured
-Git subprocess and remote-registry transport used by the next CLI slice.
+`ds git push` publishes hidden-safe Git history from a native Devspace checkout.
+The repository Durable Object journals exact expected-old-OID leases and decides
+the result from the observed remote refs. The Git process exit code is never the
+authority for whether a push succeeded.
 
-## Mechanism
+## Commands
 
-Push and remote observation use a structured `git` subprocess. This matches
-jj's own operational model at the pinned version: jj-lib performs the wire
-push by executing `git push --porcelain --no-verify` with one exact
-`--force-with-lease=<ref>:<expected>` argument per ref and unforced refspecs,
-then parses per-ref porcelain results. Devspace follows that design directly
-rather than calling jj-lib's API, which exposes neither atomic batches nor a
-side-effect-free ref observation.
+The Git boundary is available only in Devspace checkouts:
 
-The vendored gix cannot push: the locked version has no send-pack or remote
-push implementation. libgit2 would add a native dependency and a second
-credential stack without a capability the subprocess lacks.
-
-Rules:
-
-- every push requests `--atomic`; the journal batches multiple refs and a
-  partial update multiplies ambiguous recovery states. A server that does not
-  advertise atomic push fails the whole command; Devspace does not silently
-  retry without it
-- each ref carries an exact lease: `--force-with-lease=<ref>:<expected-oid>`,
-  with an empty expectation for creation and a deletion refspec for removal
-- refspecs are never force-prefixed; the leading `+` would bypass the lease
-- output is parsed from `--porcelain` with `LC_ALL=C`; the lease rejection
-  (`stale info`) is distinguished from remote policy rejections such as
-  `non-fast-forward`
-- after every attempt, successful or not, the complete requested ref set is
-  observed with `git ls-remote --refs`; absent refs map to explicit absence
-
-The journal decides from the complete post-attempt observation, never from
-the process exit code: `projection_store.ts` accepts only an exact
-all-proposed set, aborts an unclaimed all-expected set, and quarantines mixed
-or ambiguous values. A transport or authentication failure can produce no
-per-ref porcelain lines at all, so the report must distinguish not-reported
-refs; if observation itself fails, the batch stays pending.
-
-## Interface
-
-```rust
-struct LeaseUpdate {
-    expected_old_oid: Option<GitOid>, // None means creation
-    new_oid: Option<GitOid>,          // None means deletion
-}
-
-fn push(
-    sidecar_git_dir: &Path,
-    remote: &RemoteUrl,
-    updates: &BTreeMap<QualifiedRef, LeaseUpdate>,
-    environment: &GitProcessEnvironment,
-) -> Result<PushReport, PushError>;
+```text
+ds git remote add <name> <url>
+ds git remote list
+ds git push -b <bookmark> [-b <bookmark> ...] [--remote <name>]
 ```
 
-`PushReport` carries one entry per input ref — status (updated, deleted,
-up-to-date, lease-rejected, remote-rejected, other-rejected, not-reported)
-plus the observed OID — and a redacted command diagnostic. Every input ref
-appears in the report even when Git emits no line for it.
+The default remote is `origin`. Bookmark arguments are literal Git branch names,
+not patterns. Fetch, tags, push options and the remaining stock jj Git commands
+are fenced because the native store is not Git-backed. `ds git fetch` reports
+that fetch is not implemented.
 
-`QualifiedRef::from_bookmark` is the single bookmark-name validation and
-qualification boundary. It accepts Git branch names and produces only
-`refs/heads/<bookmark>` refs; the journal remains branch-only.
+The repository Durable Object owns the remote registry, so a fresh recovery
+machine resolves the same remote without inheriting another machine's Git
+configuration. A same-URL registration is idempotent. Changing a URL clears
+that remote's projection states, cursors and pending work while retaining the
+repository-wide immutable Git receipts. Password-bearing URL userinfo is
+rejected; credentials do not live in the registry.
 
-The adapter from the journal is direct: resolve the batch's remote identity
-to a push URL, qualify each bookmark as `refs/heads/<bookmark>`, copy the
-expected old OID, resolve the proposed state's Git OID or `None` for
-deletion, push the map atomically, and submit the complete observation set to
-the recovery route.
+## Push flow
 
-## Remote identity
+A push snapshots the checkout, resolves every requested local bookmark to
+exactly one commit, then performs the ordinary in-process repository sync under
+the per-repository sync lock. A conflicted bookmark fails before Git contact.
+An absent local bookmark is a deletion only when the selected remote has a
+projection cursor for it; otherwise the command reports `no such bookmark`.
 
-The journal stores a remote identity, not a URL. The repository Durable
-Object owns a remote registry mapping that identity to a fetch/push URL, so a
-fresh machine running recovery can resolve `origin` without inheriting
-another machine's git configuration. The projection schema stores this as
-`remotes (name TEXT PRIMARY KEY, url TEXT NOT NULL)`.
+After sync, the command:
 
-Authenticated repository routes expose the registry:
+1. pages one projection snapshot at a fixed activation high-water and loads the
+   accepted mappings, cursors and pending batches;
+2. opens or creates the rebuildable Git sidecar at the machine repository's
+   `projection/` directory;
+3. supplies that bookmark's accepted mappings to `export_reachable`, exports
+   its canonical target and scans the resulting public head again under the
+   target commit's hidden set;
+4. imports the public Git commits as native public shadows and assembles each
+   new journal state from the Git OID, canonical commit, public commit and the
+   canonical commit's hidden-set identity;
+5. discovers the canonical target and public-shadow commit closure, negotiates
+   cloud inventory, and uploads and installs the missing immutable packs;
+6. creates a random 128-bit journal batch carrying one update per bookmark,
+   the cursor's expected old OID and the proposed head state, or no proposed
+   state for deletion;
+7. performs one foreground, atomic, lease-protected Git push through the
+   registered URL and Git's normal credential stack;
+8. observes the complete requested ref set and submits those values to journal
+   recovery; and
+9. reports success only when the journal accepts the batch.
 
-- `PUT /repositories/<repo>/remotes/<name>` accepts `{incarnation, url}` and
-  upserts the mapping
-- `GET /repositories/<repo>/remotes?incarnation=...` lists mappings by name
+A cursor already binding the bookmark to the selected canonical commit is
+up-to-date and creates no journal batch. Successful output is one line per
+requested ref: creation, deletion and up-to-date results are named directly;
+updates show the old and new short Git OIDs. Projection, pack and Git plumbing
+output stays captured.
 
-A same-URL upsert is an idempotent no-op. Changing the URL clears only that
-remote's projection states, cursors, pending batches, batch refs, batch
-results and recovery claims. Git receipts are repository-wide immutable
-records and survive the change.
+## Git subprocess
 
-Remote names use the projection-name rules and 256-byte UTF-8 limit. URLs are
-non-empty single-line strings of at most 1024 UTF-8 bytes. Schemes are not
-allowlisted: username-only SSH URLs, scp syntax, HTTPS URLs and absolute local
-paths are valid. A password in URL userinfo is rejected with
-`credentials-in-remote-url`; credentials never live in the registry.
+Every non-empty batch uses:
 
-## Credentials
+- `git push --porcelain --no-verify --atomic`;
+- one `--force-with-lease=<ref>:<expected-oid>` per ref, with an empty
+  expectation for creation;
+- unforced OID-to-ref refspecs, or deletion refspecs; and
+- `LC_ALL=C` for stable porcelain parsing.
 
-Authentication stays inside Git's established credential paths; tokens never
-appear in URLs, arguments or logs.
+After every attempt, successful or not, `git ls-remote --refs` observes all
+requested refs. An atomic-capability or remote-policy rejection fails the whole
+batch. A lease rejection reports `remote ref moved outside devspace; fetch is
+not yet implemented`.
 
-- HTTPS: inherit configured credential helpers; when Devspace owns a token,
-  pass a scoped `GIT_ASKPASS` through the per-command environment. Background
-  recovery sets `GIT_TERMINAL_PROMPT=0` so a replay can never hang on a
-  prompt; a foreground command may present an intentional askpass UI
-- SSH: inherit the user's SSH config and `SSH_AUTH_SOCK`; a Devspace-managed
-  key or host policy uses a scoped `GIT_SSH_COMMAND`. Background recovery
-  fails and stays pending rather than waiting for input
+The subprocess wrapper retains one structured report entry for every requested
+ref, including refs Git did not mention. If remote observation fails, the
+journal batch remains pending because absence cannot be inferred from missing
+output. If the push process fails but observation shows every proposed value,
+the journal accepts the batch; if observation shows every expected value, an
+unclaimed batch aborts. Mixed or otherwise ambiguous values remain
+quarantined.
 
-The subprocess wrapper accepts an explicit git executable path and a
-per-command environment map, mirroring jj-lib's subprocess options. Remote
-URLs and environment values are absent from report and error formatting.
-Diagnostics replace the URL argument with `<remote>`, bound stderr, and drop
-lines containing the URL authority or an injected environment value; servers
-and credential helpers can emit sensitive text.
+## Recovery
 
-## Object format
+Before creating a new batch, the command checks for pending batches overlapping
+the requested remote and bookmarks. It also refreshes this check when
+`begin_push` loses a race to another pending owner.
 
-The journal and wire protocol carry 20-byte SHA-1 OIDs. Registration stores a
-location without contacting the remote, so it does not probe object format.
-SHA-256 remotes remain unsupported; supporting them requires an object-format
-field and variable-length OIDs in the journal protocol first.
+The recovery machine claims the complete pending batch, reads its exact replay
+payload and repeats the recorded multi-ref lease push. Active mappings plus the
+replay's quarantined mappings rebuild missing Git objects in an empty sidecar.
+If replay exposes a missing canonical object, the machine downloads and
+installs the cloud pack catalog through the normal pack path, then re-exports.
+Every rebuilt public head passes the hidden-path scan before Git contact.
 
-## Open items
+The command observes the complete replayed ref set and calls `recover_push`
+with the new fencing token. Only an accepted journal outcome completes
+recovery. This lets a machine with a fresh native clone and no sidecar finish a
+push after another machine moved the remote ref and stopped before finalising
+the journal.
 
-- Push options, tags and signing are not part of the native Git surface.
+## Credentials and diagnostics
+
+HTTPS pushes inherit configured credential helpers. SSH pushes inherit the
+user's SSH configuration and `SSH_AUTH_SOCK`. Foreground pushes may prompt.
+Remote URLs never appear in arguments retained for diagnostics: the safe
+command shape uses `<remote>`. Diagnostic stderr is bounded and removes lines
+containing the remote URL, its authority or injected credential environment
+values. Callers pass the registry URL only through the redacting `RemoteUrl`
+wrapper and never format it themselves.
+
+The journal and wire protocol carry 20-byte SHA-1 OIDs. SHA-256 remotes remain
+unsupported because the journal does not yet carry an object-format field or
+variable-length OIDs.
+
+## Unsupported surface
+
+Push options, tags, signing and SHA-256 remotes are outside the native Git
+surface.

@@ -373,7 +373,10 @@ impl ProjectionTransport {
         let bytes = read_bounded(response, MAX_ERROR_BYTES).await?;
         let error = serde_json::from_slice::<ErrorResponse>(&bytes).map_or_else(
             |_| "cloud request failed without an error body".to_owned(),
-            |body| body.error,
+            |body| match body.code {
+                Some(code) => format!("{code}: {}", body.error),
+                None => body.error,
+            },
         );
         Err(format!("cloud request failed with status {status}: {error}").into())
     }
@@ -399,6 +402,7 @@ impl ProjectionTransport {
 #[derive(Deserialize)]
 struct ErrorResponse {
     error: String,
+    code: Option<String>,
 }
 
 async fn read_bounded(
