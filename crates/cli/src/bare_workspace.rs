@@ -132,7 +132,11 @@ impl WorkspaceLoaderFactory for DevspaceWorkspaceLoaderFactory {
         if workspace_root.join(".jj").is_dir() {
             let loader = DefaultWorkspaceLoaderFactory.create(workspace_root)?;
             crate::boundary_sync::record_repository_path(loader.repo_path());
-            Ok(loader)
+            if crate::checkout::read_checkout_owner(workspace_root).is_ok() {
+                Ok(crate::working_copy::wrap_workspace_loader(loader))
+            } else {
+                Ok(loader)
+            }
         } else if let Some(selection) = self.repository_selector.selection()
             && workspace_root == selection.requested_path
         {

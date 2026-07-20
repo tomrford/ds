@@ -112,57 +112,91 @@ async fn checkout(root: &Path, config: &Path, name: &str) -> PathBuf {
 }
 
 #[tokio::test]
-async fn hidden_add_remove_list_round_trip_and_force_tracks_ignored_files() {
+async fn ordinary_snapshot_tracks_gitignored_hidden_file_and_sealed_change() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
-    let checkout = checkout(temp.path(), &config, "hidden-round-trip").await;
-    fs::write(checkout.join(".gitignore"), "*.env\n").unwrap();
-    fs::write(checkout.join(".dshide"), "# keep this comment\n").unwrap();
+    let checkout = checkout(temp.path(), &config, "hidden-file").await;
+    fs::write(checkout.join(".gitignore"), "*.env\n.dshide\n").unwrap();
+    fs::write(checkout.join(".dshide"), "*.env\n").unwrap();
     fs::write(checkout.join("secret.env"), "private\n").unwrap();
 
-    let added = ds(&checkout, &config, &["hidden", "add", "*.env"]);
-    assert!(added.status.success(), "{}", stderr(&added));
-    assert!(!stderr(&added).contains("not covered by gitignore"));
-    let listed = ds(&checkout, &config, &["hidden", "list"]);
-    assert!(listed.status.success(), "{}", stderr(&listed));
-    assert_eq!(stdout(&listed), "# keep this comment\n*.env\n");
+    let tracked = ds(
+        &checkout,
+        &config,
+        &["file", "list", ".dshide", "secret.env"],
+    );
+    assert!(tracked.status.success(), "{}", stderr(&tracked));
+    assert_eq!(stdout(&tracked), ".dshide\nsecret.env\n");
 
+    let sealed = ds(&checkout, &config, &["new", "-m", "after secret"]);
+    assert!(sealed.status.success(), "{}", stderr(&sealed));
+    let committed = ds(
+        &checkout,
+        &config,
+        &["file", "list", "-r", "@-", "secret.env"],
+    );
+    assert!(committed.status.success(), "{}", stderr(&committed));
+    assert_eq!(stdout(&committed), "secret.env\n");
+}
+
+#[tokio::test]
+async fn ordinary_snapshot_tracks_files_beneath_hidden_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    let checkout = checkout(temp.path(), &config, "hidden-directory").await;
+    fs::write(checkout.join(".gitignore"), "private/\n").unwrap();
+    fs::write(checkout.join(".dshide"), "private/\n").unwrap();
+    fs::create_dir(checkout.join("private")).unwrap();
+    fs::write(checkout.join("private/secret"), "private\n").unwrap();
+
+    let tracked = ds(&checkout, &config, &["file", "list", "private/secret"]);
+    assert!(tracked.status.success(), "{}", stderr(&tracked));
+    assert_eq!(stdout(&tracked), "private/secret\n");
+}
+
+#[tokio::test]
+async fn removing_hidden_pattern_keeps_file_tracked() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    let checkout = checkout(temp.path(), &config, "hidden-removal").await;
+    fs::write(checkout.join(".gitignore"), "secret.env\n").unwrap();
+    fs::write(checkout.join(".dshide"), "secret.env\n").unwrap();
+    fs::write(checkout.join("secret.env"), "private\n").unwrap();
     let tracked = ds(&checkout, &config, &["file", "list", "secret.env"]);
     assert!(tracked.status.success(), "{}", stderr(&tracked));
     assert_eq!(stdout(&tracked), "secret.env\n");
 
-    let duplicate = ds(&checkout, &config, &["hidden", "add", "*.env"]);
-    assert!(duplicate.status.success(), "{}", stderr(&duplicate));
-    assert!(stderr(&duplicate).contains("already in .dshide"));
-    assert_eq!(
-        fs::read_to_string(checkout.join(".dshide")).unwrap(),
-        "# keep this comment\n*.env\n"
-    );
-
-    let removed = ds(&checkout, &config, &["hidden", "remove", "*.env"]);
-    assert!(removed.status.success(), "{}", stderr(&removed));
-    assert!(stderr(&removed).contains("eligible for future Git publication"));
-    let listed = ds(&checkout, &config, &["hidden", "list"]);
-    assert_eq!(stdout(&listed), "# keep this comment\n");
+    fs::write(checkout.join(".dshide"), "").unwrap();
+    let still_tracked = ds(&checkout, &config, &["file", "list", "secret.env"]);
+    assert!(still_tracked.status.success(), "{}", stderr(&still_tracked));
+    assert_eq!(stdout(&still_tracked), "secret.env\n");
 }
 
 #[tokio::test]
-async fn hidden_add_warns_when_matching_content_is_not_gitignored() {
+async fn missing_dshide_leaves_gitignored_files_untracked() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
-    let checkout = checkout(temp.path(), &config, "hidden-warning").await;
-    fs::write(checkout.join("secret.txt"), "private\n").unwrap();
+    let checkout = checkout(temp.path(), &config, "no-hidden-policy").await;
+    fs::write(checkout.join(".gitignore"), "secret.env\n").unwrap();
+    fs::write(checkout.join("secret.env"), "private\n").unwrap();
 
-    let added = ds(&checkout, &config, &["hidden", "add", "secret.txt"]);
-    assert!(added.status.success(), "{}", stderr(&added));
-    assert!(stderr(&added).contains("not covered by gitignore"));
+    let untracked = ds(&checkout, &config, &["file", "list", "secret.env"]);
+    assert!(untracked.status.success(), "{}", stderr(&untracked));
+    assert_eq!(stdout(&untracked), "");
 }
 
 #[test]
-fn hidden_commands_require_a_devspace_checkout() {
+fn plain_jj_repository_gets_no_hidden_auto_tracking() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
-    let output = ds(temp.path(), &config, &["hidden", "list"]);
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("There is no jj repo"));
+    let plain = temp.path().join("plain");
+    let initialized = ds(temp.path(), &config, &["git", "init", "plain"]);
+    assert!(initialized.status.success(), "{}", stderr(&initialized));
+    fs::write(plain.join(".gitignore"), ".dshide\nsecret.env\n").unwrap();
+    fs::write(plain.join(".dshide"), "secret.env\n").unwrap();
+    fs::write(plain.join("secret.env"), "private\n").unwrap();
+
+    let untracked = ds(&plain, &config, &["file", "list", ".dshide", "secret.env"]);
+    assert!(untracked.status.success(), "{}", stderr(&untracked));
+    assert_eq!(stdout(&untracked), "");
 }

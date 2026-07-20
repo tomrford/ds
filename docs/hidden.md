@@ -34,23 +34,21 @@ commit, serialized and replicated like any other.
 
 ## User contract
 
-```sh
-ds hidden add .env
-ds hidden list
-ds hidden remove .env
-```
+Edit the root `.dshide` file to change the hidden set. Every snapshot in a
+Devspace checkout force-tracks `.dshide` itself and all working-copy files its
+current contents match, including files beneath matched directories. An
+existing gitignored secret therefore becomes canonical as soon as its pattern
+is present for the next ordinary command or explicit snapshot.
 
-The verbs are sugar over editing `.dshide` in the working copy; editing the
-file directly is equivalent. `ds hidden add` also force-tracks working-copy
-files matched by the new pattern in the same snapshot, so an existing
-gitignored secret becomes canonical immediately. Devspace does not edit or
-infer policy from `.gitignore`; hidden patterns should usually also be covered
-by gitignore so plain-git collaborators never commit their local copies, and
-the CLI warns when they are not.
+`.dshide` is not an ignore file: matching a path versions it privately and
+hides it from Git. Keep hidden paths covered by gitignore as well so plain-Git
+collaborators do not commit their local copies. Devspace does not edit or infer
+`.dshide` policy from `.gitignore`.
 
-Removing a pattern does not delete content from native history. It makes
-matching content eligible for the next Git publication from descendants of
-that commit, so the CLI warns.
+Removing a pattern does not untrack matching content or delete it from native
+history. Gitignore the path, then run `ds file untrack <path>` to stop tracking
+it. A path still tracked after its pattern is removed is eligible for the next
+Git publication from descendants of that commit.
 
 ## Projection
 

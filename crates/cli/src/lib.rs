@@ -4,11 +4,11 @@ mod boundary_sync;
 mod checkout;
 mod daemon;
 mod git;
-mod hidden;
 mod remove;
 mod repo;
 mod sync;
 mod sync_status;
+mod working_copy;
 
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
