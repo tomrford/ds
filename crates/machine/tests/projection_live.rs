@@ -168,14 +168,6 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
     let mut cloud = HttpTransport::new(&first_config, &repository_id, incarnation).unwrap();
     cloud.probe_access().await.unwrap();
     let journal = ProjectionTransport::new(&first_config, &repository_id, incarnation).unwrap();
-    assert_eq!(
-        journal
-            .mutate_hidden_path("secrets/.env", true)
-            .await
-            .unwrap()
-            .policy_epoch,
-        1
-    );
 
     let sidecar = temp.path().join("machine-a/projection");
     let projection = GitProjection::init(&sidecar, &settings).unwrap();
@@ -205,18 +197,22 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
         .iter()
         .map(|mapping| (mapping.git_id.clone(), mapping.canonical_id.clone()))
         .collect::<BTreeMap<_, _>>();
-    let states = exported
-        .new_mappings
-        .iter()
-        .map(|mapping| ProjectionState {
+    let mut states = Vec::with_capacity(exported.new_mappings.len());
+    for mapping in &exported.new_mappings {
+        let state_hidden_set = projection
+            .hidden_set_for_commit(first.repo().store(), &mapping.canonical_id)
+            .await
+            .unwrap();
+        states.push(ProjectionState {
             git_oid: mapping.git_id.as_bytes().try_into().unwrap(),
             canonical_commit_id: mapping.canonical_id.as_bytes().try_into().unwrap(),
             public_commit_id: public_by_git[&mapping.git_id]
                 .as_bytes()
                 .try_into()
                 .unwrap(),
-        })
-        .collect::<Vec<_>>();
+            hidden_set_id: state_hidden_set.identity().to_projection_id(),
+        });
+    }
     let proposed_state = states
         .iter()
         .position(|state| state.git_oid.as_slice() == git_head.as_bytes())
@@ -258,7 +254,6 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
             batch_id,
             first_machine,
             "origin",
-            1,
             &[ProjectionUpdate {
                 bookmark: "main".to_owned(),
                 expected_old_oid: None,
@@ -392,7 +387,6 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
             replay_batch_id,
             first_machine,
             "origin",
-            1,
             &[ProjectionUpdate {
                 bookmark: "replay".to_owned(),
                 expected_old_oid: None,

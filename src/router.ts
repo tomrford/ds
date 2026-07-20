@@ -43,7 +43,6 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
     );
     const headMatch = /^\/repositories\/([^/]+)\/heads$/.exec(url.pathname);
     const projectionMatch = /^\/repositories\/([^/]+)\/projection$/.exec(url.pathname);
-    const hiddenPolicyMatch = /^\/repositories\/([^/]+)\/hidden-policy$/.exec(url.pathname);
     const projectionPushMatch = /^\/repositories\/([^/]+)\/git\/pushes$/.exec(url.pathname);
     const projectionPushActionMatch =
       /^\/repositories\/([^/]+)\/git\/pushes\/([^/]+)\/(claim|confirm|recover|replay)$/.exec(
@@ -58,7 +57,6 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
       packMatch?.[1] ??
       headMatch?.[1] ??
       projectionMatch?.[1] ??
-      hiddenPolicyMatch?.[1] ??
       projectionPushMatch?.[1] ??
       projectionPushActionMatch?.[1] ??
       packCatalogMatch?.[1] ??
@@ -200,11 +198,6 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
             throughValue === null ? undefined : Number(throughValue),
           ),
         );
-      }
-      if (hiddenPolicyMatch !== null && request.method === "POST") {
-        const body = await readJsonBody(request, MAX_PROJECTION_REQUEST_BYTES, "hidden policy request");
-        if (body instanceof Response) return body;
-        return rpcResponse(await stub.mutateHiddenPolicy(authority, body));
       }
       if (projectionPushMatch !== null && request.method === "POST") {
         const body = await readJsonBody(request, MAX_PROJECTION_REQUEST_BYTES, "projection push request");

@@ -31,22 +31,22 @@ shadow commit cloud durable before a pending push is accepted.
 
 ## Cloud journal
 
-The existing per-repository Durable Object owns immutable hidden-policy
-versions, Git-object receipts, append-only projection states, exact ref
-cursors, pending push batches and final results. It does not execute Git.
+The per-repository Durable Object owns Git-object receipts, append-only
+projection states, exact ref cursors, pending push batches and final results.
+Each state binds a Git object ID, private canonical commit, public shadow
+commit and nullable hidden-set identity. It does not execute Git.
 
 A batch contains the exact remote and bookmark set, expected old Git IDs, the
-full reachable private/public/Git mapping set, one optional proposed state per
-ref, the current policy epoch, an owner machine and a monotonic fencing token.
-Draft mappings remain quarantined until the complete batch is accepted.
-Disjoint ref batches may coexist; an overlapping ref is locked by its pending
-batch. A real policy change fails while any batch is pending, while an
-idempotent no-op returns the current epoch.
+full reachable state set, one optional proposed state per ref, an owner machine
+and a monotonic fencing token. The hidden-set binding belongs to each state,
+not the batch. Draft mappings remain quarantined until the complete batch is
+accepted. Disjoint ref batches may coexist; an overlapping ref is locked by
+its pending batch.
 
 Creating a batch checks that every private and public commit is already in the
 cloud object store. Git receipts are repository-wide and immutable: one Git
 commit ID cannot later name a different public shadow. Reusing a batch ID with
-different canonical input fails.
+different canonical input or hidden-set identity fails.
 
 Any authenticated machine may claim a pending batch. Claiming assigns a new
 fencing token, so a callback from the previous owner cannot finalise it. A
@@ -78,10 +78,15 @@ deleted sidecar from durable mapping rows, and reject a Git link without
 changing the native operation head.
 
 Workers Vitest exercises the authenticated HTTP routes and real SQLite-backed
-Durable Object. It covers policy epochs, hidden drafts, eviction, overlapping
-batches, stale fences, exact retry receipts, before-push abort, post-push
-acceptance, mixed-outcome quarantine, cloud-durability checks and immutable
-receipt collisions.
+Durable Object. It covers nullable and concrete hidden-set identities through
+replay and accepted snapshots, malformed identity rejection, identity-bound
+batch retries, eviction, overlapping batches, stale fences, before-push abort,
+post-push acceptance, mixed-outcome quarantine, cloud-durability checks and
+immutable receipt collisions.
+
+Rust transport coverage proves both the sync and projection clients use the
+hardened HTTP client and terminate when a Worker accepts a request but never
+responds.
 
 The ignored `projection_live` test crosses the Rust/TypeScript boundary against
 `wrangler dev` or a deployment. It creates private native history, exports and
@@ -102,11 +107,10 @@ probe because its repository authority and Git remote are supplied explicitly.
 ## Budgets and benchmarks
 
 The journal bounds one request to 4 MiB, 256 refs and 8,192 projection states.
-Repository-wide pending and active ref sets are each bounded to 512. The
-current server epoch routes bound names and hidden paths to 256 UTF-8 bytes and
-one policy to 4,096 exact paths and 256 KiB of path text. Mapping reads page
-256 rows under one fixed activation high-water. These are current safety
-limits, not settled production quotas.
+Repository-wide pending and active ref sets are each bounded to 512. Remote
+and bookmark names are bounded to 256 UTF-8 bytes. Mapping reads page 256 rows
+under one fixed activation high-water. These are current safety limits, not
+settled production quotas.
 
 The projection path does not run during warm repository open. The release-only
 comparison remains inside the 2 times budget; 3 current local runs measure
@@ -128,9 +132,7 @@ The validation Wasm is 142,859 bytes and remains below its 200 KiB build gate.
 - Fetch-side hidden-lineage lifting, remote identity and production Git
   credential handling are specified in [`git-fetch.md`](git-fetch.md) and
   [`git-push.md`](git-push.md) but not yet implemented. The machine projection
-  uses the per-commit hidden model in [`hidden.md`](hidden.md). The cloud
-  journal still exposes the repository-scoped policy epoch surface, which is
-  retired in the next implementation chunk.
+  uses the per-commit hidden model in [`hidden.md`](hidden.md).
 - Projection width and depth need observational scaling measurements before
   production limits are set. Exercise at least 1,000, 10,000 and 100,000 tree
   entries, and history depths of 1, 100 and 1,000 commits, recording cold

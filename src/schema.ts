@@ -149,21 +149,10 @@ export function initializeSchema(sql: SqlStorage) {
   sql.exec(`
     CREATE TABLE IF NOT EXISTS projection_meta (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      current_policy_epoch INTEGER NOT NULL CHECK (current_policy_epoch >= 0),
       next_fence INTEGER NOT NULL CHECK (next_fence >= 0),
       activation_cursor INTEGER NOT NULL CHECK (activation_cursor >= 0)
     );
-    INSERT OR IGNORE INTO projection_meta VALUES (1, 0, 0, 0);
-    CREATE TABLE IF NOT EXISTS hidden_policy_versions (
-      epoch INTEGER PRIMARY KEY,
-      created_at_ms INTEGER NOT NULL
-    );
-    INSERT OR IGNORE INTO hidden_policy_versions VALUES (0, 0);
-    CREATE TABLE IF NOT EXISTS hidden_policy_paths (
-      epoch INTEGER NOT NULL,
-      path TEXT NOT NULL,
-      PRIMARY KEY (epoch, path)
-    ) WITHOUT ROWID;
+    INSERT OR IGNORE INTO projection_meta VALUES (1, 0, 0);
     CREATE TABLE IF NOT EXISTS git_receipts (
       git_oid BLOB PRIMARY KEY,
       public_commit_id BLOB NOT NULL
@@ -171,7 +160,6 @@ export function initializeSchema(sql: SqlStorage) {
     CREATE TABLE IF NOT EXISTS projection_batches (
       batch_id BLOB PRIMARY KEY,
       remote TEXT NOT NULL,
-      policy_epoch INTEGER NOT NULL,
       owner_machine BLOB NOT NULL,
       fence INTEGER NOT NULL,
       request_hash BLOB NOT NULL,
@@ -184,7 +172,7 @@ export function initializeSchema(sql: SqlStorage) {
       git_oid BLOB NOT NULL,
       canonical_commit_id BLOB NOT NULL,
       public_commit_id BLOB NOT NULL,
-      policy_epoch INTEGER NOT NULL,
+      hidden_set_id BLOB,
       pending_batch_id BLOB,
       activation_seq INTEGER UNIQUE
     );

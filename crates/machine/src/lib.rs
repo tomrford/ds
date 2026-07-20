@@ -1,6 +1,7 @@
 mod control_plane_client;
 mod creation_intent;
 mod git_projection;
+mod http_client;
 mod http_transport;
 mod install;
 mod locked_json;
@@ -62,9 +63,9 @@ pub use pack::{
 };
 pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
 pub use projection_transport::{
-    HiddenPolicyResult, PendingProjectionBatch, PendingProjectionRef, ProjectionBatchResult,
-    ProjectionClaimResult, ProjectionCursor, ProjectionMapping, ProjectionObservation,
-    ProjectionReplay, ProjectionSnapshot, ProjectionState, ProjectionTransport, ProjectionUpdate,
+    PendingProjectionBatch, PendingProjectionRef, ProjectionBatchResult, ProjectionClaimResult,
+    ProjectionCursor, ProjectionMapping, ProjectionObservation, ProjectionReplay,
+    ProjectionSnapshot, ProjectionState, ProjectionTransport, ProjectionUpdate,
 };
 pub use sync_engine::{
     CloudHeads, DownloadedPack, HeadTransactionResult, MAX_OBJECT_INVENTORY_KEYS, PackCatalogEntry,

@@ -73,11 +73,10 @@ commits keep the bytes they published.
 
 Projection states bind each published Git object to one private canonical
 commit and the identity of the `.dshide` blob under which it was exported.
-This replaces the v2 policy epoch. Fetch interprets a seed under the hidden
-set recorded by its exact state; when ancestry reaches a Git object recorded
-through several bookmarks, the newest state per bookmark must agree on one
-private commit and hidden-set identity, or the seed is ambiguous and fails
-closed.
+Fetch interprets a seed under the hidden set recorded by its exact state; when
+ancestry reaches a Git object recorded through several bookmarks, the newest
+state per bookmark must agree on one private commit and hidden-set identity,
+or the seed is ambiguous and fails closed.
 
 ## Fetch, inheritance and pollution
 
@@ -135,7 +134,5 @@ remotes do not.
 ## Open items
 
 - Canonical byte definitions and selection rule for the 2 tombstone objects.
-- The spike-era repository-scoped policy routes and epoch tables in the cloud
-  journal are retired in the next implementation chunk.
 - Hidden-path labeling in conflict surfaces needs a CLI design; the current
   embedded runner exposes only bare-repository `log`.

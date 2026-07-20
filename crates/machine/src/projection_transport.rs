@@ -3,6 +3,7 @@
 use serde::Deserialize;
 
 use crate::MachineConfig;
+use crate::http_client::hardened_http_client;
 use crate::sync_engine::TransportError;
 
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -17,6 +18,8 @@ pub struct ProjectionState {
     pub canonical_commit_id: [u8; 64],
     #[serde(deserialize_with = "deserialize_object_id")]
     pub public_commit_id: [u8; 64],
+    #[serde(deserialize_with = "deserialize_optional_object_id")]
+    pub hidden_set_id: Option<[u8; 64]>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -56,18 +59,10 @@ pub struct ProjectionReplay {
     #[serde(deserialize_with = "deserialize_short_id")]
     pub batch_id: [u8; 16],
     pub remote: String,
-    pub policy_epoch: u64,
     #[serde(deserialize_with = "deserialize_short_id")]
     pub owner_machine: [u8; 16],
     pub fence: u64,
     pub updates: Vec<ProjectionUpdate>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct HiddenPolicyResult {
-    pub changed: bool,
-    pub policy_epoch: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -81,7 +76,8 @@ pub struct ProjectionMapping {
     pub canonical_commit_id: [u8; 64],
     #[serde(deserialize_with = "deserialize_object_id")]
     pub public_commit_id: [u8; 64],
-    pub policy_epoch: u64,
+    #[serde(deserialize_with = "deserialize_optional_object_id")]
+    pub hidden_set_id: Option<[u8; 64]>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -95,7 +91,8 @@ pub struct ProjectionCursor {
     pub canonical_commit_id: [u8; 64],
     #[serde(deserialize_with = "deserialize_object_id")]
     pub public_commit_id: [u8; 64],
-    pub policy_epoch: u64,
+    #[serde(deserialize_with = "deserialize_optional_object_id")]
+    pub hidden_set_id: Option<[u8; 64]>,
     pub activation_sequence: u64,
 }
 
@@ -105,7 +102,6 @@ pub struct PendingProjectionBatch {
     #[serde(deserialize_with = "deserialize_short_id")]
     pub batch_id: [u8; 16],
     pub remote: String,
-    pub policy_epoch: u64,
     #[serde(deserialize_with = "deserialize_short_id")]
     pub owner_machine: [u8; 16],
     pub fence: u64,
@@ -125,8 +121,6 @@ pub struct PendingProjectionRef {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionSnapshot {
-    pub policy_epoch: u64,
-    pub hidden_paths: Vec<String>,
     pub activation_cursor: u64,
     pub cursors: Vec<ProjectionCursor>,
     pub mappings: Vec<ProjectionMapping>,
@@ -156,7 +150,7 @@ impl ProjectionTransport {
         ))?;
         authorization.set_sensitive(true);
         Ok(Self {
-            client: reqwest::Client::builder().build()?,
+            client: hardened_http_client()?,
             repository_url: format!(
                 "{}/repositories/{repository}",
                 config.base_url().trim_end_matches('/')
@@ -182,32 +176,11 @@ impl ProjectionTransport {
         self.read_json(response).await
     }
 
-    pub async fn mutate_hidden_path(
-        &self,
-        path: &str,
-        hidden: bool,
-    ) -> Result<HiddenPolicyResult, TransportError> {
-        let body = serde_json::json!({
-            "incarnation": self.incarnation,
-            "path": path,
-            "hidden": hidden,
-        });
-        let response = self
-            .send(
-                self.client
-                    .post(format!("{}/hidden-policy", self.repository_url))
-                    .json(&body),
-            )
-            .await?;
-        self.read_json(response).await
-    }
-
     pub async fn begin_push(
         &self,
         batch_id: [u8; 16],
         machine_id: [u8; 16],
         remote: &str,
-        policy_epoch: u64,
         updates: &[ProjectionUpdate],
     ) -> Result<ProjectionBatchResult, TransportError> {
         let updates = updates
@@ -220,6 +193,7 @@ impl ProjectionTransport {
                         "gitOid": hex(&state.git_oid),
                         "canonicalCommitId": hex(&state.canonical_commit_id),
                         "publicCommitId": hex(&state.public_commit_id),
+                        "hiddenSetId": state.hidden_set_id.as_ref().map(|id| hex(id)),
                     })).collect::<Vec<_>>(),
                     "proposedState": update.proposed_state,
                 })
@@ -230,7 +204,6 @@ impl ProjectionTransport {
             "batchId": hex(&batch_id),
             "machineId": hex(&machine_id),
             "remote": remote,
-            "policyEpoch": policy_epoch,
             "updates": updates,
         });
         let response = self
@@ -425,6 +398,18 @@ where
     D: serde::Deserializer<'de>,
 {
     deserialize_hex(deserializer, "object ID")
+}
+
+fn deserialize_optional_object_id<'de, D>(deserializer: D) -> Result<Option<[u8; 64]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            parse_hex(&value).map_err(|()| serde::de::Error::custom("invalid optional object ID"))
+        })
+        .transpose()
 }
 
 fn deserialize_hex<'de, D, const N: usize>(

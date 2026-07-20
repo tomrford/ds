@@ -598,7 +598,6 @@ describe("Git projection journal", () => {
           batchId: "79".repeat(16),
           machineId: recoveryMachine,
           remote: "origin",
-          policyEpoch: 0,
           updates: [
             {
               bookmark: "main",
@@ -608,6 +607,7 @@ describe("Git projection journal", () => {
                   gitOid: "01".repeat(20),
                   canonicalCommitId: "01".repeat(64),
                   publicCommitId: "02".repeat(64),
+                  hiddenSetId: null,
                 },
               ],
               proposedState: 0,
@@ -627,30 +627,15 @@ describe("Git projection journal", () => {
     const repository = "projection-recovery";
     const batchId = "81".repeat(16);
     const gitOid = "91".repeat(20);
+    const hiddenSetId = "a5".repeat(64);
     await initializeProjectionRepository(repository, incarnation);
     const [canonicalCommitId, publicCommitId] = await installProjectionCommits(repository);
-
-    expect(
-      await projectionRequest(repository, "hidden-policy", {
-        incarnation,
-        path: "secrets/.env",
-        hidden: true,
-      }),
-    ).toEqual({ status: 200, body: { changed: true, policyEpoch: 1 } });
-    expect(
-      await projectionRequest(repository, "hidden-policy", {
-        incarnation,
-        path: "secrets/.env",
-        hidden: true,
-      }),
-    ).toEqual({ status: 200, body: { changed: false, policyEpoch: 1 } });
 
     const begin = projectionBatch(
       incarnation,
       batchId,
       firstMachine,
-      1,
-      projectionUpdate("main", null, gitOid, canonicalCommitId, publicCommitId),
+      projectionUpdate("main", null, gitOid, canonicalCommitId, publicCommitId, hiddenSetId),
     );
     expect(await projectionRequest(repository, "git/pushes", begin)).toEqual({
       status: 200,
@@ -659,8 +644,6 @@ describe("Git projection journal", () => {
     expect(await getProjection(repository, incarnation)).toEqual({
       status: 200,
       body: {
-        policyEpoch: 1,
-        hiddenPaths: ["secrets/.env"],
         activationCursor: 0,
         cursors: [],
         mappings: [],
@@ -671,7 +654,6 @@ describe("Git projection journal", () => {
           {
             batchId,
             remote: "origin",
-            policyEpoch: 1,
             ownerMachine: firstMachine,
             fence: 1,
             refs: [
@@ -684,16 +666,6 @@ describe("Git projection journal", () => {
           },
         ],
       },
-    });
-    expect(
-      await projectionRequest(repository, "hidden-policy", {
-        incarnation,
-        path: "another-secret",
-        hidden: true,
-      }),
-    ).toEqual({
-      status: 409,
-      body: { error: "hidden policy cannot change while a push is pending" },
     });
 
     await evictDurableObject(await repositoryStub(repository, incarnation));
@@ -708,7 +680,6 @@ describe("Git projection journal", () => {
       body: {
         batchId,
         remote: "origin",
-        policyEpoch: 1,
         ownerMachine: recoveryMachine,
         fence: 2,
         updates: begin.updates,
@@ -769,7 +740,7 @@ describe("Git projection journal", () => {
           gitOid,
           canonicalCommitId,
           publicCommitId,
-          policyEpoch: 1,
+          hiddenSetId,
           activationSequence: 1,
         },
       ],
@@ -781,7 +752,10 @@ describe("Git projection journal", () => {
     expect(
       await projectionRequest(repository, "git/pushes", {
         ...begin,
-        remote: "different",
+        updates: begin.updates.map((update) => ({
+          ...update,
+          states: update.states.map((state) => ({ ...state, hiddenSetId: null })),
+        })),
       }),
     ).toEqual({
       status: 409,
@@ -795,7 +769,6 @@ describe("Git projection journal", () => {
         batchId: deletionBatch,
         machineId: firstMachine,
         remote: "origin",
-        policyEpoch: 1,
         updates: [
           { bookmark: "main", expectedOldOid: gitOid, states: [], proposedState: null },
         ],
@@ -832,7 +805,6 @@ describe("Git projection journal", () => {
       incarnation,
       firstBatch,
       firstMachine,
-      0,
       projectionUpdate("a", null, firstGitOid, canonicalCommitId, publicCommitId),
       projectionUpdate("B", null, secondGitOid, canonicalCommitId, publicCommitId),
     );
@@ -845,7 +817,6 @@ describe("Git projection journal", () => {
           incarnation,
           "83".repeat(16),
           recoveryMachine,
-          0,
           projectionUpdate("a", null, firstGitOid, canonicalCommitId, publicCommitId),
         ),
       ),
@@ -882,7 +853,6 @@ describe("Git projection journal", () => {
           incarnation,
           mixedBatch,
           firstMachine,
-          0,
           projectionUpdate("a", null, firstGitOid, canonicalCommitId, publicCommitId),
           projectionUpdate("B", null, secondGitOid, canonicalCommitId, publicCommitId),
         ),
@@ -922,7 +892,6 @@ describe("Git projection journal", () => {
           incarnation,
           "80".repeat(16),
           firstMachine,
-          0,
           projectionUpdate("zero", null, "00".repeat(20), "a1".repeat(64), "a2".repeat(64)),
         ),
       ),
@@ -933,7 +902,6 @@ describe("Git projection journal", () => {
         batchId: "8b".repeat(16),
         machineId: firstMachine,
         remote: "origin",
-        policyEpoch: 0,
         updates: [
           {
             bookmark: "delete",
@@ -943,6 +911,7 @@ describe("Git projection journal", () => {
                 gitOid: "97".repeat(20),
                 canonicalCommitId: "a1".repeat(64),
                 publicCommitId: "a2".repeat(64),
+                hiddenSetId: null,
               },
             ],
             proposedState: null,
@@ -957,7 +926,6 @@ describe("Git projection journal", () => {
       incarnation,
       "85".repeat(16),
       firstMachine,
-      0,
       projectionUpdate("main", null, "94".repeat(20), "a1".repeat(64), "a2".repeat(64)),
     );
     expect(await projectionRequest(repository, "git/pushes", missing)).toEqual({
@@ -979,7 +947,6 @@ describe("Git projection journal", () => {
           incarnation,
           "88".repeat(16),
           firstMachine,
-          0,
           projectionUpdate(
             "incomplete",
             null,
@@ -1008,11 +975,27 @@ describe("Git projection journal", () => {
           incarnation,
           firstBatch,
           firstMachine,
-          0,
           projectionUpdate("main", null, gitOid, canonicalCommitId, publicCommitId),
         ),
       ),
     ).toEqual({ status: 200, body: { pending: true, fence: 1 } });
+    expect(await getProjectionReplay(repository, firstBatch, incarnation)).toMatchObject({
+      status: 200,
+      body: {
+        updates: [
+          {
+            states: [
+              {
+                gitOid,
+                canonicalCommitId,
+                publicCommitId,
+                hiddenSetId: null,
+              },
+            ],
+          },
+        ],
+      },
+    });
     expect(
       await projectionRequest(repository, `git/pushes/${firstBatch}/confirm`, {
         incarnation,
@@ -1023,6 +1006,10 @@ describe("Git projection journal", () => {
       status: 200,
       body: { pending: false, fence: 1, outcome: "accepted" },
     });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      cursors: [{ hiddenSetId: null }],
+      mappings: [{ hiddenSetId: null }],
+    });
     expect(
       await projectionRequest(
         repository,
@@ -1031,7 +1018,6 @@ describe("Git projection journal", () => {
           incarnation,
           "87".repeat(16),
           firstMachine,
-          0,
           projectionUpdate("other", null, gitOid, canonicalCommitId, otherPublicCommitId),
         ),
       ),
@@ -1050,6 +1036,7 @@ describe("Git projection journal", () => {
       gitOid: (index + 1).toString(16).padStart(40, "0"),
       canonicalCommitId,
       publicCommitId,
+      hiddenSetId: null,
     }));
     expect(
       await projectionRequest(repository, "git/pushes", {
@@ -1057,7 +1044,6 @@ describe("Git projection journal", () => {
         batchId,
         machineId: firstMachine,
         remote: "origin",
-        policyEpoch: 0,
         updates: [
           {
             bookmark: "main",
@@ -1092,32 +1078,67 @@ describe("Git projection journal", () => {
     expect((second.body as { mappings: unknown[] }).mappings).toHaveLength(1);
   });
 
-  it("rejects noncanonical projection text before Durable Object state", async () => {
-    const repository = "projection-text";
+  it("rejects malformed hidden-set identities before Durable Object state", async () => {
+    const repository = "projection-hidden-set-id";
     await initializeProjectionRepository(repository, incarnation);
-    const prefix = new TextEncoder().encode(
-      `{"incarnation":"${incarnation}","path":"bad`,
-    );
-    const suffix = new TextEncoder().encode(`","hidden":true}`);
+    const [canonicalCommitId, publicCommitId] = await installProjectionCommits(repository);
+    const state = {
+      gitOid: "a7".repeat(20),
+      canonicalCommitId,
+      publicCommitId,
+      hiddenSetId: null as string | null,
+    };
+    const request = {
+      incarnation,
+      batchId: "a8".repeat(16),
+      machineId: firstMachine,
+      remote: "origin",
+      updates: [
+        {
+          bookmark: "main",
+          expectedOldOid: null,
+          states: [state],
+          proposedState: 0,
+        },
+      ],
+    };
+    for (const hiddenSetId of ["aa", "AA".repeat(64), "gg".repeat(64)]) {
+      expect(
+        await projectionRequest(repository, "git/pushes", {
+          ...request,
+          updates: [
+            {
+              ...request.updates[0],
+              states: [{ ...state, hiddenSetId }],
+            },
+          ],
+        }),
+      ).toEqual({
+        status: 400,
+        body: {
+          error: "hiddenSetId must be null or 128 lowercase hex characters",
+          code: "invalid-hidden-set-id",
+        },
+      });
+    }
+
+    const { hiddenSetId: _, ...stateWithoutIdentity } = state;
     expect(
-      await projectionRawRequest(
-        repository,
-        "hidden-policy",
-        concat(prefix, new Uint8Array([0xff]), suffix),
-      ),
-    ).toEqual({
-      status: 400,
-      body: { error: "hidden policy request must be valid JSON" },
-    });
-    expect(
-      await projectionRequest(repository, "hidden-policy", {
-        incarnation,
-        path: "bad\ud800",
-        hidden: true,
+      await projectionRequest(repository, "git/pushes", {
+        ...request,
+        updates: [
+          {
+            ...request.updates[0],
+            states: [stateWithoutIdentity],
+          },
+        ],
       }),
     ).toEqual({
       status: 400,
-      body: { error: "path must be a non-empty string without control characters" },
+      body: {
+        error:
+          "request fields must be exactly gitOid, canonicalCommitId, publicCommitId, hiddenSetId",
+      },
     });
   });
 });
@@ -1250,11 +1271,12 @@ function projectionUpdate(
   gitOid: string,
   canonicalCommitId: string,
   publicCommitId: string,
+  hiddenSetId: string | null = null,
 ) {
   return {
     bookmark,
     expectedOldOid,
-    states: [{ gitOid, canonicalCommitId, publicCommitId }],
+    states: [{ gitOid, canonicalCommitId, publicCommitId, hiddenSetId }],
     proposedState: 0,
   };
 }
@@ -1263,10 +1285,9 @@ function projectionBatch(
   incarnation: string,
   batchId: string,
   machineId: string,
-  policyEpoch: number,
   ...updates: ReturnType<typeof projectionUpdate>[]
 ) {
-  return { incarnation, batchId, machineId, remote: "origin", policyEpoch, updates };
+  return { incarnation, batchId, machineId, remote: "origin", updates };
 }
 
 async function projectionRequest(repository: string, path: string, body: unknown) {

@@ -19,6 +19,7 @@ use jj_lib::conflict_labels::ConflictLabels;
 use jj_lib::git_backend::GitBackend;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::merged_tree::MergedTree;
+use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
 use jj_lib::signing::Signer;
@@ -124,6 +125,12 @@ pub struct HiddenSetIdentity(Option<FileId>);
 impl HiddenSetIdentity {
     pub fn file_id(&self) -> Option<&FileId> {
         self.0.as_ref()
+    }
+
+    pub fn to_projection_id(&self) -> Option<[u8; 64]> {
+        self.0
+            .as_ref()
+            .map(|id| id.as_bytes().try_into().expect("FileId is 64 bytes"))
     }
 }
 

@@ -110,8 +110,6 @@ traversal plus labeled rejection, not conflict-term filtering.
   responses at fetch-mutation, cursor races, policy-bearing (`.dshide`)
   commits, rewritten refs, ambiguous multi-bookmark seeds, octopus merges and
   hidden parent disagreement.
-- Retirement of the spike-era repository-scoped hidden-policy routes and
-  epoch tables in favor of hidden-set identities (see `hidden.md`).
 - Adversarial depth testing for recursive tree translation.
 - Non-UTF-8 names, case collisions and paths that cannot materialize on a
   client platform have no defined handling.

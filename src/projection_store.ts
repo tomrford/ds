@@ -1,17 +1,15 @@
 import { KIND, KIND_BY_NUMBER, Kernel, equalBytes, exactBuffer, toHex } from "./kernel";
 import {
   BeginProjectionBatchRequest,
-  MAX_HIDDEN_POLICY_BYTES,
-  MAX_HIDDEN_PATHS,
   MAX_PROJECTION_STATES,
   MAX_REPOSITORY_PROJECTION_REFS,
+  ProjectionProtocolError,
   ProjectionFenceRequest,
   ProjectionObservation,
   canonicalProjectionBatchBytes,
   compareNullableBytes,
   decodeBeginProjectionBatch,
   decodeClaimProjectionBatch,
-  decodeHiddenPolicyMutation,
   decodeProjectionFence,
   decodeRecoverProjectionBatch,
 } from "./projection_protocol";
@@ -21,14 +19,12 @@ interface RepositoryStateRow extends Record<string, SqlStorageValue> {
 }
 
 interface ProjectionMetaRow extends Record<string, SqlStorageValue> {
-  current_policy_epoch: number;
   next_fence: number;
   activation_cursor: number;
 }
 
 interface BatchRow extends Record<string, SqlStorageValue> {
   remote: string;
-  policy_epoch: number;
   owner_machine: ArrayBuffer;
   fence: number;
   request_hash: ArrayBuffer;
@@ -53,14 +49,13 @@ interface CursorRow extends Record<string, SqlStorageValue> {
   git_oid: ArrayBuffer;
   canonical_commit_id: ArrayBuffer;
   public_commit_id: ArrayBuffer;
-  policy_epoch: number;
+  hidden_set_id: ArrayBuffer | null;
   activation_seq: number;
 }
 
 interface PendingRow extends Record<string, SqlStorageValue> {
   batch_id: ArrayBuffer;
   remote: string;
-  policy_epoch: number;
   owner_machine: ArrayBuffer;
   fence: number;
 }
@@ -76,6 +71,7 @@ interface ReplayStateRow extends Record<string, SqlStorageValue> {
   git_oid: ArrayBuffer;
   canonical_commit_id: ArrayBuffer;
   public_commit_id: ArrayBuffer;
+  hidden_set_id: ArrayBuffer | null;
 }
 
 interface MappingRow extends Record<string, SqlStorageValue> {
@@ -84,7 +80,7 @@ interface MappingRow extends Record<string, SqlStorageValue> {
   git_oid: ArrayBuffer;
   canonical_commit_id: ArrayBuffer;
   public_commit_id: ArrayBuffer;
-  policy_epoch: number;
+  hidden_set_id: ArrayBuffer | null;
   activation_seq: number;
 }
 
@@ -138,18 +134,11 @@ export class ProjectionStore {
           400,
         );
       }
-      const hiddenPaths = this.sql
-        .exec<{ path: string }>(
-          "SELECT path FROM hidden_policy_paths WHERE epoch = ? ORDER BY path",
-          meta.current_policy_epoch,
-        )
-        .toArray()
-        .map((row) => row.path);
       const cursors = this.sql
         .exec<CursorRow>(
           `SELECT cursors.remote, cursors.bookmark, states.git_oid,
                   states.canonical_commit_id, states.public_commit_id,
-                  states.policy_epoch, states.activation_seq
+                  states.hidden_set_id, states.activation_seq
            FROM projection_cursors AS cursors
            JOIN projection_states AS states ON states.state_id = cursors.state_id
            ORDER BY cursors.remote, cursors.bookmark`,
@@ -161,19 +150,19 @@ export class ProjectionStore {
           gitOid: toHex(new Uint8Array(row.git_oid)),
           canonicalCommitId: toHex(new Uint8Array(row.canonical_commit_id)),
           publicCommitId: toHex(new Uint8Array(row.public_commit_id)),
-          policyEpoch: row.policy_epoch,
+          hiddenSetId:
+            row.hidden_set_id === null ? null : toHex(new Uint8Array(row.hidden_set_id)),
           activationSequence: row.activation_seq,
         }));
       const pending = this.sql
         .exec<PendingRow>(
-          `SELECT batch_id, remote, policy_epoch, owner_machine, fence
+          `SELECT batch_id, remote, owner_machine, fence
            FROM projection_batches ORDER BY batch_id`,
         )
         .toArray()
         .map((row) => ({
           batchId: toHex(new Uint8Array(row.batch_id)),
           remote: row.remote,
-          policyEpoch: row.policy_epoch,
           ownerMachine: toHex(new Uint8Array(row.owner_machine)),
           fence: row.fence,
           refs: this.pendingRefSnapshot(row.batch_id),
@@ -181,7 +170,7 @@ export class ProjectionStore {
       const mappingRows = this.sql
         .exec<MappingRow>(
           `SELECT remote, bookmark, git_oid, canonical_commit_id,
-                  public_commit_id, policy_epoch, activation_seq
+                  public_commit_id, hidden_set_id, activation_seq
            FROM projection_states
            WHERE pending_batch_id IS NULL
              AND activation_seq > ? AND activation_seq <= ?
@@ -199,7 +188,8 @@ export class ProjectionStore {
           gitOid: toHex(new Uint8Array(row.git_oid)),
           canonicalCommitId: toHex(new Uint8Array(row.canonical_commit_id)),
           publicCommitId: toHex(new Uint8Array(row.public_commit_id)),
-          policyEpoch: row.policy_epoch,
+          hiddenSetId:
+            row.hidden_set_id === null ? null : toHex(new Uint8Array(row.hidden_set_id)),
         }));
       const nextAfter =
         pageRows.length === 0
@@ -207,8 +197,6 @@ export class ProjectionStore {
           : pageRows[pageRows.length - 1].activation_seq;
       return {
         ok: true as const,
-        policyEpoch: meta.current_policy_epoch,
-        hiddenPaths,
         activationCursor: meta.activation_cursor,
         cursors,
         mappings,
@@ -256,7 +244,7 @@ export class ProjectionStore {
       const updates = this.batchRefs(batchId).map((ref) => {
         const states = this.sql
           .exec<ReplayStateRow>(
-            `SELECT state_id, git_oid, canonical_commit_id, public_commit_id
+            `SELECT state_id, git_oid, canonical_commit_id, public_commit_id, hidden_set_id
              FROM projection_states
              WHERE pending_batch_id = ? AND remote = ? AND bookmark = ?
              ORDER BY state_id`,
@@ -282,6 +270,10 @@ export class ProjectionStore {
             gitOid: toHex(new Uint8Array(state.git_oid)),
             canonicalCommitId: toHex(new Uint8Array(state.canonical_commit_id)),
             publicCommitId: toHex(new Uint8Array(state.public_commit_id)),
+            hiddenSetId:
+              state.hidden_set_id === null
+                ? null
+                : toHex(new Uint8Array(state.hidden_set_id)),
           })),
           proposedState,
         };
@@ -290,108 +282,10 @@ export class ProjectionStore {
         ok: true as const,
         batchId: toHex(new Uint8Array(batchId)),
         remote: batch.remote,
-        policyEpoch: batch.policy_epoch,
         ownerMachine: toHex(new Uint8Array(batch.owner_machine)),
         fence: batch.fence,
         updates,
       };
-    } catch (error) {
-      return this.handleExpected(error);
-    }
-  }
-
-  mutatePolicy(value: unknown) {
-    let request: ReturnType<typeof decodeHiddenPolicyMutation>;
-    try {
-      request = decodeHiddenPolicyMutation(value);
-    } catch (error) {
-      return failure(error, 400);
-    }
-    const incarnation = exactBuffer(request.incarnation);
-    try {
-      return this.ctx.storage.transactionSync(() => {
-        this.requireIncarnation(incarnation);
-        const meta = this.meta();
-        const present =
-          this.sql
-            .exec<{ count: number }>(
-              "SELECT count(*) AS count FROM hidden_policy_paths WHERE epoch = ? AND path = ?",
-              meta.current_policy_epoch,
-              request.path,
-            )
-            .one().count !== 0;
-        if (present === request.hidden) {
-          return {
-            ok: true as const,
-            changed: false,
-            policyEpoch: meta.current_policy_epoch,
-          };
-        }
-        const pending = this.sql
-          .exec<{ count: number }>("SELECT count(*) AS count FROM projection_batches")
-          .one().count;
-        if (pending !== 0) {
-          throw new ProjectionStoreError("hidden policy cannot change while a push is pending", 409);
-        }
-        if (meta.current_policy_epoch >= Number.MAX_SAFE_INTEGER) {
-          throw new Error("hidden policy epoch exceeds the safe integer range");
-        }
-        const nextEpoch = meta.current_policy_epoch + 1;
-        const count = this.sql
-          .exec<{ count: number }>(
-            `SELECT count(*) AS count FROM hidden_policy_paths
-             WHERE epoch = ? AND path != ?`,
-            meta.current_policy_epoch,
-            request.path,
-          )
-          .one().count;
-        if (count + (request.hidden ? 1 : 0) > MAX_HIDDEN_PATHS) {
-          throw new ProjectionStoreError(
-            `hidden policy exceeds the ${MAX_HIDDEN_PATHS}-path limit`,
-            409,
-          );
-        }
-        const retainedBytes = this.sql
-          .exec<{ path: string }>(
-            "SELECT path FROM hidden_policy_paths WHERE epoch = ? AND path != ?",
-            meta.current_policy_epoch,
-            request.path,
-          )
-          .toArray()
-          .reduce((total, row) => total + new TextEncoder().encode(row.path).byteLength, 0);
-        const policyBytes =
-          retainedBytes + (request.hidden ? new TextEncoder().encode(request.path).byteLength : 0);
-        if (policyBytes > MAX_HIDDEN_POLICY_BYTES) {
-          throw new ProjectionStoreError(
-            `hidden policy exceeds the ${MAX_HIDDEN_POLICY_BYTES}-byte limit`,
-            409,
-          );
-        }
-        this.sql.exec(
-          "INSERT INTO hidden_policy_versions VALUES (?, ?)",
-          nextEpoch,
-          Date.now(),
-        );
-        this.sql.exec(
-          `INSERT INTO hidden_policy_paths (epoch, path)
-           SELECT ?, path FROM hidden_policy_paths WHERE epoch = ? AND path != ?`,
-          nextEpoch,
-          meta.current_policy_epoch,
-          request.path,
-        );
-        if (request.hidden) {
-          this.sql.exec(
-            "INSERT INTO hidden_policy_paths VALUES (?, ?)",
-            nextEpoch,
-            request.path,
-          );
-        }
-        this.sql.exec(
-          "UPDATE projection_meta SET current_policy_epoch = ? WHERE singleton = 1",
-          nextEpoch,
-        );
-        return { ok: true as const, changed: true, policyEpoch: nextEpoch };
-      });
     } catch (error) {
       return this.handleExpected(error);
     }
@@ -429,12 +323,6 @@ export class ProjectionStore {
           return { ok: true as const, pending: true, fence: previous.fence };
         }
         const meta = this.meta();
-        if (request.policyEpoch !== meta.current_policy_epoch) {
-          throw new ProjectionStoreError(
-            `projection policy epoch ${request.policyEpoch} is stale; current epoch is ${meta.current_policy_epoch}`,
-            409,
-          );
-        }
         const pendingRefs = this.sql
           .exec<{ count: number }>("SELECT count(*) AS count FROM projection_batch_refs")
           .one().count;
@@ -483,10 +371,9 @@ export class ProjectionStore {
         }
         const fence = this.nextFence(meta);
         this.sql.exec(
-          "INSERT INTO projection_batches VALUES (?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO projection_batches VALUES (?, ?, ?, ?, ?, ?)",
           batchId,
           request.remote,
-          request.policyEpoch,
           exactBuffer(request.machineId),
           fence,
           requestHash,
@@ -499,14 +386,14 @@ export class ProjectionStore {
             this.sql.exec(
               `INSERT INTO projection_states
                (remote, bookmark, git_oid, canonical_commit_id, public_commit_id,
-                policy_epoch, pending_batch_id, activation_seq)
+                hidden_set_id, pending_batch_id, activation_seq)
                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
               request.remote,
               update.bookmark,
               exactBuffer(state.gitOid),
               exactBuffer(state.canonicalCommitId),
               exactBuffer(state.publicCommitId),
-              request.policyEpoch,
+              state.hiddenSetId === null ? null : exactBuffer(state.hiddenSetId),
               batchId,
             );
             stateIds.push(
@@ -900,7 +787,7 @@ export class ProjectionStore {
   private batch(batchId: ArrayBuffer): BatchRow | undefined {
     return this.sql
       .exec<BatchRow>(
-        `SELECT remote, policy_epoch, owner_machine, fence, request_hash
+        `SELECT remote, owner_machine, fence, request_hash
          FROM projection_batches WHERE batch_id = ?`,
         batchId,
       )
@@ -951,7 +838,7 @@ export class ProjectionStore {
   private meta(): ProjectionMetaRow {
     return this.sql
       .exec<ProjectionMetaRow>(
-        `SELECT current_policy_epoch, next_fence, activation_cursor
+        `SELECT next_fence, activation_cursor
          FROM projection_meta WHERE singleton = 1`,
       )
       .one();
@@ -977,6 +864,7 @@ function failure(error: unknown, status: number) {
     ok: false as const,
     status,
     error: error instanceof Error ? error.message : "projection request failed",
+    ...(error instanceof ProjectionProtocolError ? { code: error.code } : {}),
   };
 }
 

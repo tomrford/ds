@@ -3,11 +3,8 @@ import { compareBytes, toHex } from "./kernel";
 export const MAX_PROJECTION_REQUEST_BYTES = 4 * 1024 * 1024;
 export const MAX_PROJECTION_REFS = 256;
 export const MAX_PROJECTION_STATES = 8_192;
-export const MAX_HIDDEN_PATHS = 4_096;
-export const MAX_HIDDEN_POLICY_BYTES = 256 * 1024;
 export const MAX_REPOSITORY_PROJECTION_REFS = 512;
 export const MAX_PROJECTION_NAME_BYTES = 256;
-export const MAX_HIDDEN_PATH_BYTES = 256;
 
 const SHORT_ID_PATTERN = /^[0-9a-f]{32}$/;
 const GIT_OID_PATTERN = /^[0-9a-f]{40}$/;
@@ -18,6 +15,7 @@ export interface ProjectionState {
   gitOid: Uint8Array;
   canonicalCommitId: Uint8Array;
   publicCommitId: Uint8Array;
+  hiddenSetId: Uint8Array | null;
 }
 
 export interface ProjectionUpdate {
@@ -32,7 +30,6 @@ export interface BeginProjectionBatchRequest {
   batchId: Uint8Array;
   machineId: Uint8Array;
   remote: string;
-  policyEpoch: number;
   updates: ProjectionUpdate[];
 }
 
@@ -56,22 +53,18 @@ export interface RecoverProjectionBatchRequest extends ProjectionFenceRequest {
   observations: ProjectionObservation[];
 }
 
-export interface HiddenPolicyMutation {
-  incarnation: Uint8Array;
-  path: string;
-  hidden: boolean;
+export class ProjectionProtocolError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+  ) {
+    super(message);
+  }
 }
 
 export function decodeBeginProjectionBatch(value: unknown): BeginProjectionBatchRequest {
   const record = requireRecord(value, "projection batch");
-  requireExactKeys(record, [
-    "incarnation",
-    "batchId",
-    "machineId",
-    "remote",
-    "policyEpoch",
-    "updates",
-  ]);
+  requireExactKeys(record, ["incarnation", "batchId", "machineId", "remote", "updates"]);
   const updatesValue = record.updates;
   if (!Array.isArray(updatesValue) || updatesValue.length === 0) {
     throw new Error("updates must be a non-empty array");
@@ -91,7 +84,6 @@ export function decodeBeginProjectionBatch(value: unknown): BeginProjectionBatch
     batchId: decodeHex(record.batchId, SHORT_ID_PATTERN, "batchId", 16),
     machineId: decodeHex(record.machineId, SHORT_ID_PATTERN, "machineId", 16),
     remote: decodeName(record.remote, "remote"),
-    policyEpoch: decodeSafeInteger(record.policyEpoch, "policyEpoch"),
     updates,
   };
 }
@@ -140,17 +132,6 @@ export function decodeRecoverProjectionBatch(value: unknown): RecoverProjectionB
   };
 }
 
-export function decodeHiddenPolicyMutation(value: unknown): HiddenPolicyMutation {
-  const record = requireRecord(value, "hidden policy mutation");
-  requireExactKeys(record, ["incarnation", "path", "hidden"]);
-  if (typeof record.hidden !== "boolean") throw new Error("hidden must be a boolean");
-  return {
-    incarnation: decodeHex(record.incarnation, SHORT_ID_PATTERN, "incarnation", 16),
-    path: decodeHiddenPath(record.path),
-    hidden: record.hidden,
-  };
-}
-
 export function canonicalProjectionBatchBytes(request: BeginProjectionBatchRequest): Uint8Array {
   return encoder.encode(
     JSON.stringify({
@@ -158,7 +139,6 @@ export function canonicalProjectionBatchBytes(request: BeginProjectionBatchReque
       batchId: toHex(request.batchId),
       machineId: toHex(request.machineId),
       remote: request.remote,
-      policyEpoch: request.policyEpoch,
       updates: request.updates.map((update) => ({
         bookmark: update.bookmark,
         expectedOldOid: update.expectedOldOid === null ? null : toHex(update.expectedOldOid),
@@ -166,6 +146,7 @@ export function canonicalProjectionBatchBytes(request: BeginProjectionBatchReque
           gitOid: toHex(state.gitOid),
           canonicalCommitId: toHex(state.canonicalCommitId),
           publicCommitId: toHex(state.publicCommitId),
+          hiddenSetId: state.hiddenSetId === null ? null : toHex(state.hiddenSetId),
         })),
         proposedState: update.proposedState,
       })),
@@ -188,7 +169,7 @@ function decodeUpdate(value: unknown, index: number): ProjectionUpdate {
   if (!Array.isArray(record.states)) throw new Error(`updates[${index}].states must be an array`);
   const states = record.states.map((value, stateIndex): ProjectionState => {
     const state = requireRecord(value, `updates[${index}].states[${stateIndex}]`);
-    requireExactKeys(state, ["gitOid", "canonicalCommitId", "publicCommitId"]);
+    requireExactKeys(state, ["gitOid", "canonicalCommitId", "publicCommitId", "hiddenSetId"]);
     const decoded = {
       gitOid: decodeHex(state.gitOid, GIT_OID_PATTERN, "gitOid", 20),
       canonicalCommitId: decodeHex(
@@ -198,6 +179,7 @@ function decodeUpdate(value: unknown, index: number): ProjectionUpdate {
         64,
       ),
       publicCommitId: decodeHex(state.publicCommitId, OBJECT_ID_PATTERN, "publicCommitId", 64),
+      hiddenSetId: decodeHiddenSetId(state.hiddenSetId),
     };
     requireNonZero(decoded.gitOid, "gitOid");
     requireNonZero(decoded.canonicalCommitId, "canonicalCommitId");
@@ -238,6 +220,17 @@ function decodeNullableGitOid(value: unknown, field: string): Uint8Array | null 
   return oid;
 }
 
+function decodeHiddenSetId(value: unknown): Uint8Array | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || !OBJECT_ID_PATTERN.test(value)) {
+    throw new ProjectionProtocolError(
+      "hiddenSetId must be null or 128 lowercase hex characters",
+      "invalid-hidden-set-id",
+    );
+  }
+  return decodeHex(value, OBJECT_ID_PATTERN, "hiddenSetId", 64);
+}
+
 function decodeHex(
   value: unknown,
   pattern: RegExp,
@@ -273,21 +266,6 @@ function decodeName(value: unknown, field: string): string {
 
 function requireNonZero(value: Uint8Array, field: string) {
   if (value.every((byte) => byte === 0)) throw new Error(`${field} must not be zero`);
-}
-
-function decodeHiddenPath(value: unknown): string {
-  const path = decodeName(value, "path");
-  if (encoder.encode(path).byteLength > MAX_HIDDEN_PATH_BYTES) {
-    throw new Error(`path exceeds ${MAX_HIDDEN_PATH_BYTES} UTF-8 bytes`);
-  }
-  if (
-    path.startsWith("/") ||
-    path.endsWith("/") ||
-    path.split("/").some((component) => component === "" || component === "." || component === "..")
-  ) {
-    throw new Error("hidden paths must be exact, non-root, repository-relative file paths");
-  }
-  return path;
 }
 
 function decodeSafeInteger(value: unknown, field: string): number {

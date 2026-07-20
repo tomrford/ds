@@ -130,10 +130,6 @@ export class Repository extends DurableObject<Env> {
     );
   }
 
-  mutateHiddenPolicy(authority: RepositoryAuthority, value: unknown) {
-    return this.withAuthority(authority, () => this.projection.mutatePolicy(value));
-  }
-
   beginProjectionPush(authority: RepositoryAuthority, value: unknown) {
     return this.withAuthority(authority, () => this.projection.begin(value, authority.machineId));
   }
