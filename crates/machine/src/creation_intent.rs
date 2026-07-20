@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::locked_json::{LockedJsonError, LockedJsonFile, hex_bytes};
+use crate::locked_json::{LockedJsonError, LockedJsonFile};
 use crate::{
     MachineConfig, MachineId, MachineStore, MachineStoreError, RepositoryId, RepositoryIdentity,
-    RepositoryIncarnation, RepositoryName,
+    RepositoryIncarnation, RepositoryName, decode_lower_hex, encode_lower_hex,
 };
 
 const JOURNAL_VERSION: u32 = 2;
@@ -283,7 +283,7 @@ struct PersistedIntent {
 impl From<&RepositoryCreationIntent> for PersistedIntent {
     fn from(intent: &RepositoryCreationIntent) -> Self {
         Self {
-            idempotency_key: hex_bytes(&intent.key.0),
+            idempotency_key: encode_lower_hex(&intent.key.0),
             base_url: intent.target.base_url.clone(),
             machine_id: intent.target.machine_id.as_str().to_owned(),
             repository_id: intent
@@ -343,22 +343,7 @@ fn validate_journal(journal: &PersistedJournal) -> Result<(), RepositoryCreation
 }
 
 fn parse_hex_16(value: &str) -> Result<[u8; 16], RepositoryCreationIntentError> {
-    if value.len() != 32 {
-        return Err(RepositoryCreationIntentError::InvalidKey);
-    }
-    let mut bytes = [0; 16];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        bytes[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
-    }
-    Ok(bytes)
-}
-
-fn hex_digit(byte: u8) -> Result<u8, RepositoryCreationIntentError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => Err(RepositoryCreationIntentError::InvalidKey),
-    }
+    decode_lower_hex(value).map_err(|_| RepositoryCreationIntentError::InvalidKey)
 }
 
 #[derive(Debug, Error)]

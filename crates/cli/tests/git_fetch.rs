@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
-    ProjectionSnapshot, ProjectionTransport, RepositoryName, SharedSecret,
+    HttpTransport, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository,
+    MachineStore, ProjectionSnapshot, RepositoryName, SharedSecret,
 };
 use jj_lib::ref_name::RefName;
 use jj_lib::repo::Repo as _;
@@ -410,7 +410,7 @@ impl LiveFixture {
         let store = machine_store(&self.home);
         let entry = self.entry();
         let config = store.load_config().unwrap();
-        let transport = ProjectionTransport::new(
+        let transport = HttpTransport::new(
             &config,
             entry.identity.repository_id.as_str(),
             parse_incarnation(entry.identity.incarnation.as_str()),

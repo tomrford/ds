@@ -19,6 +19,7 @@ use crate::checkout::{
     owned_directory_matches, read_checkout_owner, reject_unsupported_global_options,
     workspace_name,
 };
+use crate::tx::{RepoTransactionError, commit_repo_transaction};
 
 #[derive(clap::Args)]
 pub(crate) struct RemoveArgs {
@@ -300,6 +301,8 @@ async fn snapshot_checkout(
             let current_operation = current_repo.op_id().clone();
             let (mut locked_workspace, desired_commit) =
                 helper.unchecked_start_working_copy_mutation().await?;
+            // Mirrors jj_cli::cli_util::update_stale_working_copy, with the
+            // Devspace ownership and freshness checks required before removal.
             match WorkingCopyFreshness::check_stale(
                 locked_workspace.locked_wc(),
                 &desired_commit,
@@ -425,13 +428,18 @@ async fn forget_workspace(
                 .repo_mut()
                 .record_abandoned_commit(&working_copy_commit);
         }
-        transaction.repo_mut().rebase_descendants().await?;
-        transaction
-            .commit(format!(
+        commit_repo_transaction(
+            transaction,
+            format!(
                 "forget Devspace checkout workspace {}",
                 workspace_name.as_symbol()
-            ))
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|error| match error {
+            RepoTransactionError::Rebase(source) => CommandError::from(source),
+            RepoTransactionError::Commit(source) => CommandError::from(source),
+        })?;
     }
     forget_workspace_record(&entry.native_repository_path, workspace_name)
 }

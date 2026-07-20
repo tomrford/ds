@@ -30,3 +30,27 @@ Gate: `nix develop -c pnpm check` and `nix develop -c pnpm test`.
 - The accepted schema is exactly jj's simple backend and simple operation-store
   schema. Do not add Devspace-only fields. Values the simple backend cannot
   store, including Git submodules, must fail before encoding.
+- The simple-store on-disk layout knowledge in
+  `crates/machine/src/object_closure.rs::object_path` is fork surface living
+  outside the kernel; audit it on every bump alongside the encodings.
+
+## jj bump rollout (encoding changes)
+
+Cloud replication is byte-exact and objects are content-addressed by jj's
+semantic hash, so a bump only matters for rollout when the audit above finds
+that canonical bytes changed for existing object shapes (proto3 field
+additions usually don't). When they did:
+
+1. Bump `devspace_kernel::ENCODING_VERSION`. Clients advertise it via the
+   `x-devspace-client` header (set in `hardened_http_client`).
+2. Deploy the Worker FIRST, with the kernel accepting both the old and new
+   canonical forms (an accept-set decode branch, never a data migration —
+   stored bytes are immutable and are never rewritten). The Worker may gate
+   stale clients on the advertised encoding with an "upgrade ds" error;
+   never let them hit a canonicality failure.
+3. Upgrade machines after. Mixed-epoch machines writing the same logical
+   object as different bytes trip the no-clobber check by design.
+4. Accept-set branches are deletable at any time by re-incarnating the
+   affected repositories: the cloud store is fully derivable from any
+   up-to-date machine (re-upload under the new encoding). No migration code,
+   ever.

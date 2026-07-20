@@ -10,17 +10,20 @@ use crate::sync_engine::{
     CloudHeads, DownloadedPack, HeadTransactionResult, PackCatalogEntry, PackCatalogPage,
     SyncTransport, TransportError,
 };
-use crate::{MAX_CHUNK_BYTES, MachineConfig, ObjectKind, PackManifest, PendingHeadTransaction};
+use crate::wire::{read_bounded, send};
+use crate::{
+    MAX_CHUNK_BYTES, MachineConfig, ObjectKind, PackManifest, PendingHeadTransaction,
+    decode_lower_hex, encode_lower_hex,
+};
 
 const MAX_JSON_RESPONSE_BYTES: usize = 1024 * 1024;
-const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
 
 pub struct HttpTransport {
-    client: reqwest::Client,
-    repository_url: String,
-    authorization: reqwest::header::HeaderValue,
-    machine_id: String,
-    incarnation: String,
+    pub(crate) client: reqwest::Client,
+    pub(crate) repository_url: String,
+    pub(crate) authorization: reqwest::header::HeaderValue,
+    pub(crate) machine_id: String,
+    pub(crate) incarnation: String,
 }
 
 #[derive(Deserialize)]
@@ -46,12 +49,6 @@ struct CatalogResponse {
 struct CatalogEntry {
     sequence: u64,
     id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ErrorResponse {
-    error: String,
 }
 
 #[derive(Deserialize)]
@@ -86,7 +83,7 @@ impl HttpTransport {
             ),
             authorization,
             machine_id: config.machine_id().as_str().to_owned(),
-            incarnation: hex_bytes(&incarnation),
+            incarnation: encode_lower_hex(&incarnation),
         })
     }
 
@@ -101,57 +98,25 @@ impl HttpTransport {
         Ok(())
     }
 
-    async fn send(
+    pub(crate) async fn send(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, TransportError> {
-        let response = request
-            .header(reqwest::header::AUTHORIZATION, &self.authorization)
-            .header("x-devspace-machine-id", &self.machine_id)
-            .header("x-devspace-incarnation", &self.incarnation)
-            .send()
-            .await?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-        let message = read_bounded(response, MAX_ERROR_RESPONSE_BYTES)
-            .await
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<ErrorResponse>(&bytes).ok())
-            .map_or_else(
-                || "cloud request failed without an error body".to_string(),
-                |body| body.error,
-            );
-        Err(format!("cloud request failed with status {status}: {message}").into())
+        send(
+            request,
+            &self.authorization,
+            &self.machine_id,
+            &self.incarnation,
+        )
+        .await
     }
 
     async fn fetch_bytes(&self, url: String, limit: usize) -> Result<Vec<u8>, TransportError> {
         let response = self.send(self.client.get(url)).await?;
-        read_bounded(response, limit).await
+        read_bounded(response, limit)
+            .await
+            .map_err(|error| Box::new(error) as TransportError)
     }
-}
-
-async fn read_bounded(
-    mut response: reqwest::Response,
-    limit: usize,
-) -> Result<Vec<u8>, TransportError> {
-    if let Some(length) = response.content_length()
-        && length > limit as u64
-    {
-        return Err(format!(
-            "cloud response declares {length} bytes, exceeding the {limit}-byte limit"
-        )
-        .into());
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if bytes.len() + chunk.len() > limit {
-            return Err(format!("cloud response exceeds the {limit}-byte limit").into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(
@@ -173,7 +138,7 @@ impl SyncTransport for HttpTransport {
                 .iter()
                 .map(|object| serde_json::json!({
                     "kind": object.kind as u8,
-                    "id": hex_bytes(&object.id),
+                    "id": encode_lower_hex(&object.id),
                 }))
                 .collect::<Vec<_>>(),
         });
@@ -227,7 +192,7 @@ impl SyncTransport for HttpTransport {
     }
 
     async fn download_pack(&mut self, id: ObjectId) -> Result<DownloadedPack, TransportError> {
-        let pack_url = format!("{}/packs/{}", self.repository_url, hex_bytes(&id));
+        let pack_url = format!("{}/packs/{}", self.repository_url, encode_lower_hex(&id));
         let manifest = self
             .fetch_bytes(
                 format!("{pack_url}/manifest?incarnation={}", self.incarnation),
@@ -256,7 +221,11 @@ impl SyncTransport for HttpTransport {
     }
 
     async fn upload_manifest(&mut self, id: ObjectId, bytes: &[u8]) -> Result<(), TransportError> {
-        let url = format!("{}/packs/{}/manifest", self.repository_url, hex_bytes(&id));
+        let url = format!(
+            "{}/packs/{}/manifest",
+            self.repository_url,
+            encode_lower_hex(&id)
+        );
         self.send(self.client.put(url).body(bytes.to_vec())).await?;
         Ok(())
     }
@@ -270,14 +239,18 @@ impl SyncTransport for HttpTransport {
         let url = format!(
             "{}/packs/{}/chunks/{position}",
             self.repository_url,
-            hex_bytes(&id)
+            encode_lower_hex(&id)
         );
         self.send(self.client.put(url).body(bytes.to_vec())).await?;
         Ok(())
     }
 
     async fn install_pack(&mut self, id: ObjectId) -> Result<(), TransportError> {
-        let url = format!("{}/packs/{}/install", self.repository_url, hex_bytes(&id));
+        let url = format!(
+            "{}/packs/{}/install",
+            self.repository_url,
+            encode_lower_hex(&id)
+        );
         self.send(self.client.post(url)).await?;
         Ok(())
     }
@@ -298,12 +271,12 @@ impl SyncTransport for HttpTransport {
         let url = format!("{}/heads", self.repository_url);
         let body = serde_json::json!({
             "incarnation": self.incarnation,
-            "idempotencyKey": hex_bytes(&pending.idempotency_key),
-            "newHead": hex_bytes(&pending.new_head),
+            "idempotencyKey": encode_lower_hex(&pending.idempotency_key),
+            "newHead": encode_lower_hex(&pending.new_head),
             "observedHeads": pending
                 .observed_heads
                 .iter()
-                .map(|head| hex_bytes(head))
+                .map(|head| encode_lower_hex(head))
                 .collect::<Vec<_>>(),
         });
         let response = self.send(self.client.post(url).json(&body)).await?;
@@ -325,39 +298,11 @@ fn parse_heads(response: HeadsResponse) -> Result<CloudHeads, TransportError> {
 }
 
 fn parse_object_id(value: &str) -> Result<ObjectId, TransportError> {
-    if value.len() != 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(format!("cloud ID must be 128 lowercase hex characters, got {value:?}").into());
-    }
-    let mut id = [0; 64];
-    for (index, byte) in id.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|error| format!("invalid cloud ID {value:?}: {error}"))?;
-    }
-    Ok(id)
+    decode_lower_hex(value)
+        .map_err(|_| format!("cloud ID must be 128 lowercase hex characters, got {value:?}").into())
 }
 
 fn parse_object_kind(value: u8) -> Result<ObjectKind, TransportError> {
-    match value {
-        0 => Ok(ObjectKind::File),
-        1 => Ok(ObjectKind::Symlink),
-        2 => Ok(ObjectKind::Tree),
-        3 => Ok(ObjectKind::Commit),
-        4 => Ok(ObjectKind::View),
-        5 => Ok(ObjectKind::Operation),
-        _ => Err(format!("cloud object kind must be from 0 through 5, got {value}").into()),
-    }
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
+    ObjectKind::try_from(value)
+        .map_err(|_| format!("cloud object kind must be from 0 through 5, got {value}").into())
 }

@@ -241,6 +241,7 @@ export class PackStore {
         ok: false as const,
         status: 400,
         error: error instanceof Error ? error.message : "object inventory request failed",
+        code: "invalid-object-inventory-request",
       };
     }
     const state = this.heads.get(toHex(request.incarnation));

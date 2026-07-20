@@ -13,14 +13,17 @@ use jj_cli::ui::Ui;
 use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 use jj_lib::repo::{Repo as _, StoreFactories};
-use jj_lib::workspace::{Workspace, default_working_copy_factories};
+use jj_lib::workspace::Workspace;
 
 use crate::add::{AddArgs, add_checkout};
 use crate::checkout::{
     absolute_path, canonical_destination_path, ensure_destination_parent,
     reject_unsupported_global_options, workspace_name,
 };
+use crate::git::display_error;
 use crate::repo::{create_cloud_repository, materialize_cloud_repository};
+use crate::tx::{commit_repo_transaction, materialize_checkout};
+use crate::working_copy::devspace_working_copy_factories;
 
 const ORIGIN: &str = "origin";
 const AFTER_CLOUD_REGISTRATION_FAILPOINT: &str = "after_init_cloud_registration";
@@ -287,35 +290,21 @@ async fn position_checkout(
         .check_out(workspace_name, &head)
         .await
         .map_err(|error| error.to_string())?;
-    // check_out abandons the previous discardable working-copy commit; raw
-    // jj-lib transactions must rebase descendants after any rewrite.
-    transaction
-        .repo_mut()
-        .rebase_descendants()
-        .await
-        .map_err(|error| error.to_string())?;
-    let repo = transaction
-        .commit(format!("track {head_branch}@{ORIGIN} after init"))
-        .await
-        .map_err(|error| error.to_string())?;
+    let repo = commit_repo_transaction(
+        transaction,
+        format!("track {head_branch}@{ORIGIN} after init"),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
 
     let mut workspace = Workspace::load(
         command.settings(),
         checkout_path,
         &StoreFactories::default(),
-        &default_working_copy_factories(),
+        &devspace_working_copy_factories(),
     )
     .map_err(|error| error.to_string())?;
-    // The commit must come from the loaded workspace's own store; jj asserts
-    // store identity between the checkout target and the working copy.
-    let working_copy_commit = workspace
-        .repo_loader()
-        .store()
-        .get_commit_async(working_copy_commit.id())
-        .await
-        .map_err(|error| error.to_string())?;
-    workspace
-        .check_out(repo.op_id().clone(), None, &working_copy_commit)
+    materialize_checkout(&mut workspace, repo.op_id().clone(), &working_copy_commit)
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -346,10 +335,6 @@ fn failpoint(name: &str) {
     if std::env::var_os("DEVSPACE_FAILPOINT").as_deref() == Some(std::ffi::OsStr::new(name)) {
         std::process::exit(86);
     }
-}
-
-fn display_error(error: impl std::fmt::Display) -> CommandError {
-    user_error(error.to_string())
 }
 
 #[cfg(test)]

@@ -419,7 +419,7 @@ pub enum PackManifestError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_closure::hex;
+    use crate::encode_lower_hex as hex;
     use crate::{DEFAULT_CHUNK_BYTES, ObjectKind};
     use blake2::{Blake2b512, Digest};
 
@@ -523,7 +523,7 @@ mod tests {
         .unwrap();
         let id: ObjectId = Blake2b512::digest(manifest.encode()).into();
         assert_eq!(
-            hex(id),
+            hex(&id),
             "606591ef0c95a0b8ab99b4ccc8cfd34f05e143f82cf4e7ff0766183d21f0fce42456f1d602deaaef70fcaed78de2ca8cee73a055853d7aff1409c7a26b185733"
         );
         assert_eq!(PackManifest::decode(&manifest.encode()).unwrap(), manifest);
@@ -570,7 +570,7 @@ mod tests {
         .unwrap();
         let id: ObjectId = Blake2b512::digest(manifest.encode()).into();
         assert_eq!(
-            hex(id),
+            hex(&id),
             "f1bf19025a446aefff8403fb0fdee17ff43382ecc8d5df0d398f24a741025c06faa832335491098ab8a285fce47d49d13510b94a7d009e4cefa3061a892ce52a"
         );
         assert_eq!(PackManifest::decode(&manifest.encode()).unwrap(), manifest);

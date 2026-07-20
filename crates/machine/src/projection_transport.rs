@@ -2,12 +2,12 @@
 
 use serde::Deserialize;
 
-use crate::MachineConfig;
-use crate::http_client::hardened_http_client;
+use crate::HttpTransport;
 use crate::sync_engine::TransportError;
+use crate::wire::read_bounded;
+use crate::{decode_lower_hex, encode_lower_hex};
 
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_ERROR_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -169,37 +169,7 @@ pub struct ProjectionSnapshot {
     pub pending: Vec<PendingProjectionBatch>,
 }
 
-pub struct ProjectionTransport {
-    client: reqwest::Client,
-    repository_url: String,
-    authorization: reqwest::header::HeaderValue,
-    machine_id: String,
-    incarnation: String,
-}
-
-impl ProjectionTransport {
-    pub fn new(
-        config: &MachineConfig,
-        repository: &str,
-        incarnation: [u8; 16],
-    ) -> Result<Self, TransportError> {
-        let mut authorization = reqwest::header::HeaderValue::from_str(&format!(
-            "Bearer {}",
-            config.shared_secret().expose()
-        ))?;
-        authorization.set_sensitive(true);
-        Ok(Self {
-            client: hardened_http_client()?,
-            repository_url: format!(
-                "{}/repositories/{repository}",
-                config.base_url().trim_end_matches('/')
-            ),
-            authorization,
-            machine_id: config.machine_id().as_str().to_owned(),
-            incarnation: hex(&incarnation),
-        })
-    }
-
+impl HttpTransport {
     pub async fn get(
         &self,
         after: u64,
@@ -252,21 +222,16 @@ impl ProjectionTransport {
             .map(|update| {
                 serde_json::json!({
                     "bookmark": update.bookmark,
-                    "expectedOldOid": update.expected_old_oid.as_ref().map(|id| hex(id)),
-                    "states": update.states.iter().map(|state| serde_json::json!({
-                        "gitOid": hex(&state.git_oid),
-                        "canonicalCommitId": hex(&state.canonical_commit_id),
-                        "publicCommitId": hex(&state.public_commit_id),
-                        "hiddenSetId": state.hidden_set_id.as_ref().map(|id| hex(id)),
-                    })).collect::<Vec<_>>(),
+                    "expectedOldOid": update.expected_old_oid.as_ref().map(|id| encode_lower_hex(id)),
+                    "states": update.states.iter().map(projection_state_json).collect::<Vec<_>>(),
                     "proposedState": update.proposed_state,
                 })
             })
             .collect::<Vec<_>>();
         let body = serde_json::json!({
             "incarnation": self.incarnation,
-            "batchId": hex(&batch_id),
-            "machineId": hex(&machine_id),
+            "batchId": encode_lower_hex(&batch_id),
+            "machineId": encode_lower_hex(&machine_id),
             "remote": remote,
             "updates": updates,
         });
@@ -293,14 +258,9 @@ impl ProjectionTransport {
             .map(|fetch_ref| {
                 serde_json::json!({
                     "bookmark": fetch_ref.bookmark,
-                    "observedGitOid": hex(&fetch_ref.observed_git_oid),
-                    "expectedCursorOid": fetch_ref.expected_cursor_oid.as_ref().map(|id| hex(id)),
-                    "states": fetch_ref.states.iter().map(|state| serde_json::json!({
-                        "gitOid": hex(&state.git_oid),
-                        "canonicalCommitId": hex(&state.canonical_commit_id),
-                        "publicCommitId": hex(&state.public_commit_id),
-                        "hiddenSetId": state.hidden_set_id.as_ref().map(|id| hex(id)),
-                    })).collect::<Vec<_>>(),
+                    "observedGitOid": encode_lower_hex(&fetch_ref.observed_git_oid),
+                    "expectedCursorOid": fetch_ref.expected_cursor_oid.as_ref().map(|id| encode_lower_hex(id)),
+                    "states": fetch_ref.states.iter().map(projection_state_json).collect::<Vec<_>>(),
                     "proposedState": fetch_ref.proposed_state,
                 })
             })
@@ -309,15 +269,15 @@ impl ProjectionTransport {
             .iter()
             .map(|receipt| {
                 serde_json::json!({
-                    "gitOid": hex(&receipt.git_oid),
-                    "publicCommitId": hex(&receipt.public_commit_id),
+                    "gitOid": encode_lower_hex(&receipt.git_oid),
+                    "publicCommitId": encode_lower_hex(&receipt.public_commit_id),
                 })
             })
             .collect::<Vec<_>>();
         let body = serde_json::json!({
             "incarnation": self.incarnation,
-            "fetchId": hex(&fetch_id),
-            "machineId": hex(&machine_id),
+            "fetchId": encode_lower_hex(&fetch_id),
+            "machineId": encode_lower_hex(&machine_id),
             "remote": remote,
             "refs": refs,
             "receipts": receipts,
@@ -339,7 +299,7 @@ impl ProjectionTransport {
     ) -> Result<ProjectionClaimResult, TransportError> {
         let body = serde_json::json!({
             "incarnation": self.incarnation,
-            "machineId": hex(&machine_id),
+            "machineId": encode_lower_hex(&machine_id),
         });
         let response = self
             .send(
@@ -347,7 +307,7 @@ impl ProjectionTransport {
                     .post(format!(
                         "{}/git/pushes/{}/claim",
                         self.repository_url,
-                        hex(&batch_id)
+                        encode_lower_hex(&batch_id)
                     ))
                     .json(&body),
             )
@@ -363,34 +323,9 @@ impl ProjectionTransport {
             .send(self.client.get(format!(
                 "{}/git/pushes/{}/replay?incarnation={}",
                 self.repository_url,
-                hex(&batch_id),
+                encode_lower_hex(&batch_id),
                 self.incarnation,
             )))
-            .await?;
-        self.read_json(response).await
-    }
-
-    pub async fn confirm_push(
-        &self,
-        batch_id: [u8; 16],
-        machine_id: [u8; 16],
-        fence: u64,
-    ) -> Result<ProjectionBatchResult, TransportError> {
-        let body = serde_json::json!({
-            "incarnation": self.incarnation,
-            "machineId": hex(&machine_id),
-            "fence": fence,
-        });
-        let response = self
-            .send(
-                self.client
-                    .post(format!(
-                        "{}/git/pushes/{}/confirm",
-                        self.repository_url,
-                        hex(&batch_id)
-                    ))
-                    .json(&body),
-            )
             .await?;
         self.read_json(response).await
     }
@@ -407,13 +342,13 @@ impl ProjectionTransport {
             .map(|observation| {
                 serde_json::json!({
                     "bookmark": observation.bookmark,
-                    "liveOid": observation.live_oid.as_ref().map(|id| hex(id)),
+                    "liveOid": observation.live_oid.as_ref().map(|id| encode_lower_hex(id)),
                 })
             })
             .collect::<Vec<_>>();
         let body = serde_json::json!({
             "incarnation": self.incarnation,
-            "machineId": hex(&machine_id),
+            "machineId": encode_lower_hex(&machine_id),
             "fence": fence,
             "observations": observations,
         });
@@ -423,37 +358,12 @@ impl ProjectionTransport {
                     .post(format!(
                         "{}/git/pushes/{}/recover",
                         self.repository_url,
-                        hex(&batch_id)
+                        encode_lower_hex(&batch_id)
                     ))
                     .json(&body),
             )
             .await?;
         self.read_json(response).await
-    }
-
-    async fn send(
-        &self,
-        request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, TransportError> {
-        let response = request
-            .header(reqwest::header::AUTHORIZATION, &self.authorization)
-            .header("x-devspace-machine-id", &self.machine_id)
-            .header("x-devspace-incarnation", &self.incarnation)
-            .send()
-            .await?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-        let bytes = read_bounded(response, MAX_ERROR_BYTES).await?;
-        let error = serde_json::from_slice::<ErrorResponse>(&bytes).map_or_else(
-            |_| "cloud request failed without an error body".to_owned(),
-            |body| match body.code {
-                Some(code) => format!("{code}: {}", body.error),
-                None => body.error,
-            },
-        );
-        Err(format!("cloud request failed with status {status}: {error}").into())
     }
 
     fn remote_url(&self, name: &str) -> Result<reqwest::Url, TransportError> {
@@ -472,26 +382,6 @@ impl ProjectionTransport {
             &read_bounded(response, MAX_RESPONSE_BYTES).await?,
         )?)
     }
-}
-
-#[derive(Deserialize)]
-struct ErrorResponse {
-    error: String,
-    code: Option<String>,
-}
-
-async fn read_bounded(
-    mut response: reqwest::Response,
-    limit: usize,
-) -> Result<Vec<u8>, TransportError> {
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if bytes.len() + chunk.len() > limit {
-            return Err(format!("cloud response exceeds the {limit}-byte limit").into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
 }
 
 fn deserialize_short_id<'de, D>(deserializer: D) -> Result<[u8; 16], D::Error>
@@ -515,8 +405,8 @@ where
     let value = Option::<String>::deserialize(deserializer)?;
     value
         .map(|value| {
-            parse_hex(&value)
-                .map_err(|()| serde::de::Error::custom("invalid optional Git object ID"))
+            decode_lower_hex(&value)
+                .map_err(|_| serde::de::Error::custom("invalid optional Git object ID"))
         })
         .transpose()
 }
@@ -535,7 +425,8 @@ where
     let value = Option::<String>::deserialize(deserializer)?;
     value
         .map(|value| {
-            parse_hex(&value).map_err(|()| serde::de::Error::custom("invalid optional object ID"))
+            decode_lower_hex(&value)
+                .map_err(|_| serde::de::Error::custom("invalid optional object ID"))
         })
         .transpose()
 }
@@ -548,30 +439,14 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
-    parse_hex(&value).map_err(|()| serde::de::Error::custom(format!("invalid {label}")))
+    decode_lower_hex(&value).map_err(|_| serde::de::Error::custom(format!("invalid {label}")))
 }
 
-fn parse_hex<const N: usize>(value: &str) -> Result<[u8; N], ()> {
-    if value.len() != N * 2
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(());
-    }
-    let mut output = [0; N];
-    for (index, byte) in output.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| ())?;
-    }
-    Ok(output)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
+fn projection_state_json(state: &ProjectionState) -> serde_json::Value {
+    serde_json::json!({
+        "gitOid": encode_lower_hex(&state.git_oid),
+        "canonicalCommitId": encode_lower_hex(&state.canonical_commit_id),
+        "publicCommitId": encode_lower_hex(&state.public_commit_id),
+        "hiddenSetId": state.hidden_set_id.as_ref().map(|id| encode_lower_hex(id)),
+    })
 }

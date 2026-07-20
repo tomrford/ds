@@ -7,6 +7,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+use crate::sync_directory;
+
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct LockedJsonFile<'a> {
@@ -106,26 +108,6 @@ impl<'a> LockedJsonFile<'a> {
         }
         result
     }
-}
-
-pub(crate) fn hex_bytes(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-#[cfg(unix)]
-pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[derive(Debug, Error)]

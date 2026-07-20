@@ -158,12 +158,6 @@ export class Repository extends DurableObject<Env> {
     return this.withAuthority(authority, () => this.projection.replay(batchId, incarnationValue));
   }
 
-  confirmProjectionPush(authority: RepositoryAuthority, batchId: unknown, value: unknown) {
-    return this.withAuthority(authority, () =>
-      this.projection.confirm(batchId, value, authority.machineId),
-    );
-  }
-
   recoverProjectionPush(authority: RepositoryAuthority, batchId: unknown, value: unknown) {
     return this.withAuthority(authority, () =>
       this.projection.recover(batchId, value, authority.machineId),

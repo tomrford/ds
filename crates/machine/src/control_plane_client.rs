@@ -4,10 +4,11 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::locked_json::hex_bytes;
+use crate::http_client::hardened_http_client;
+use crate::wire::{BoundedResponseError, ErrorResponse, read_bounded};
 use crate::{
     MachineConfig, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
-    SharedSecret,
+    SharedSecret, encode_lower_hex,
 };
 
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 64 * 1024;
@@ -42,13 +43,6 @@ struct RepositoryResponse {
     incarnation: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ErrorResponse {
-    error: String,
-    code: Option<String>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlPlaneRemoteErrorKind {
     RepositoryNotFound,
@@ -68,7 +62,7 @@ impl ControlPlaneClient {
         let machine_id = HeaderValue::from_str(config.machine_id().as_str())
             .map_err(|_| ControlPlaneClientError::InvalidMachineId)?;
         Ok(Self {
-            client: reqwest::Client::builder().build()?,
+            client: hardened_http_client()?,
             base_url: config.base_url().to_owned(),
             authorization,
             machine_id,
@@ -108,7 +102,7 @@ impl ControlPlaneClient {
             .authenticated(self.client.post(format!("{}/repositories", self.base_url)))
             .json(&CreateRepositoryRequest {
                 name: name.as_str().to_owned(),
-                idempotency_key: hex_bytes(&idempotency_key),
+                idempotency_key: encode_lower_hex(&idempotency_key),
             })
             .build()?)
     }
@@ -126,12 +120,12 @@ impl ControlPlaneClient {
     ) -> Result<CloudRepository, ControlPlaneClientError> {
         let response = self.client.execute(request).await?;
         let status = response.status();
-        let bytes = read_bounded(response, MAX_DIRECTORY_RESPONSE_BYTES).await?;
+        let bytes = read_bounded_directory(response, MAX_DIRECTORY_RESPONSE_BYTES).await?;
         if !status.is_success() {
             let (raw_error, kind) = match serde_json::from_slice::<ErrorResponse>(&bytes) {
                 Ok(body) => {
                     let kind = classify_remote_error(body.code.as_deref());
-                    (body.error, kind)
+                    (body.to_string(), kind)
                 }
                 Err(_) => (
                     "cloud request failed without a valid error body".to_owned(),
@@ -171,24 +165,19 @@ fn classify_remote_error(code: Option<&str>) -> ControlPlaneRemoteErrorKind {
     }
 }
 
-async fn read_bounded(
-    mut response: reqwest::Response,
+async fn read_bounded_directory(
+    response: reqwest::Response,
     limit: usize,
 ) -> Result<Vec<u8>, ControlPlaneClientError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(ControlPlaneClientError::ResponseTooLarge(limit));
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if bytes.len() + chunk.len() > limit {
-            return Err(ControlPlaneClientError::ResponseTooLarge(limit));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+    read_bounded(response, limit)
+        .await
+        .map_err(|error| match error {
+            BoundedResponseError::Request(source) => ControlPlaneClientError::Request(source),
+            BoundedResponseError::DeclaredTooLarge { .. }
+            | BoundedResponseError::TooLarge { .. } => {
+                ControlPlaneClientError::ResponseTooLarge(limit)
+            }
+        })
 }
 
 #[derive(Debug, Error)]

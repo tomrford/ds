@@ -20,11 +20,11 @@ jj-cli.workspace = true
 jj-lib.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
 tokio = { version = "=1.52.3", features = ["rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { version = "=1.52.3", features = ["macros"] }

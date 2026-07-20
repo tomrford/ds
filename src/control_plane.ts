@@ -1,12 +1,24 @@
 import { DurableObject } from "cloudflare:workers";
+import { z } from "zod";
 import { toHex } from "./kernel";
+import { lowerHexStringSchema } from "./validation";
 
-const ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
-const MACHINE_ID_PATTERN = /^[0-9a-f]{32}$/;
-const REPOSITORY_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
-const REPOSITORY_ID_PATTERN = /^[0-9a-f]{64}$/;
-const INCARNATION_PATTERN = /^[0-9a-f]{32}$/;
-const IDEMPOTENCY_KEY_PATTERN = /^[0-9a-f]{32}$/;
+const idSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/);
+const machineIdSchema = lowerHexStringSchema(16, "machine ID");
+const repositoryNameSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/);
+const repositoryIdSchema = lowerHexStringSchema(32, "repository ID");
+const incarnationSchema = lowerHexStringSchema(16, "incarnation");
+const idempotencyKeySchema = lowerHexStringSchema(16, "idempotencyKey");
+const identitySchema = z.strictObject({ userId: idSchema, machineId: machineIdSchema });
+const createRepositorySchema = z.strictObject({
+  name: repositoryNameSchema,
+  idempotencyKey: idempotencyKeySchema,
+});
+const deleteRepositorySchema = z.strictObject({
+  name: repositoryNameSchema,
+  repositoryId: repositoryIdSchema,
+  incarnation: incarnationSchema,
+});
 const PROVISIONAL_RETENTION_MS = 24 * 60 * 60 * 1_000;
 const RETIREMENT_RECOVERY_BATCH = 64;
 const NAME_IN_USE = "name-in-use";
@@ -75,7 +87,8 @@ export class ControlPlane extends DurableObject<Env> {
     } catch (error) {
       return failure(error, 400);
     }
-    if (typeof repositoryIdValue !== "string" || !REPOSITORY_ID_PATTERN.test(repositoryIdValue)) {
+    const repositoryId = repositoryIdSchema.safeParse(repositoryIdValue);
+    if (!repositoryId.success) {
       return failure("repository not found", 404);
     }
     let incarnation: string;
@@ -84,7 +97,7 @@ export class ControlPlane extends DurableObject<Env> {
     } catch (error) {
       return failure(error, 400);
     }
-    const repository = this.repositoryById(identity.userId, repositoryIdValue);
+    const repository = this.repositoryById(identity.userId, repositoryId.data);
     if (
       repository === undefined ||
       repository.status !== "active" ||
@@ -94,7 +107,7 @@ export class ControlPlane extends DurableObject<Env> {
     }
     return {
       ok: true as const,
-      authority: { ...identity, repositoryId: repositoryIdValue, incarnation },
+      authority: { ...identity, repositoryId: repositoryId.data, incarnation },
     };
   }
 
@@ -429,10 +442,6 @@ export class ControlPlane extends DurableObject<Env> {
 
 function initializeControlPlaneSchema(sql: SqlStorage) {
   sql.exec(`
-    CREATE TABLE IF NOT EXISTS _sql_schema_migrations (
-      id INTEGER PRIMARY KEY,
-      applied_at_ms INTEGER NOT NULL
-    );
     CREATE TABLE IF NOT EXISTS repositories (
       repository_id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -452,83 +461,31 @@ function initializeControlPlaneSchema(sql: SqlStorage) {
       incarnation TEXT NOT NULL,
       PRIMARY KEY (user_id, idempotency_key)
     ) WITHOUT ROWID;
-    INSERT OR IGNORE INTO _sql_schema_migrations VALUES (2, ${Date.now()});
   `);
 }
 
 function decodeIdentity(value: unknown): AuthenticatedPrincipal {
-  if (!isRecord(value)) throw new Error("authenticated identity is invalid");
-  requireExactKeys(value, ["userId", "machineId"]);
-  return {
-    userId: requireId(value.userId, "user ID"),
-    machineId: requireMachineId(value.machineId),
-  };
+  return identitySchema.parse(value);
 }
 
 function decodeCreateRepository(value: unknown) {
-  if (!isRecord(value)) throw new Error("repository creation request must be a JSON object");
-  requireExactKeys(value, ["name", "idempotencyKey"]);
-  if (typeof value.idempotencyKey !== "string" || !IDEMPOTENCY_KEY_PATTERN.test(value.idempotencyKey)) {
-    throw new Error("idempotencyKey must be 32 lowercase hex characters");
-  }
-  return { name: requireRepositoryName(value.name), idempotencyKey: value.idempotencyKey };
+  return createRepositorySchema.parse(value);
 }
 
 function decodeDeleteRepository(value: unknown) {
-  if (!isRecord(value)) throw new Error("repository deletion request must be a JSON object");
-  requireExactKeys(value, ["name", "repositoryId", "incarnation"]);
-  return {
-    name: requireRepositoryName(value.name),
-    repositoryId: requireRepositoryId(value.repositoryId),
-    incarnation: requireIncarnation(value.incarnation),
-  };
-}
-
-function requireId(value: unknown, label: string): string {
-  if (typeof value !== "string" || !ID_PATTERN.test(value)) {
-    throw new Error(`${label} is invalid`);
-  }
-  return value;
-}
-
-function requireMachineId(value: unknown): string {
-  if (typeof value !== "string" || !MACHINE_ID_PATTERN.test(value)) {
-    throw new Error("machine ID must be 32 lowercase hex characters");
-  }
-  return value;
+  return deleteRepositorySchema.parse(value);
 }
 
 function requireRepositoryName(value: unknown): string {
-  if (typeof value !== "string" || !REPOSITORY_NAME_PATTERN.test(value)) {
-    throw new Error("invalid repository name");
-  }
-  return value;
+  return repositoryNameSchema.parse(value);
 }
 
 function requireRepositoryId(value: unknown): string {
-  if (typeof value !== "string" || !REPOSITORY_ID_PATTERN.test(value)) {
-    throw new Error("invalid repository ID");
-  }
-  return value;
+  return repositoryIdSchema.parse(value);
 }
 
 function requireIncarnation(value: unknown): string {
-  if (typeof value !== "string" || !INCARNATION_PATTERN.test(value)) {
-    throw new Error("incarnation must be 32 lowercase hex characters");
-  }
-  return value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function requireExactKeys(value: Record<string, unknown>, expected: string[]) {
-  const keys = Object.keys(value).sort();
-  const sortedExpected = [...expected].sort();
-  if (keys.length !== sortedExpected.length || keys.some((key, index) => key !== sortedExpected[index])) {
-    throw new Error(`request fields must be exactly ${expected.join(", ")}`);
-  }
+  return incarnationSchema.parse(value);
 }
 
 function randomHex(bytes: number): string {
@@ -541,7 +498,12 @@ function expectedFailure(error: unknown) {
 }
 
 function failure(error: unknown, status: number) {
-  const code = error instanceof ControlPlaneError ? error.code : undefined;
+  const code =
+    error instanceof ControlPlaneError
+      ? error.code
+      : status === 400
+        ? "invalid-control-plane-request"
+        : undefined;
   return {
     ok: false as const,
     status,

@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use devspace_machine::{
-    FetchReceipt, FetchRef, FetchResult, MachineConfig, MachineId, ProjectionState,
-    ProjectionTransport, SharedSecret,
+    FetchReceipt, FetchRef, FetchResult, HttpTransport, MachineConfig, MachineId, ProjectionState,
+    SharedSecret,
 };
 
 #[path = "../../cli/tests/support/stalling_server.rs"]
@@ -45,7 +45,7 @@ async fn projection_transport_times_out_when_worker_stalls() {
         SharedSecret::new("timeout-test-secret").unwrap(),
     )
     .unwrap();
-    let transport = ProjectionTransport::new(&config, &"ab".repeat(32), [0xcd; 16]).unwrap();
+    let transport = HttpTransport::new(&config, &"ab".repeat(32), [0xcd; 16]).unwrap();
 
     let started = Instant::now();
     let error = transport.get(0, None).await.unwrap_err();
@@ -103,7 +103,7 @@ async fn projection_transport_records_fetch_and_deserializes_result() {
         SharedSecret::new("fetch-test-secret").unwrap(),
     )
     .unwrap();
-    let transport = ProjectionTransport::new(&config, &"ab".repeat(32), [0xcd; 16]).unwrap();
+    let transport = HttpTransport::new(&config, &"ab".repeat(32), [0xcd; 16]).unwrap();
     let state = ProjectionState {
         git_oid: [0x33; 20],
         canonical_commit_id: [0x44; 64],

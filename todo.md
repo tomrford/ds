@@ -39,3 +39,28 @@
   real histories; raising it needs paged/streaming import so one fetch
   transaction stays bounded. Decide before dogfooding a repo deeper than the
   limit (this repo qualifies).
+- Projection idempotency journals grow forever: `projection_fetch_results`
+  (one row per fetch) and `projection_batch_results` are never pruned. Port
+  the head-store retention + quota pattern (the `*_at_ms` columns exist for
+  it). Do early in checkpoint 8, before dogfood data accumulates.
+- `projection_states` scaling: no index on `(remote, bookmark)` or
+  `pending_batch_id`, and `requireUnambiguousFetchLineage` re-runs a
+  full-table `GROUP BY` per fetched OID — hoist the CTE once per request and
+  add the two indexes. Pair with the retention work.
+- Lift full-tree scans: `apply_pollution_tombstones` and
+  `hidden_conflict_paths` walk every tree entry per lifted commit; drive both
+  from the public base→tree `MergedTree` diff stream instead. Pair with the
+  import-depth raise — same dogfood gate.
+- Auto-track discovery walk never sees jj's base ignores (global
+  `core.excludesFile`): a globally-ignored directory is descended by our walk
+  but pruned by jj's, so hidden matches inside it silently diverge from the
+  documented rule. Plumb the same base ignores jj-cli feeds SnapshotOptions
+  into `discover_hidden_paths` and pin a golden test.
+- Test harness dedup (~1.1k LOC): `settings()` defined 24x, the fake TCP
+  Worker written 4x, live-test helpers duplicated between `sync.rs` and
+  `sync_live.rs` (move the two `#[ignore]`d live tests there too).
+  Opportunistic; zero coverage change.
+- Worker version gating: clients now send `x-devspace-client`
+  (`ds/<version> encoding/<epoch>`); the Worker ignores it. When enrolment or
+  the first encoding bump lands, gate stale epochs with an "upgrade ds" error
+  (see AGENTS.md jj bump rollout).

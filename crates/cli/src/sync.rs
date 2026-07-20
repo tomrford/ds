@@ -5,7 +5,7 @@ use std::path::Path;
 use devspace_machine::{
     CatalogEntry, HttpTransport, MachineConfig, MachineRepository, MachineStore, MachineStoreError,
     MachineSyncStore, RepositoryIdentity, RepositoryName, RepositorySyncGuard, SyncEngine,
-    SyncEngineError,
+    SyncEngineError, decode_lower_hex,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -154,11 +154,7 @@ pub(crate) fn run_sync_engine(
 }
 
 fn parse_incarnation(value: &str) -> [u8; 16] {
-    debug_assert_eq!(value.len(), 32);
-    std::array::from_fn(|index| {
-        u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .expect("catalog incarnations are validated lowercase hex")
-    })
+    decode_lower_hex(value).expect("catalog incarnations are validated lowercase hex")
 }
 
 fn sync_error_message(error: &SyncEngineError) -> String {

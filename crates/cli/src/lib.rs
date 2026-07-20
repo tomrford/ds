@@ -9,6 +9,7 @@ mod remove;
 mod repo;
 mod sync;
 mod sync_status;
+mod tx;
 mod working_copy;
 
 use std::process::ExitCode;

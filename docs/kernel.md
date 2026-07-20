@@ -22,8 +22,9 @@ depend on `jj-lib`.
 
 The kernel validates canonical bytes, calculates the content ID, and returns the
 object references needed for closure checks. It covers files, symlinks, trees,
-commits, views and operations. Hidden-path parsing lives in the same no-I/O
-crate; tree traversal and Git projection do not.
+commits, views and operations. Hidden-path parsing and matching live
+machine-side on jj's `GitIgnoreFile`, alongside tree traversal and Git
+projection.
 
 The kernel rejects non-canonical bytes. Both stores hold only canonical bytes;
 normalization belongs on the machine because replication is byte-exact, so the

@@ -14,6 +14,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use crate::{decode_lower_hex, encode_lower_hex};
+
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -21,23 +23,13 @@ pub struct GitOid(pub [u8; 20]);
 
 impl GitOid {
     pub fn from_hex(value: &str) -> Result<Self, GitOidParseError> {
-        if value.len() != 40
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(GitOidParseError);
-        }
-        let mut bytes = [0; 20];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-                .map_err(|_| GitOidParseError)?;
-        }
-        Ok(Self(bytes))
+        decode_lower_hex(value)
+            .map(Self)
+            .map_err(|_| GitOidParseError)
     }
 
     fn hex(self) -> String {
-        hex(&self.0)
+        encode_lower_hex(&self.0)
     }
 }
 
@@ -678,16 +670,6 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 #[cfg(test)]

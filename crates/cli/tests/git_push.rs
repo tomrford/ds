@@ -8,8 +8,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use devspace_machine::{
-    GitProjection, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository,
-    MachineStore, MachineStoreError, ProjectionSnapshot, ProjectionTransport, RepositoryId,
+    GitProjection, HttpTransport, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId,
+    MachineRepository, MachineStore, MachineStoreError, ProjectionSnapshot, RepositoryId,
     RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
 };
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
@@ -626,7 +626,7 @@ impl LiveFixture {
             .unwrap()
             .unwrap();
         let config = store.load_config().unwrap();
-        let transport = ProjectionTransport::new(
+        let transport = HttpTransport::new(
             &config,
             entry.identity.repository_id.as_str(),
             parse_incarnation(entry.identity.incarnation.as_str()),
@@ -942,7 +942,7 @@ fn sync_log(home: &Path, repository_name: &str) -> String {
     .unwrap_or_default()
 }
 
-async fn load_snapshot(transport: &ProjectionTransport) -> ProjectionSnapshot {
+async fn load_snapshot(transport: &HttpTransport) -> ProjectionSnapshot {
     let mut snapshot = transport.get(0, None).await.unwrap();
     let through = snapshot.through;
     while snapshot.has_more {

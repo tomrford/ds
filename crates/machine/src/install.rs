@@ -5,8 +5,11 @@ use blake2::{Blake2b512, Digest as _};
 use devspace_kernel::validate;
 use thiserror::Error;
 
-use crate::object_closure::{ObjectId, hex};
-use crate::{MAX_OBJECT_BYTES, MachineRepository, ObjectKey, PackManifest, PackManifestError};
+use crate::object_closure::ObjectId;
+use crate::{
+    MAX_OBJECT_BYTES, MachineRepository, ObjectKey, PackManifest, PackManifestError,
+    encode_lower_hex as hex,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstalledPack {
@@ -27,8 +30,8 @@ impl MachineRepository {
         let actual_id: ObjectId = Blake2b512::digest(manifest_bytes).into();
         if actual_id != expected_id {
             return Err(PackInstallError::ManifestIdMismatch {
-                expected: hex(expected_id),
-                actual: hex(actual_id),
+                expected: hex(&expected_id),
+                actual: hex(&actual_id),
             });
         }
         let manifest = PackManifest::decode(manifest_bytes)?;
@@ -129,7 +132,7 @@ impl MachineRepository {
         if validated.id != key.id {
             return Err(PackInstallError::ObjectIdMismatch {
                 key,
-                actual: hex(validated.id),
+                actual: hex(&validated.id),
             });
         }
 

@@ -5,7 +5,7 @@
 use devspace_machine::{
     CommitMapping, ExportMappings, GitProjection, HttpTransport, ImportMappings, MachineConfig,
     MachineId, MachineRepository, PackOptions, ProjectionObservation, ProjectionState,
-    ProjectionTransport, ProjectionUpdate, SharedSecret, SyncTransport, build_packs,
+    ProjectionUpdate, SharedSecret, SyncTransport, build_packs,
 };
 use jj_lib::backend::{
     ChangeId, Commit as BackendCommit, CommitId, CopyId, MillisSinceEpoch, Signature, Timestamp,
@@ -167,7 +167,7 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
     let (private_head, hidden_values) = write_private_history(first.repo().store()).await;
     let mut cloud = HttpTransport::new(&first_config, &repository_id, incarnation).unwrap();
     cloud.probe_access().await.unwrap();
-    let journal = ProjectionTransport::new(&first_config, &repository_id, incarnation).unwrap();
+    let journal = HttpTransport::new(&first_config, &repository_id, incarnation).unwrap();
 
     let sidecar = temp.path().join("machine-a/projection");
     let projection = GitProjection::init(&sidecar, &settings).unwrap();
@@ -292,7 +292,7 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
     drop(projection);
     drop(first);
 
-    let recovery = ProjectionTransport::new(&recovery_config, &repository_id, incarnation).unwrap();
+    let recovery = HttpTransport::new(&recovery_config, &repository_id, incarnation).unwrap();
     let claimed = recovery
         .claim_push(batch_id, recovery_machine)
         .await

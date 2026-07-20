@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use crate::sync_engine::TransportError;
-
 // Prevent an unreachable cloud from wedging the singleton daemon during connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // Prevent a stalled Worker from wedging the singleton daemon during a request.
@@ -10,11 +8,22 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const TEST_HOOKS_ENV: &str = "DEVSPACE_HTTP_TEST_HOOKS";
 const TEST_REQUEST_TIMEOUT_MS_ENV: &str = "DEVSPACE_HTTP_TEST_REQUEST_TIMEOUT_MS";
 
-pub(crate) fn hardened_http_client() -> Result<reqwest::Client, TransportError> {
-    Ok(reqwest::Client::builder()
+pub(crate) fn hardened_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-devspace-client",
+        reqwest::header::HeaderValue::from_str(&format!(
+            "ds/{} encoding/{}",
+            env!("CARGO_PKG_VERSION"),
+            devspace_kernel::ENCODING_VERSION,
+        ))
+        .expect("client version header is static ASCII"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(request_timeout())
-        .build()?)
+        .build()
 }
 
 fn request_timeout() -> Duration {

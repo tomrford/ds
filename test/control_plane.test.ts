@@ -129,9 +129,7 @@ describe("cloud identity and repository directory", () => {
       }),
     });
     expect(injectedBody.status).toBe(400);
-    expect(await injectedBody.json()).toEqual({
-      error: "request fields must be exactly name, idempotencyKey",
-    });
+    expect(await injectedBody.json()).toMatchObject({ code: "invalid-control-plane-request" });
   });
 
   it("replays lost create responses and rejects idempotency-key reuse", async () => {

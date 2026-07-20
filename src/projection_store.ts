@@ -12,7 +12,7 @@ import {
   compareNullableBytes,
   decodeBeginProjectionBatch,
   decodeClaimProjectionBatch,
-  decodeProjectionFence,
+  decodeProjectionShortId,
   decodeRecordFetch,
   decodeRecoverProjectionBatch,
 } from "./projection_protocol";
@@ -122,7 +122,7 @@ class ProjectionStoreError extends Error {
   constructor(
     message: string,
     readonly status: number,
-    readonly code?: string,
+    readonly code: string = defaultProjectionErrorCode(status),
   ) {
     super(message);
   }
@@ -191,13 +191,17 @@ export class ProjectionStore {
   get(incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
     let incarnation: ArrayBuffer;
     try {
-      incarnation = exactBuffer(decodeIncarnationOnly(incarnationValue));
+      incarnation = exactBuffer(decodeProjectionShortId(incarnationValue, "incarnation"));
       if (
         typeof afterValue !== "number" ||
         !Number.isSafeInteger(afterValue) ||
         afterValue < 0
       ) {
-        throw new ProjectionStoreError("projection cursor must be a non-negative integer", 400);
+        throw new ProjectionStoreError(
+          "projection cursor must be a non-negative integer",
+          400,
+          "invalid-projection-cursor",
+        );
       }
       this.requireIncarnation(incarnation);
       const meta = this.meta();
@@ -211,6 +215,7 @@ export class ProjectionStore {
         throw new ProjectionStoreError(
           "projection high-water must be between the cursor and current activation frontier",
           400,
+          "invalid-projection-high-water",
         );
       }
       const cursors = this.sql
@@ -312,8 +317,8 @@ export class ProjectionStore {
     let batchId: ArrayBuffer;
     let incarnation: ArrayBuffer;
     try {
-      batchId = exactBuffer(decodeBatchId(batchIdValue));
-      incarnation = exactBuffer(decodeIncarnationOnly(incarnationValue));
+      batchId = exactBuffer(decodeProjectionShortId(batchIdValue, "batchId"));
+      incarnation = exactBuffer(decodeProjectionShortId(incarnationValue, "incarnation"));
     } catch (error) {
       return failure(error, 400);
     }
@@ -376,7 +381,7 @@ export class ProjectionStore {
       request = decodeBeginProjectionBatch(value);
       requireAuthenticatedMachine(request.machineId, authenticatedMachineId);
     } catch (error) {
-      return requestFailure(error);
+      return requestFailure(error, "invalid-projection-request");
     }
     const incarnation = exactBuffer(request.incarnation);
     const batchId = exactBuffer(request.batchId);
@@ -409,6 +414,7 @@ export class ProjectionStore {
           throw new ProjectionStoreError(
             `pending projection refs exceed the ${MAX_REPOSITORY_PROJECTION_REFS}-ref repository limit`,
             429,
+            "projection-pending-ref-limit",
           );
         }
         const pendingStates = this.sql
@@ -424,6 +430,7 @@ export class ProjectionStore {
           throw new ProjectionStoreError(
             `pending projection states exceed the ${MAX_PROJECTION_STATES}-state repository limit`,
             429,
+            "projection-pending-state-limit",
           );
         }
         const activeCursors = this.sql
@@ -442,6 +449,7 @@ export class ProjectionStore {
           throw new ProjectionStoreError(
             `projection cursors exceed the ${MAX_REPOSITORY_PROJECTION_REFS}-ref repository limit`,
             429,
+            "projection-ref-limit",
           );
         }
         for (const update of request.updates) {
@@ -497,6 +505,7 @@ export class ProjectionStore {
               throw new ProjectionStoreError(
                 `another push already owns ${request.remote}/${update.bookmark}`,
                 409,
+                "push-in-progress",
               );
             }
             throw error;
@@ -689,11 +698,11 @@ export class ProjectionStore {
     let batchId: ArrayBuffer;
     let request: ReturnType<typeof decodeClaimProjectionBatch>;
     try {
-      batchId = exactBuffer(decodeBatchId(batchIdValue));
+      batchId = exactBuffer(decodeProjectionShortId(batchIdValue, "batchId"));
       request = decodeClaimProjectionBatch(value);
       requireAuthenticatedMachine(request.machineId, authenticatedMachineId);
     } catch (error) {
-      return requestFailure(error);
+      return requestFailure(error, "invalid-projection-request");
     }
     try {
       return this.ctx.storage.transactionSync(() => {
@@ -717,21 +726,6 @@ export class ProjectionStore {
     }
   }
 
-  confirm(batchIdValue: unknown, value: unknown, authenticatedMachineId: string) {
-    return this.withFence(batchIdValue, value, decodeProjectionFence, authenticatedMachineId, (batchId, request) => {
-      const replay = this.replayFinished(batchId, request);
-      if (replay !== undefined) return replay;
-      this.requireFence(batchId, request);
-      if (this.isRecoveryClaimed(batchId)) {
-        throw new ProjectionStoreError(
-          "claimed projection batch requires observed remote state recovery",
-          409,
-        );
-      }
-      return this.finish(batchId, request.fence, "accepted");
-    });
-  }
-
   recover(batchIdValue: unknown, value: unknown, authenticatedMachineId: string) {
     return this.withFence(batchIdValue, value, decodeRecoverProjectionBatch, authenticatedMachineId, (batchId, request) => {
       const replay = this.replayFinished(batchId, request);
@@ -753,6 +747,7 @@ export class ProjectionStore {
         throw new ProjectionStoreError(
           "claimed projection batch still matches its expected refs; replay the exact push before recovery",
           409,
+          "projection-replay-required",
         );
       }
       if (allExpected) {
@@ -761,6 +756,7 @@ export class ProjectionStore {
       throw new ProjectionStoreError(
         "remote refs are mixed or ambiguous; projection batch remains quarantined",
         409,
+        "projection-remote-state-ambiguous",
       );
     });
   }
@@ -786,11 +782,11 @@ export class ProjectionStore {
     let batchId: ArrayBuffer;
     let request: T;
     try {
-      batchId = exactBuffer(decodeBatchId(batchIdValue));
+      batchId = exactBuffer(decodeProjectionShortId(batchIdValue, "batchId"));
       request = decode(value);
       requireAuthenticatedMachine(request.machineId, authenticatedMachineId);
     } catch (error) {
-      return requestFailure(error);
+      return requestFailure(error, "invalid-projection-request");
     }
     try {
       return this.ctx.storage.transactionSync(() => {
@@ -885,7 +881,11 @@ export class ProjectionStore {
     const result = this.batchResult(batchId);
     if (result === undefined) return undefined;
     if (result.final_fence !== request.fence) {
-      throw new ProjectionStoreError("projection fencing token is stale", 409);
+      throw new ProjectionStoreError(
+        "projection fencing token is stale",
+        409,
+        "projection-fence-stale",
+      );
     }
     return {
       ok: true as const,
@@ -901,7 +901,11 @@ export class ProjectionStore {
       batch.fence !== request.fence ||
       !equalBytes(new Uint8Array(batch.owner_machine), request.machineId)
     ) {
-      throw new ProjectionStoreError("projection owner or fencing token is stale", 409);
+      throw new ProjectionStoreError(
+        "projection owner or fencing token is stale",
+        409,
+        "projection-owner-stale",
+      );
     }
   }
 
@@ -910,7 +914,11 @@ export class ProjectionStore {
       refs.length !== observations.length ||
       refs.some((ref, index) => ref.bookmark !== observations[index].bookmark)
     ) {
-      throw new ProjectionStoreError("observations must cover the exact pending ref set", 409);
+      throw new ProjectionStoreError(
+        "observations must cover the exact pending ref set",
+        409,
+        "projection-observation-set-mismatch",
+      );
     }
   }
 
@@ -926,7 +934,7 @@ export class ProjectionStore {
         throw new ProjectionStoreError(
           `${label} commit ${toHex(id)} is not cloud durable`,
           409,
-          code,
+          code ?? "projection-commit-not-durable",
         );
       }
       const commitId = exactBuffer(id);
@@ -937,13 +945,13 @@ export class ProjectionStore {
           throw new ProjectionStoreError(
             `${label} commit ${toHex(id)} is not cloud durable`,
             409,
-            code,
+            code ?? "projection-commit-not-durable",
           );
         }
         throw new ProjectionStoreError(
           `${label} commit ${toHex(id)} closure is missing ${KIND_BY_NUMBER[missing.kind] ?? `kind ${missing.kind}`} ${missingId}`,
           409,
-          code,
+          code ?? "projection-commit-not-durable",
         );
       }
       this.markClosureComplete(commitId);
@@ -1008,6 +1016,7 @@ export class ProjectionStore {
         throw new ProjectionStoreError(
           `Git object ${toHex(gitOid)} already has a different immutable receipt`,
           409,
+          "projection-receipt-mismatch",
         );
       }
       return;
@@ -1039,7 +1048,7 @@ export class ProjectionStore {
       throw new ProjectionStoreError(
         `projection cursor for ${remote}/${bookmark} does not match expected old Git ID`,
         409,
-        code,
+        code ?? "projection-cursor-stale",
       );
     }
   }
@@ -1059,7 +1068,13 @@ export class ProjectionStore {
 
   private requireBatch(batchId: ArrayBuffer): BatchRow {
     const batch = this.batch(batchId);
-    if (batch === undefined) throw new ProjectionStoreError("projection batch does not exist", 404);
+    if (batch === undefined) {
+      throw new ProjectionStoreError(
+        "projection batch does not exist",
+        404,
+        "projection-batch-not-found",
+      );
+    }
     return batch;
   }
 
@@ -1088,6 +1103,7 @@ export class ProjectionStore {
       throw new ProjectionStoreError(
         "projection batch ID was already used for a different request",
         409,
+        "projection-replay-mismatch",
       );
     }
   }
@@ -1097,10 +1113,18 @@ export class ProjectionStore {
       .exec<RepositoryStateRow>("SELECT incarnation FROM repository_state WHERE singleton = 1")
       .toArray()[0];
     if (state === undefined) {
-      throw new ProjectionStoreError("repository is not initialized", 409, code);
+      throw new ProjectionStoreError(
+        "repository is not initialized",
+        409,
+        code ?? "repository-not-initialized",
+      );
     }
     if (!equalBytes(new Uint8Array(state.incarnation), new Uint8Array(incarnation))) {
-      throw new ProjectionStoreError("repository incarnation does not match", 409, code);
+      throw new ProjectionStoreError(
+        "repository incarnation does not match",
+        409,
+        code ?? "repository-incarnation-mismatch",
+      );
     }
   }
 
@@ -1307,14 +1331,6 @@ function hexBytes(value: string) {
   );
 }
 
-function decodeIncarnationOnly(value: unknown): Uint8Array {
-  return decodeClaimProjectionBatch({ incarnation: value, machineId: "00".repeat(16) }).incarnation;
-}
-
-function decodeBatchId(value: unknown): Uint8Array {
-  return decodeClaimProjectionBatch({ incarnation: value, machineId: "00".repeat(16) }).incarnation;
-}
-
 function failure(error: unknown, status: number, code?: string) {
   return {
     ok: false as const,
@@ -1330,11 +1346,30 @@ function failure(error: unknown, status: number, code?: string) {
   };
 }
 
+function defaultProjectionErrorCode(status: number): string {
+  switch (status) {
+    case 400:
+      return "invalid-projection-request";
+    case 403:
+      return "projection-forbidden";
+    case 404:
+      return "projection-not-found";
+    case 409:
+      return "projection-conflict";
+    case 429:
+      return "projection-capacity-exhausted";
+    default:
+      throw new Error(`projection store error status ${status} requires an explicit code`);
+  }
+}
+
 function requestFailure(error: unknown, code?: string) {
   return failure(
     error,
     error instanceof ProjectionStoreError ? error.status : 400,
-    error instanceof ProjectionStoreError ? error.code : code,
+    error instanceof ProjectionStoreError || error instanceof ProjectionProtocolError
+      ? error.code
+      : code,
   );
 }
 
@@ -1352,7 +1387,7 @@ function requireAuthenticatedMachine(
     throw new ProjectionStoreError(
       "projection machine does not match authenticated machine",
       403,
-      code,
+      code ?? "projection-machine-mismatch",
     );
   }
 }

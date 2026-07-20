@@ -24,6 +24,20 @@ use jj_lib::workspace::{
 };
 
 const DSPRIVATE: &str = ".dsprivate";
+pub(crate) const DEVSPACE_WORKING_COPY_TYPE: &str = "devspace-local";
+
+pub(crate) fn devspace_working_copy_factory() -> Box<dyn WorkingCopyFactory> {
+    Box::new(DevspaceWorkingCopyFactory)
+}
+
+pub(crate) fn devspace_working_copy_factories() -> WorkingCopyFactories {
+    let mut factories = WorkingCopyFactories::new();
+    factories.insert(
+        DEVSPACE_WORKING_COPY_TYPE.to_owned(),
+        devspace_working_copy_factory(),
+    );
+    factories
+}
 
 pub(crate) fn wrap_workspace_loader(inner: Box<dyn WorkspaceLoader>) -> Box<dyn WorkspaceLoader> {
     Box::new(DevspaceWorkspaceLoader { inner })
@@ -48,8 +62,7 @@ impl WorkspaceLoader for DevspaceWorkspaceLoader {
         store_factories: &StoreFactories,
         _working_copy_factories: &WorkingCopyFactories,
     ) -> Result<Workspace, WorkspaceLoadError> {
-        let mut factories = WorkingCopyFactories::new();
-        factories.insert("local".to_owned(), Box::new(DevspaceWorkingCopyFactory));
+        let factories = devspace_working_copy_factories();
         self.inner.load(settings, store_factories, &factories)
     }
 
@@ -112,7 +125,7 @@ struct DevspaceWorkingCopy {
 #[async_trait(?Send)]
 impl WorkingCopy for DevspaceWorkingCopy {
     fn name(&self) -> &str {
-        self.inner.name()
+        DEVSPACE_WORKING_COPY_TYPE
     }
 
     fn workspace_name(&self) -> &WorkspaceName {

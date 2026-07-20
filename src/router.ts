@@ -5,10 +5,15 @@ import { MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, readBoundedBody } from "./pack_pro
 import { MAX_PROJECTION_REQUEST_BYTES } from "./projection_protocol";
 import { MAX_REMOTE_REQUEST_BYTES } from "./remote_protocol";
 import type { Repository } from "./repository";
+import {
+  cursorStringSchema,
+  jsonObjectSchema,
+  objectIdStringSchema,
+} from "./validation";
+import { z } from "zod";
 
 const DIRECTORY_REQUEST_BYTES = 4 * 1024;
-const REPOSITORY_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
-const PACK_ID_PATTERN = /^[0-9a-f]{128}$/;
+const repositoryNameSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/);
 const CONTROL_PLANE_NAME = "directory";
 type WorkerEnv = Env & DevelopmentSecretEnv;
 
@@ -49,7 +54,7 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
     const projectionPushMatch = /^\/repositories\/([^/]+)\/git\/pushes$/.exec(url.pathname);
     const projectionFetchMatch = /^\/repositories\/([^/]+)\/git\/fetches$/.exec(url.pathname);
     const projectionPushActionMatch =
-      /^\/repositories\/([^/]+)\/git\/pushes\/([^/]+)\/(claim|confirm|recover|replay)$/.exec(
+      /^\/repositories\/([^/]+)\/git\/pushes\/([^/]+)\/(claim|recover|replay)$/.exec(
         url.pathname,
       );
     const packCatalogMatch = /^\/repositories\/([^/]+)\/packs$/.exec(url.pathname);
@@ -78,15 +83,20 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
       }
       if (directoryMatch !== null) {
         const name = directoryMatch[1];
-        if (!REPOSITORY_NAME_PATTERN.test(name)) return errorResponse(400, "invalid repository name");
+        if (!repositoryNameSchema.safeParse(name).success) {
+          return errorResponse(400, "invalid repository name");
+        }
         if (request.method === "GET") {
           return rpcResponse(await control.resolveRepository(principal, name));
         }
         if (request.method === "DELETE") {
           const body = await readJsonBody(request, DIRECTORY_REQUEST_BYTES, "repository deletion request");
           if (body instanceof Response) return body;
-          if (!isRecord(body)) return errorResponse(400, "repository deletion request must be a JSON object");
-          return rpcResponse(await control.deleteRepository(principal, { ...body, name }));
+          const record = jsonObjectSchema.safeParse(body);
+          if (!record.success) {
+            return errorResponse(400, "repository deletion request must be a JSON object");
+          }
+          return rpcResponse(await control.deleteRepository(principal, { ...record.data, name }));
         }
       }
       return errorResponse(404, "not found");
@@ -98,7 +108,7 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
       incarnation,
     );
     if (!authorization.ok) return rpcResponse(authorization);
-    if (packId !== undefined && !PACK_ID_PATTERN.test(packId)) {
+    if (packId !== undefined && !objectIdStringSchema.safeParse(packId).success) {
       return errorResponse(400, "invalid pack ID");
     }
     const authority = authorization.authority;
@@ -121,25 +131,31 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
         return rpcResponse(await stub.putPackManifest(authority, packId, bytes));
       }
       if (objectInventoryMatch !== null && request.method === "POST") {
-        const body = await readJsonBody(request, MAX_OBJECT_INVENTORY_REQUEST_BYTES, "object inventory request");
+        const body = await readJsonBody(
+          request,
+          MAX_OBJECT_INVENTORY_REQUEST_BYTES,
+          "object inventory request",
+          "invalid-object-inventory-request",
+        );
         if (body instanceof Response) return body;
         return rpcResponse(await stub.inventoryObjects(authority, body));
       }
       if (packCatalogMatch !== null && request.method === "GET") {
-        const after = url.searchParams.get("after") ?? "0";
-        if (!/^(0|[1-9][0-9]*)$/.test(after) || !Number.isSafeInteger(Number(after))) {
+        const after = cursorStringSchema.safeParse(url.searchParams.get("after") ?? "0");
+        if (!after.success) {
           return errorResponse(400, "invalid pack cursor");
         }
         const throughValue = url.searchParams.get("through");
-        if (throughValue !== null && (!/^(0|[1-9][0-9]*)$/.test(throughValue) || !Number.isSafeInteger(Number(throughValue)))) {
+        const through = throughValue === null ? undefined : cursorStringSchema.safeParse(throughValue);
+        if (through !== undefined && !through.success) {
           return errorResponse(400, "invalid pack high-water");
         }
         return rpcResponse(
           await stub.listInstalledPacks(
             authority,
             url.searchParams.get("incarnation"),
-            Number(after),
-            throughValue === null ? undefined : Number(throughValue),
+            after.data,
+            through?.data,
           ),
         );
       }
@@ -155,10 +171,11 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
       }
       if (chunkMatch !== null) {
         if (packId === undefined) throw new Error("chunk route did not capture a pack ID");
-        if (!/^(0|[1-9][0-9]*)$/.test(chunkMatch[3]) || !Number.isSafeInteger(Number(chunkMatch[3]))) {
+        const decodedPosition = cursorStringSchema.safeParse(chunkMatch[3]);
+        if (!decodedPosition.success) {
           return errorResponse(400, "invalid chunk position");
         }
-        const position = Number(chunkMatch[3]);
+        const position = decodedPosition.data;
         if (request.method === "PUT") {
           let bytes: Uint8Array;
           try {
@@ -187,22 +204,28 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
         return rpcResponse(await stub.getHeads(authority, url.searchParams.get("incarnation")));
       }
       if (headMatch !== null && request.method === "POST") {
-        const body = await readJsonBody(request, MAX_HEAD_REQUEST_BYTES, "head request");
+        const body = await readJsonBody(
+          request,
+          MAX_HEAD_REQUEST_BYTES,
+          "head request",
+          "invalid-head-request",
+        );
         if (body instanceof Response) return body;
         return rpcResponse(await stub.transactHeads(authority, body));
       }
       if (projectionMatch !== null && request.method === "GET") {
-        const after = url.searchParams.get("after") ?? "0";
+        const after = cursorStringSchema.safeParse(url.searchParams.get("after") ?? "0");
         const throughValue = url.searchParams.get("through");
-        if (!/^(0|[1-9][0-9]*)$/.test(after) || !Number.isSafeInteger(Number(after)) || (throughValue !== null && (!/^(0|[1-9][0-9]*)$/.test(throughValue) || !Number.isSafeInteger(Number(throughValue))))) {
+        const through = throughValue === null ? undefined : cursorStringSchema.safeParse(throughValue);
+        if (!after.success || (through !== undefined && !through.success)) {
           return errorResponse(400, "invalid projection cursor");
         }
         return rpcResponse(
           await stub.getProjection(
             authority,
             url.searchParams.get("incarnation"),
-            Number(after),
-            throughValue === null ? undefined : Number(throughValue),
+            after.data,
+            through?.data,
           ),
         );
       }
@@ -228,7 +251,12 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
         return rpcResponse(await stub.setRemote(authority, name, body));
       }
       if (projectionPushMatch !== null && request.method === "POST") {
-        const body = await readJsonBody(request, MAX_PROJECTION_REQUEST_BYTES, "projection push request");
+        const body = await readJsonBody(
+          request,
+          MAX_PROJECTION_REQUEST_BYTES,
+          "projection push request",
+          "invalid-projection-request",
+        );
         if (body instanceof Response) return body;
         return rpcResponse(await stub.beginProjectionPush(authority, body));
       }
@@ -252,14 +280,17 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
         );
       }
       if (projectionPushActionMatch !== null && request.method === "POST") {
-        const body = await readJsonBody(request, MAX_PROJECTION_REQUEST_BYTES, "projection push request");
+        const body = await readJsonBody(
+          request,
+          MAX_PROJECTION_REQUEST_BYTES,
+          "projection push request",
+          "invalid-projection-request",
+        );
         if (body instanceof Response) return body;
         const batchId = projectionPushActionMatch[2];
         switch (projectionPushActionMatch[3]) {
           case "claim":
             return rpcResponse(await stub.claimProjectionPush(authority, batchId, body));
-          case "confirm":
-            return rpcResponse(await stub.confirmProjectionPush(authority, batchId, body));
           case "recover":
             return rpcResponse(await stub.recoverProjectionPush(authority, batchId, body));
         }
@@ -307,8 +338,4 @@ function binaryRpcResponse(result: { ok: boolean; error?: string; status?: numbe
   if (!result.ok) return errorResponse(result.status ?? 400, result.error ?? "repository request failed");
   if (result.bytes === undefined) throw new Error("binary repository response is missing bytes");
   return new Response(result.bytes, { headers: { "content-type": "application/octet-stream" } });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

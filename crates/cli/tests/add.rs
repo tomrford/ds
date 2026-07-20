@@ -13,7 +13,9 @@ use devspace_machine::{
 };
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
+use jj_lib::repo::{StoreFactories, StoreLoadError};
 use jj_lib::settings::UserSettings;
+use jj_lib::workspace::{Workspace, WorkspaceLoadError, default_working_copy_factories};
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
@@ -605,6 +607,26 @@ async fn add_fresh_creates_deterministic_owned_workspace() {
     assert_eq!(owner["repository_id"], "ab".repeat(32));
     assert_eq!(owner["incarnation"], "cd".repeat(16));
     assert_eq!(owner["workspace_name"], workspace_id);
+    assert_eq!(
+        fs::read_to_string(canonical_destination.join(".jj/working_copy/type")).unwrap(),
+        "devspace-local"
+    );
+    let load_error = match Workspace::load(
+        &settings(),
+        &canonical_destination,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    ) {
+        Ok(_) => panic!("stock jj factories loaded a Devspace working copy"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        load_error,
+        WorkspaceLoadError::StoreLoadError(StoreLoadError::UnsupportedType {
+            store: "working copy",
+            ref store_type,
+        }) if store_type == "devspace-local"
+    ));
     let (registered, _) = only_workspace(&repository_path).await;
     assert_eq!(registered.as_str(), workspace_id);
     assert!(

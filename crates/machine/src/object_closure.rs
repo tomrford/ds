@@ -10,7 +10,7 @@ use jj_lib::op_heads_store::OpHeadsStoreError;
 use jj_lib::repo::Repo as _;
 use thiserror::Error;
 
-use crate::MachineRepository;
+use crate::{MachineRepository, encode_lower_hex};
 
 pub type ObjectId = [u8; 64];
 pub const MAX_OBJECT_BYTES: u64 = 1024 * 1024;
@@ -162,7 +162,7 @@ impl MachineRepository {
                 if validated.id != key.id {
                     return Err(ObjectClosureError::ObjectIdMismatch {
                         key,
-                        actual: hex(validated.id),
+                        actual: encode_lower_hex(&validated.id),
                     });
                 }
                 pending.extend(validated.references.into_iter().map(|reference| ObjectKey {
@@ -262,7 +262,10 @@ impl MachineRepository {
             ObjectKind::View => ("op_store", "views"),
             ObjectKind::Operation => ("op_store", "operations"),
         };
-        self.path().join(store).join(directory).join(hex(key.id))
+        self.path()
+            .join(store)
+            .join(directory)
+            .join(encode_lower_hex(&key.id))
     }
 }
 
@@ -294,19 +297,9 @@ fn require_object_id(key: ObjectKey, actual: ObjectId) -> Result<(), ObjectClosu
     } else {
         Err(ObjectClosureError::ObjectIdMismatch {
             key,
-            actual: hex(actual),
+            actual: encode_lower_hex(&actual),
         })
     }
-}
-
-pub(crate) fn hex(id: ObjectId) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(id.len() * 2);
-    for byte in id {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 #[derive(Debug, Error)]

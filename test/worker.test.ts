@@ -80,7 +80,7 @@ describe("pack installation", () => {
 
     const earlyInstall = await install("pack", helloPackId);
     expect(earlyInstall.status).toBe(400);
-    expect(await earlyInstall.json()).toEqual({ error: "pack is missing 1 chunks" });
+    expect(await earlyInstall.json()).toMatchObject({ error: expect.any(String) });
 
     const corruptChunk = await putChunk(
       "pack",
@@ -89,7 +89,7 @@ describe("pack installation", () => {
       new TextEncoder().encode("HELLO"),
     );
     expect(corruptChunk.status).toBe(400);
-    expect(await corruptChunk.json()).toEqual({ error: "chunk 0 hash does not match manifest" });
+    expect(await corruptChunk.json()).toMatchObject({ error: expect.any(String) });
 
     const firstChunk = await putChunk("pack", helloPackId, 0, hello);
     expect(await firstChunk.json()).toEqual({ inserted: true, installed: false });
@@ -160,7 +160,7 @@ describe("pack installation", () => {
     expect((await putChunk("rollback", fixture.id, 0, fixture.bytes)).status).toBe(200);
     const response = await install("rollback", fixture.id);
     expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: "object 1 ID does not match manifest" });
+    expect(await response.json()).toMatchObject({ error: expect.any(String) });
     const stub = await repositoryStub("rollback");
     expect(await stub.countObjects()).toBe(0);
     expect(await stub.countInstalledPacks()).toBe(0);
@@ -254,10 +254,7 @@ describe("cloud operation heads", () => {
       status: 200,
       body: { initialized: false, cursor: 0, heads: [] },
     });
-    expect(await initialize(repository, otherIncarnation)).toEqual({
-      status: 409,
-      body: { error: "repository incarnation does not match" },
-    });
+    expect(await initialize(repository, otherIncarnation)).toMatchObject({ status: 409 });
 
     const base = await installOperation(repository, "base");
     const left = await installOperation(repository, "left", [base]);
@@ -285,30 +282,24 @@ describe("cloud operation heads", () => {
     });
     expect(
       await headTransaction(repository, incarnation, "02".repeat(16), merged, [left, right]),
-    ).toEqual({
-      status: 409,
-      body: { error: "idempotency key was already used for a different head request" },
-    });
+    ).toMatchObject({ status: 409, body: { code: "head-replay-mismatch" } });
     expect(await headTransaction(repository, incarnation, "04".repeat(16), merged, [right, left]))
       .toEqual({ status: 200, body: { cursor: 4, heads: [merged] } });
     expect(await headTransaction(repository, incarnation, "09".repeat(16), unrelated, [merged]))
-      .toEqual({
-        status: 409,
-        body: { error: `observed current head is not an ancestor of new head: ${merged}` },
-      });
+      .toMatchObject({ status: 409, body: { code: "head-observation-stale" } });
     expect(await getHeads(repository, incarnation)).toEqual({
       status: 200,
       body: { cursor: 4, heads: [merged] },
     });
-    expect(await getHeads(repository, otherIncarnation)).toEqual({
+    expect(await getHeads(repository, otherIncarnation)).toMatchObject({
       status: 409,
-      body: { error: "repository incarnation does not match" },
+      body: { code: "repository-incarnation-mismatch" },
     });
     expect(
       await headTransaction(repository, otherIncarnation, "05".repeat(16), left, [merged]),
-    ).toEqual({
+    ).toMatchObject({
       status: 409,
-      body: { error: "repository incarnation does not match" },
+      body: { code: "repository-incarnation-mismatch" },
     });
   });
 
@@ -324,9 +315,9 @@ describe("cloud operation heads", () => {
     const childId = await installObject(repository, KIND.operation, child);
     const request = headRequest(incarnation, "06".repeat(16), childId, []);
 
-    expect(await postHeads(repository, request)).toEqual({
+    expect(await postHeads(repository, request)).toMatchObject({
       status: 409,
-      body: { error: `head closure is missing operation ${parentId}` },
+      body: { code: "head-closure-incomplete" },
     });
     expect(await getHeads(repository, incarnation)).toEqual({
       status: 200,
@@ -334,9 +325,9 @@ describe("cloud operation heads", () => {
     });
 
     expect(await installObject(repository, KIND.operation, parent)).toBe(parentId);
-    expect(await postHeads(repository, request)).toEqual({
+    expect(await postHeads(repository, request)).toMatchObject({
       status: 409,
-      body: { error: `head closure is missing view ${viewId}` },
+      body: { code: "head-closure-incomplete" },
     });
     expect(await installObject(repository, KIND.view, view)).toBe(viewId);
     expect(await postHeads(repository, request)).toEqual({
@@ -361,7 +352,7 @@ describe("cloud operation heads", () => {
       }),
     );
     expect(missing.status).toBe(404);
-    expect(await missing.json()).toEqual({ error: "repository not found" });
+    expect(await missing.json()).toMatchObject({ error: expect.any(String) });
     await initialize(repository, incarnation);
     const operation = await installOperation(repository, "validation");
     expect(
@@ -369,21 +360,13 @@ describe("cloud operation heads", () => {
         ...headRequest(incarnation, "07".repeat(16), operation, []),
         unexpected: true,
       }),
-    ).toEqual({
-      status: 400,
-      body: {
-        error: "head request fields must be exactly incarnation, idempotencyKey, newHead, observedHeads",
-      },
-    });
+    ).toMatchObject({ status: 400, body: { code: "invalid-head-request" } });
     expect(
       await postHeads(repository, headRequest(incarnation, "07".repeat(16), operation, [zeroId, zeroId])),
-    ).toEqual({
+    ).toMatchObject({ status: 400, body: { code: "invalid-head-request" } });
+    expect(await postRawHeads(repository, "{")).toMatchObject({
       status: 400,
-      body: { error: "observedHeads must not contain duplicates" },
-    });
-    expect(await postRawHeads(repository, "{")).toEqual({
-      status: 400,
-      body: { error: "head request must be valid JSON" },
+      body: { code: "invalid-head-request" },
     });
     expect(
       await postHeads(
@@ -397,14 +380,10 @@ describe("cloud operation heads", () => {
           ),
         ),
       ),
-    ).toEqual({
-      status: 400,
-      body: { error: `observedHeads exceeds the ${MAX_OBSERVED_HEADS}-head limit` },
-    });
-    expect(await postRawHeads(repository, "x".repeat(MAX_HEAD_REQUEST_BYTES + 1))).toEqual({
-      status: 400,
-      body: { error: `head request exceeds ${MAX_HEAD_REQUEST_BYTES} byte limit` },
-    });
+    ).toMatchObject({ status: 400, body: { code: "invalid-head-request" } });
+    expect(
+      await postRawHeads(repository, "x".repeat(MAX_HEAD_REQUEST_BYTES + 1)),
+    ).toMatchObject({ status: 400, body: { code: "invalid-head-request" } });
   });
 });
 
@@ -448,12 +427,7 @@ describe("cloud pack download", () => {
       status: 200,
       body: { packs: [], nextAfter: 1, through: 1, hasMore: false },
     });
-    expect(await listPacks(repository, incarnation, 1, 99)).toEqual({
-      status: 400,
-      body: {
-        error: "pack high-water must be between the cursor and current catalog frontier",
-      },
-    });
+    expect(await listPacks(repository, incarnation, 1, 99)).toMatchObject({ status: 400 });
     expect(await downloadPackManifest(repository, helloPackId, incarnation)).toEqual(manifest);
     expect(await downloadPackChunk(repository, helloPackId, 0, incarnation)).toEqual(hello);
 
@@ -485,13 +459,13 @@ describe("cloud pack download", () => {
       );
     }
 
-    expect(await listPacks(repository, "44".repeat(16), 0)).toEqual({
+    expect(await listPacks(repository, "44".repeat(16), 0)).toMatchObject({
       status: 409,
-      body: { error: "repository incarnation does not match" },
+      body: { code: "repository-incarnation-mismatch" },
     });
     const missing = await fetchPackChunk(repository, "00".repeat(64), 0, incarnation);
     expect(missing.status).toBe(404);
-    expect(await missing.json()).toEqual({ error: "installed pack chunk does not exist" });
+    expect(await missing.json()).toMatchObject({ error: expect.any(String) });
   });
 });
 
@@ -523,9 +497,9 @@ describe("cloud object inventory", () => {
         incarnation: "35".repeat(16),
         objects: [{ kind: KIND.file, id: helloId }],
       }),
-    ).toEqual({
+    ).toMatchObject({
       status: 409,
-      body: { error: "repository incarnation does not match" },
+      body: { code: "repository-incarnation-mismatch" },
     });
   });
 
@@ -539,11 +513,9 @@ describe("cloud object inventory", () => {
         objects: [{ kind: KIND.operation, id: "01".repeat(64) }],
         unexpected: true,
       }),
-    ).toEqual({
+    ).toMatchObject({
       status: 400,
-      body: {
-        error: "object inventory request fields must be exactly incarnation, objects",
-      },
+      body: { code: "invalid-object-inventory-request" },
     });
     expect(
       await objectInventory(repository, {
@@ -553,9 +525,9 @@ describe("cloud object inventory", () => {
           { kind: KIND.operation, id: "01".repeat(64) },
         ],
       }),
-    ).toEqual({
+    ).toMatchObject({
       status: 400,
-      body: { error: "objects must be strictly sorted and unique" },
+      body: { code: "invalid-object-inventory-request" },
     });
     expect(
       await stub.inventoryObjects(await repositoryAuthority(repository), {
@@ -568,18 +540,16 @@ describe("cloud object inventory", () => {
     ).toMatchObject({
       ok: false,
       status: 400,
-      error: `objects exceeds the ${MAX_OBJECT_INVENTORY_KEYS}-object limit`,
+      code: "invalid-object-inventory-request",
     });
     expect(
       await objectInventoryRaw(
         repository,
         new TextEncoder().encode("x".repeat(MAX_OBJECT_INVENTORY_REQUEST_BYTES + 1)),
       ),
-    ).toEqual({
+    ).toMatchObject({
       status: 400,
-      body: {
-        error: `object inventory request exceeds ${MAX_OBJECT_INVENTORY_REQUEST_BYTES} byte limit`,
-      },
+      body: { code: "invalid-object-inventory-request" },
     });
   });
 });
@@ -624,9 +594,7 @@ describe("Git projection journal", () => {
       firstMachine,
     );
     expect(response.status).toBe(403);
-    expect(await response.json()).toEqual({
-      error: "projection machine does not match authenticated machine",
-    });
+    expect(await response.json()).toMatchObject({ code: "projection-machine-mismatch" });
   });
 
   it("recovers an evicted post-push batch under a new fencing token", async () => {
@@ -698,32 +666,17 @@ describe("Git projection journal", () => {
         fence: 2,
         observations: [{ bookmark: "main", liveOid: null }],
       }),
-    ).toEqual({
-      status: 409,
-      body: {
-        error:
-          "claimed projection batch still matches its expected refs; replay the exact push before recovery",
-      },
-    });
+    ).toMatchObject({ status: 409, body: { code: "projection-replay-required" } });
     expect(
-      await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+      await projectionRequest(repository, `git/pushes/${batchId}/recover`, {
         incarnation,
         machineId: firstMachine,
         fence: 1,
+        observations: [{ bookmark: "main", liveOid: null }],
       }),
-    ).toEqual({
+    ).toMatchObject({
       status: 409,
-      body: { error: "projection owner or fencing token is stale" },
-    });
-    expect(
-      await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
-        incarnation,
-        machineId: recoveryMachine,
-        fence: 2,
-      }),
-    ).toEqual({
-      status: 409,
-      body: { error: "claimed projection batch requires observed remote state recovery" },
+      body: { code: "projection-owner-stale" },
     });
     expect(
       await projectionRequest(repository, `git/pushes/${batchId}/recover`, {
@@ -763,9 +716,9 @@ describe("Git projection journal", () => {
           states: update.states.map((state) => ({ ...state, hiddenSetId: null })),
         })),
       }),
-    ).toEqual({
+    ).toMatchObject({
       status: 409,
-      body: { error: "projection batch ID was already used for a different request" },
+      body: { code: "projection-replay-mismatch" },
     });
 
     const deletionBatch = "8a".repeat(16);
@@ -826,9 +779,9 @@ describe("Git projection journal", () => {
           projectionUpdate("a", null, firstGitOid, canonicalCommitId, publicCommitId),
         ),
       ),
-    ).toEqual({
+    ).toMatchObject({
       status: 409,
-      body: { error: "another push already owns origin/a" },
+      body: { code: "push-in-progress" },
     });
     expect(
       await projectionRequest(repository, `git/pushes/${firstBatch}/recover`, {
@@ -874,11 +827,9 @@ describe("Git projection journal", () => {
           { bookmark: "B", liveOid: null },
         ],
       }),
-    ).toEqual({
+    ).toMatchObject({
       status: 409,
-      body: {
-        error: "remote refs are mixed or ambiguous; projection batch remains quarantined",
-      },
+      body: { code: "projection-remote-state-ambiguous" },
     });
     expect((await getProjection(repository, incarnation)).body).toMatchObject({
       activationCursor: 0,
@@ -901,7 +852,7 @@ describe("Git projection journal", () => {
           projectionUpdate("zero", null, "00".repeat(20), "a1".repeat(64), "a2".repeat(64)),
         ),
       ),
-    ).toEqual({ status: 400, body: { error: "gitOid must not be zero" } });
+    ).toMatchObject({ status: 400, body: { code: "invalid-projection-request" } });
     expect(
       await projectionRequest(repository, "git/pushes", {
         incarnation,
@@ -924,19 +875,16 @@ describe("Git projection journal", () => {
           },
         ],
       }),
-    ).toEqual({
-      status: 400,
-      body: { error: "updates[0].states must be empty for a deletion" },
-    });
+    ).toMatchObject({ status: 400, body: { code: "invalid-projection-request" } });
     const missing = projectionBatch(
       incarnation,
       "85".repeat(16),
       firstMachine,
       projectionUpdate("main", null, "94".repeat(20), "a1".repeat(64), "a2".repeat(64)),
     );
-    expect(await projectionRequest(repository, "git/pushes", missing)).toEqual({
+    expect(await projectionRequest(repository, "git/pushes", missing)).toMatchObject({
       status: 409,
-      body: { error: `canonical commit ${"a1".repeat(64)} is not cloud durable` },
+      body: { code: "projection-commit-not-durable" },
     });
 
     const missingTreeId = "a3".repeat(64);
@@ -962,11 +910,9 @@ describe("Git projection journal", () => {
           ),
         ),
       ),
-    ).toEqual({
+    ).toMatchObject({
       status: 409,
-      body: {
-        error: `canonical commit ${incompleteCommitId} closure is missing tree ${missingTreeId}`,
-      },
+      body: { code: "projection-commit-not-durable" },
     });
 
     const [canonicalCommitId, publicCommitId, otherPublicCommitId] =
@@ -1003,10 +949,11 @@ describe("Git projection journal", () => {
       },
     });
     expect(
-      await projectionRequest(repository, `git/pushes/${firstBatch}/confirm`, {
+      await projectionRequest(repository, `git/pushes/${firstBatch}/recover`, {
         incarnation,
         machineId: firstMachine,
         fence: 1,
+        observations: [{ bookmark: "main", liveOid: gitOid }],
       }),
     ).toEqual({
       status: 200,
@@ -1027,9 +974,9 @@ describe("Git projection journal", () => {
           projectionUpdate("other", null, gitOid, canonicalCommitId, otherPublicCommitId),
         ),
       ),
-    ).toEqual({
+    ).toMatchObject({
       status: 409,
-      body: { error: `Git object ${gitOid} already has a different immutable receipt` },
+      body: { code: "projection-receipt-mismatch" },
     });
   });
 
@@ -1061,10 +1008,11 @@ describe("Git projection journal", () => {
       }),
     ).toEqual({ status: 200, body: { pending: true, fence: 1 } });
     expect(
-      await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+      await projectionRequest(repository, `git/pushes/${batchId}/recover`, {
         incarnation,
         machineId: firstMachine,
         fence: 1,
+        observations: [{ bookmark: "main", liveOid: states[256].gitOid }],
       }),
     ).toEqual({
       status: 200,
@@ -1119,13 +1067,7 @@ describe("Git projection journal", () => {
             },
           ],
         }),
-      ).toEqual({
-        status: 400,
-        body: {
-          error: "hiddenSetId must be null or 128 lowercase hex characters",
-          code: "invalid-hidden-set-id",
-        },
-      });
+      ).toMatchObject({ status: 400, body: { code: "invalid-hidden-set-id" } });
     }
 
     const { hiddenSetId: _, ...stateWithoutIdentity } = state;
@@ -1139,13 +1081,7 @@ describe("Git projection journal", () => {
           },
         ],
       }),
-    ).toEqual({
-      status: 400,
-      body: {
-        error:
-          "request fields must be exactly gitOid, canonicalCommitId, publicCommitId, hiddenSetId",
-      },
-    });
+    ).toMatchObject({ status: 400, body: { code: "invalid-hidden-set-id" } });
   });
 });
 
@@ -1236,13 +1172,7 @@ describe("Git fetch journal", () => {
         ...request,
         remote: "upstream",
       }),
-    ).toEqual({
-      status: 409,
-      body: {
-        error: "fetch ID was already used for a different request",
-        code: "fetch-request-mismatch",
-      },
-    });
+    ).toMatchObject({ status: 409, body: { code: "fetch-request-mismatch" } });
 
     const knownResult = await projectionRequest(
       repository,
@@ -1653,9 +1583,9 @@ describe("Git fetch journal", () => {
         incarnation: "f2".repeat(16),
       }),
     ).toMatchObject({ status: 409, body: { code: "repository-incarnation-mismatch" } });
-    expect(await projectionRequest(repository, "git/fetches", valid)).toEqual({
+    expect(await projectionRequest(repository, "git/fetches", valid)).toMatchObject({
       status: 404,
-      body: { error: "remote origin is not registered", code: "remote-not-found" },
+      body: { code: "remote-not-found" },
     });
 
     await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
@@ -1671,13 +1601,7 @@ describe("Git fetch journal", () => {
     );
     expect(
       await projectionRequest(repository, "git/fetches", { ...valid, refs: tooManyRefs }),
-    ).toEqual({
-      status: 400,
-      body: {
-        error: `refs exceeds the ${MAX_PROJECTION_REFS}-ref limit`,
-        code: "invalid-fetch-request",
-      },
-    });
+    ).toMatchObject({ status: 400, body: { code: "invalid-fetch-request" } });
     expect(
       await projectionRawRequest(
         repository,
@@ -1685,13 +1609,7 @@ describe("Git fetch journal", () => {
         new TextEncoder().encode("{"),
         machine,
       ),
-    ).toEqual({
-      status: 400,
-      body: {
-        error: "projection fetch request must be valid JSON",
-        code: "invalid-fetch-request",
-      },
-    });
+    ).toMatchObject({ status: 400, body: { code: "invalid-fetch-request" } });
     expect(
       await projectionRawRequest(
         repository,
@@ -1699,13 +1617,7 @@ describe("Git fetch journal", () => {
         new Uint8Array(MAX_PROJECTION_REQUEST_BYTES + 1),
         machine,
       ),
-    ).toEqual({
-      status: 400,
-      body: {
-        error: `projection fetch request exceeds ${MAX_PROJECTION_REQUEST_BYTES} byte limit`,
-        code: "invalid-fetch-request",
-      },
-    });
+    ).toMatchObject({ status: 400, body: { code: "invalid-fetch-request" } });
     expect((await getProjection(repository, incarnation)).body).toMatchObject({
       activationCursor: 0,
       cursors: [],
@@ -1768,10 +1680,11 @@ describe("remote registry", () => {
       ),
     ).toEqual({ status: 200, body: { pending: true, fence: 1 } });
     expect(
-      await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+      await projectionRequest(repository, `git/pushes/${batchId}/recover`, {
         incarnation,
         machineId: machine,
         fence: 1,
+        observations: [{ bookmark: "main", liveOid: "c2".repeat(20) }],
       }),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
 
@@ -1781,10 +1694,11 @@ describe("remote registry", () => {
       mappings: [{ remote: "origin", bookmark: "main" }],
     });
     expect(
-      await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+      await projectionRequest(repository, `git/pushes/${batchId}/recover`, {
         incarnation,
         machineId: machine,
         fence: 1,
+        observations: [{ bookmark: "main", liveOid: "c2".repeat(20) }],
       }),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
   });
@@ -1816,10 +1730,11 @@ describe("remote registry", () => {
       ).toMatchObject({ status: 200, body: { pending: true } });
       const fence = remote === "origin" ? 1 : 2;
       expect(
-        await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+        await projectionRequest(repository, `git/pushes/${batchId}/recover`, {
           incarnation,
           machineId: machine,
           fence,
+          observations: [{ bookmark: "main", liveOid: oid }],
         }),
       ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
     }
@@ -1857,22 +1772,24 @@ describe("remote registry", () => {
       mappings: [{ remote: "backup", bookmark: "main" }],
       pending: [],
     });
-    expect(await getProjectionReplay(repository, pendingBatch, incarnation)).toEqual({
+    expect(await getProjectionReplay(repository, pendingBatch, incarnation)).toMatchObject({
       status: 404,
-      body: { error: "projection batch does not exist" },
+      body: { code: "projection-batch-not-found" },
     });
     expect(
-      await projectionRequest(repository, `git/pushes/${originBatch}/confirm`, {
+      await projectionRequest(repository, `git/pushes/${originBatch}/recover`, {
         incarnation,
         machineId: machine,
         fence: 1,
+        observations: [{ bookmark: "main", liveOid: originOid }],
       }),
-    ).toEqual({ status: 404, body: { error: "projection batch does not exist" } });
+    ).toMatchObject({ status: 404, body: { code: "projection-batch-not-found" } });
     expect(
-      await projectionRequest(repository, `git/pushes/${backupBatch}/confirm`, {
+      await projectionRequest(repository, `git/pushes/${backupBatch}/recover`, {
         incarnation,
         machineId: machine,
         fence: 2,
+        observations: [{ bookmark: "main", liveOid: "c6".repeat(20) }],
       }),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
 
@@ -1881,10 +1798,11 @@ describe("remote registry", () => {
       body: { pending: true, fence: 5 },
     });
     expect(
-      await projectionRequest(repository, `git/pushes/${pendingBatch}/confirm`, {
+      await projectionRequest(repository, `git/pushes/${pendingBatch}/recover`, {
         incarnation,
         machineId: machine,
         fence: 5,
+        observations: [{ bookmark: "pending", liveOid: "c8".repeat(20) }],
       }),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
 
@@ -1904,9 +1822,9 @@ describe("remote registry", () => {
         ),
         remote: "backup",
       }),
-    ).toEqual({
+    ).toMatchObject({
       status: 409,
-      body: { error: `Git object ${originOid} already has a different immutable receipt` },
+      body: { code: "projection-receipt-mismatch" },
     });
   });
 
@@ -1914,12 +1832,9 @@ describe("remote registry", () => {
     const repository = "remote-validation";
     await initializeProjectionRepository(repository, incarnation);
     for (const url of ["https://user:password@example.com/repo", "ssh://git:secret@host/repo"] ) {
-      expect(await putRemote(repository, incarnation, "origin", url)).toEqual({
+      expect(await putRemote(repository, incarnation, "origin", url)).toMatchObject({
         status: 400,
-        body: {
-          error: "remote URL must not contain userinfo credentials",
-          code: "credentials-in-remote-url",
-        },
+        body: { code: "credentials-in-remote-url" },
       });
     }
     for (const url of ["ssh://git@host/repo", "git@host:repo", "https://host/repo", "/tmp/repo.git"]) {

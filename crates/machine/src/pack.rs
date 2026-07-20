@@ -7,11 +7,13 @@ use blake2::{Blake2b512, Digest};
 use devspace_kernel::validate;
 use thiserror::Error;
 
-use crate::object_closure::{ObjectId, hex};
+use crate::object_closure::ObjectId;
 use crate::pack_manifest::{
     ChunkEntry, MAX_MANIFEST_BYTES, ObjectEntry, PackManifest, PackManifestError,
 };
-use crate::{MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectKey, ObjectKind};
+use crate::{
+    MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectKey, ObjectKind, encode_lower_hex as hex,
+};
 
 pub const MIN_CHUNK_BYTES: u32 = 64 * 1024;
 pub const DEFAULT_CHUNK_BYTES: u32 = 1024 * 1024;
@@ -236,7 +238,7 @@ impl PackBuilder {
         write_file(staging.path().join("manifest.bin"), &manifest_bytes)?;
         sync_directory(staging.path())?;
 
-        let directory = packs_root.join(hex(id));
+        let directory = packs_root.join(hex(&id));
         if directory.exists() {
             verify_existing_pack(&directory, &manifest_bytes, &manifest)?;
         } else if let Err(source) = fs::rename(staging.path(), &directory) {
@@ -410,7 +412,7 @@ fn require_id(key: ObjectKey, actual: ObjectId) -> Result<(), PackBuildError> {
     } else {
         Err(PackBuildError::ObjectIdMismatch {
             key,
-            actual: hex(actual),
+            actual: hex(&actual),
         })
     }
 }

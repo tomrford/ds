@@ -5,7 +5,7 @@ use devspace_machine::{
     CatalogEntry, CommitMapping, FetchReceipt, FetchRef, FetchedGitRef, GitLiftError, GitOid,
     GitProcessEnvironment, GitProjection, HttpTransport, ImportMappings, LiftResult,
     MachineRepository, MachineStore, PackOptions, ProjectionCursor, ProjectionSnapshot,
-    ProjectionState, ProjectionTransport, QualifiedRef, RemoteUrl, upload_object_closure,
+    ProjectionState, QualifiedRef, RemoteUrl, upload_object_closure,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -17,15 +17,15 @@ use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 use jj_lib::repo::Repo as _;
 use jj_lib::settings::UserSettings;
 
-use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
-use crate::sync::{LockedSyncRun, run_sync_entry_locked};
+use crate::checkout::reject_unsupported_global_options;
 
-use super::projection_sidecar::open_or_create_projection;
 use super::push::{
     find_remote, load_projection_snapshot, overlapping_pending, recover_pending_batch,
 };
+use super::{
+    cloud_runtime, failpoint_enabled, locked_checkout_entry, open_cloud_session, short_oid,
+};
 
-const FAILPOINT_ENV: &str = "DEVSPACE_FAILPOINT";
 const AFTER_FETCH_RECORD_FAILPOINT: &str = "after_fetch_record_before_view";
 const LOST_FETCH_RECORD_RESPONSE_FAILPOINT: &str = "lost_fetch_record_response_once";
 
@@ -39,45 +39,20 @@ pub(super) async fn fetch_bookmarks(
     validate_requested_bookmarks(&bookmark_names)?;
 
     let workspace = command.workspace_helper(ui).await?;
-    let owner = read_checkout_owner(workspace.workspace_root())
-        .map_err(|_| user_error("`ds git fetch` is available only inside a Devspace checkout."))?;
-    let store = MachineStore::platform_default().map_err(display_error)?;
-    let entry = store
-        .entries()
-        .map_err(display_error)?
-        .into_iter()
-        .find(|entry| {
-            entry.identity.repository_id.as_str() == owner.repository_id()
-                && entry.identity.incarnation.as_str() == owner.incarnation()
-        })
-        .ok_or_else(|| {
-            user_error(
-                "repository-not-registered: This checkout's repository is not registered on this machine.",
-            )
-        })?;
+    let workspace_root = workspace.workspace_root().to_owned();
     drop(workspace);
 
-    let sync_guard = match run_sync_entry_locked(&store, &entry, command.settings()).await {
-        Ok(LockedSyncRun::Completed(guard)) => guard,
-        Ok(LockedSyncRun::AlreadyLocked) => {
-            return Err(user_error(format!(
-                "Repository `{}` is already being synchronized; retry the fetch after it finishes.",
-                entry.name
-            )));
-        }
-        Err(error) => return Err(user_error(error)),
-    };
+    let locked = locked_checkout_entry(&workspace_root, command.settings(), "fetch").await?;
 
     fetch_entry(
         ui,
         command.settings(),
-        &store,
-        &entry,
+        &locked.store,
+        &locked.entry,
         bookmark_names,
         remote_name,
     )
     .await?;
-    drop(sync_guard);
     Ok(())
 }
 
@@ -89,40 +64,17 @@ pub(crate) async fn fetch_entry(
     bookmark_names: Vec<String>,
     remote_name: String,
 ) -> Result<Vec<String>, CommandError> {
-    let repository = MachineRepository::open(&entry.native_repository_path, settings)
-        .await
-        .map_err(display_error)?;
-    let config = store.load_config().map_err(display_error)?;
-    let incarnation = parse_hex(
-        entry.identity.incarnation.as_str(),
-        "repository incarnation",
-    )?;
-    let machine_id = parse_hex(config.machine_id().as_str(), "machine ID")?;
-    let journal =
-        ProjectionTransport::new(&config, entry.identity.repository_id.as_str(), incarnation)
-            .map_err(display_error)?;
-    let cloud = HttpTransport::new(&config, entry.identity.repository_id.as_str(), incarnation)
-        .map_err(display_error)?;
-    let (projection, rebuilt_projection) =
-        open_or_create_projection(&store.repository_projection_path(&entry.identity), settings)
-            .map_err(user_error)?;
-    if rebuilt_projection {
-        writeln!(
-            ui.warning_default(),
-            "Rebuilt the local Git projection sidecar after it failed validation."
-        )?;
-    }
+    let session = open_cloud_session(ui, settings, store, entry).await?;
 
     let runtime = cloud_runtime()?;
     let outcome = runtime
         .block_on(fetch_with_cloud(
             store,
             entry,
-            &repository,
-            &projection,
-            journal,
-            cloud,
-            machine_id,
+            &session.repository,
+            &session.projection,
+            session.transport,
+            session.machine_id,
             &remote_name,
             bookmark_names,
         ))
@@ -152,13 +104,12 @@ async fn fetch_with_cloud(
     entry: &CatalogEntry,
     repository: &MachineRepository,
     projection: &GitProjection,
-    journal: ProjectionTransport,
     mut cloud: HttpTransport,
     machine_id: [u8; 16],
     remote_name: &str,
     mut bookmark_names: Vec<String>,
 ) -> Result<FetchOutcome, String> {
-    let remotes = journal
+    let remotes = cloud
         .list_remotes()
         .await
         .map_err(|error| error.to_string())?;
@@ -183,13 +134,13 @@ async fn fetch_with_cloud(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let mut snapshot = load_projection_snapshot(&journal).await?;
+    let mut snapshot = load_projection_snapshot(&cloud).await?;
     while let Some(pending) = overlapping_pending(&snapshot, remote_name, &requested_names) {
         recover_pending_batch(
-            repository, projection, &journal, &mut cloud, machine_id, remote, &snapshot, &pending,
+            repository, projection, &mut cloud, machine_id, remote, &snapshot, &pending,
         )
         .await?;
-        snapshot = load_projection_snapshot(&journal).await?;
+        snapshot = load_projection_snapshot(&cloud).await?;
     }
 
     let report = devspace_machine::fetch(
@@ -301,7 +252,7 @@ async fn fetch_with_cloud(
 
         let fetch_id = new_fetch_id()?;
         record_fetch_with_retry(
-            &journal,
+            &cloud,
             fetch_id,
             machine_id,
             remote_name,
@@ -312,7 +263,7 @@ async fn fetch_with_cloud(
         if failpoint_enabled(AFTER_FETCH_RECORD_FAILPOINT) {
             std::process::exit(86);
         }
-        snapshot = load_projection_snapshot(&journal).await?;
+        snapshot = load_projection_snapshot(&cloud).await?;
     }
 
     lines.extend(
@@ -328,7 +279,7 @@ async fn fetch_with_cloud(
 }
 
 async fn record_fetch_with_retry(
-    journal: &ProjectionTransport,
+    journal: &HttpTransport,
     fetch_id: [u8; 16],
     machine_id: [u8; 16],
     remote: &str,
@@ -601,35 +552,6 @@ fn new_fetch_id() -> Result<[u8; 16], String> {
     Ok(id)
 }
 
-fn failpoint_enabled(name: &str) -> bool {
-    std::env::var_os(FAILPOINT_ENV).as_deref() == Some(std::ffi::OsStr::new(name))
-}
-
-fn short_oid(oid: GitOid) -> String {
-    oid.to_string()[..12].to_owned()
-}
-
-fn parse_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], CommandError> {
-    if value.len() != N * 2 {
-        return Err(user_error(format!("{label} has an invalid length")));
-    }
-    let mut bytes = [0; N];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| user_error(format!("{label} is not lowercase hexadecimal")))?;
-    }
-    Ok(bytes)
-}
-
-fn cloud_runtime() -> Result<tokio::runtime::Runtime, CommandError> {
-    tokio::runtime::Runtime::new()
-        .map_err(|_| user_error("failed to start the cloud transport runtime"))
-}
-
-fn display_error(error: impl std::fmt::Display) -> CommandError {
-    user_error(error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,7 +692,7 @@ mod tests {
             devspace_machine::SharedSecret::new("fetch-retry-secret").unwrap(),
         )
         .unwrap();
-        let journal = ProjectionTransport::new(&config, &"ab".repeat(32), [0xcd; 16]).unwrap();
+        let journal = HttpTransport::new(&config, &"ab".repeat(32), [0xcd; 16]).unwrap();
         let fetch_ref = FetchRef {
             bookmark: "main".to_owned(),
             observed_git_oid: [3; 20],

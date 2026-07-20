@@ -1,5 +1,6 @@
 mod control_plane_client;
 mod creation_intent;
+mod fsync;
 mod git_lift;
 mod git_projection;
 mod git_subprocess;
@@ -17,6 +18,7 @@ mod projection_transport;
 mod reconciliation_tests;
 mod sync_engine;
 mod sync_state;
+mod wire;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -43,6 +45,7 @@ pub use creation_intent::{
     RepositoryCreationTarget,
 };
 pub use devspace_kernel::ObjectKind;
+pub use fsync::sync_directory;
 pub use git_lift::{
     FetchedGitRef, GitLiftError, GitSeed, LiftResult, LiftedCommitState, SeedSelection,
     TOMBSTONE_A, TOMBSTONE_B, lift_imported, select_seeds,
@@ -78,8 +81,8 @@ pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError
 pub use projection_transport::{
     FetchReceipt, FetchRef, FetchResult, PendingProjectionBatch, PendingProjectionRef,
     ProjectionBatchResult, ProjectionClaimResult, ProjectionCursor, ProjectionMapping,
-    ProjectionObservation, ProjectionReplay, ProjectionSnapshot, ProjectionState,
-    ProjectionTransport, ProjectionUpdate, RegisteredRemote,
+    ProjectionObservation, ProjectionReplay, ProjectionSnapshot, ProjectionState, ProjectionUpdate,
+    RegisteredRemote,
 };
 pub use sync_engine::{
     CloudHeads, DownloadedPack, HeadTransactionResult, MAX_OBJECT_INVENTORY_KEYS, PackCatalogEntry,
@@ -90,6 +93,7 @@ pub use sync_state::{
     MachineSyncLock, MachineSyncStore, PendingHead, PendingHeadBatch, PendingHeadTransaction,
     SyncState, SyncStateError,
 };
+pub use wire::{LowerHexError, decode_lower_hex, encode_lower_hex};
 
 /// A native jj repository in a machine store.
 ///

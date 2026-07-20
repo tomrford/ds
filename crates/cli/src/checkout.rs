@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::io::Read as _;
 
 use blake2::{Blake2b512, Digest as _};
-use devspace_machine::{RepositoryId, RepositoryIncarnation};
+use devspace_machine::{RepositoryId, RepositoryIncarnation, encode_lower_hex};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_lib::ref_name::WorkspaceNameBuf;
@@ -132,7 +132,7 @@ pub(crate) fn canonical_destination_path(requested: &Path) -> Result<PathBuf, Co
 pub(crate) fn destination_hash(path: &Path) -> String {
     let encoded = encode_path(path);
     let digest = Blake2b512::digest(encoded.as_bytes());
-    hex_bytes(&digest[..DESTINATION_HASH_BYTES])
+    encode_lower_hex(&digest[..DESTINATION_HASH_BYTES])
 }
 
 pub(crate) fn workspace_name(machine_id: &str, path: &Path) -> WorkspaceNameBuf {
@@ -249,7 +249,7 @@ fn read_checkout_owner_impl(path: &Path) -> Result<Option<CheckoutOwner>, String
 #[cfg(unix)]
 fn encode_path(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt as _;
-    format!("unix:{}", hex_bytes(path.as_os_str().as_bytes()))
+    format!("unix:{}", encode_lower_hex(path.as_os_str().as_bytes()))
 }
 
 #[cfg(windows)]
@@ -260,9 +260,5 @@ fn encode_path(path: &Path) -> String {
         .encode_wide()
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
-    format!("windows:{}", hex_bytes(&bytes))
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    format!("windows:{}", encode_lower_hex(&bytes))
 }

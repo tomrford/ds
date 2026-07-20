@@ -8,8 +8,8 @@ use jj_lib::settings::UserSettings;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::locked_json::{LockedJsonError, LockedJsonFile, sync_directory};
-use crate::{MachineRepository, MachineRepositoryError};
+use crate::locked_json::{LockedJsonError, LockedJsonFile};
+use crate::{MachineRepository, MachineRepositoryError, decode_lower_hex, sync_directory};
 
 mod repository_clone;
 pub use repository_clone::StagedRepositoryClone;
@@ -590,11 +590,12 @@ fn validate_lower_hex(
     length: usize,
     field: &'static str,
 ) -> Result<(), MachineStoreError> {
-    if value.len() != length
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    let valid = match length {
+        32 => decode_lower_hex::<16>(value).is_ok(),
+        64 => decode_lower_hex::<32>(value).is_ok(),
+        _ => unreachable!("machine identities have fixed supported lengths"),
+    };
+    if !valid {
         return Err(MachineStoreError::InvalidOpaqueIdentity {
             field,
             value: value.to_owned(),

@@ -16,6 +16,13 @@ pub use error::ValidationError;
 pub use hash::RawHasher;
 use hash::raw_id;
 
+/// Monotonic canonical-encoding epoch. Bump only when a jj upgrade changes the
+/// canonical bytes this kernel accepts for existing object shapes (see the
+/// AGENTS.md jj bump procedure). Clients advertise it in `x-devspace-client`
+/// so the Worker can refuse stale fleets with an upgrade error instead of a
+/// canonicality failure.
+pub const ENCODING_VERSION: u32 = 1;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum ObjectKind {

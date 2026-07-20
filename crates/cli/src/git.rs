@@ -3,16 +3,38 @@ mod projection_sidecar;
 mod push;
 
 use std::io::Write as _;
+use std::path::Path;
 
 use clap::parser::ValueSource;
-use devspace_machine::{CatalogEntry, MachineStore, ProjectionTransport};
+use devspace_machine::{
+    CatalogEntry, GitOid, GitProjection, HttpTransport, LowerHexError, MachineRepository,
+    MachineStore, RepositorySyncGuard, decode_lower_hex,
+};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
+use jj_lib::settings::UserSettings;
 
 use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
+use crate::sync::{LockedSyncRun, run_sync_entry_locked};
+
+use self::projection_sidecar::open_or_create_projection;
 
 const DEFAULT_REMOTE: &str = "origin";
+const FAILPOINT_ENV: &str = "DEVSPACE_FAILPOINT";
+
+pub(super) struct LockedCheckoutEntry {
+    pub(super) store: MachineStore,
+    pub(super) entry: CatalogEntry,
+    _guard: RepositorySyncGuard,
+}
+
+pub(super) struct CloudSession {
+    pub(super) repository: MachineRepository,
+    pub(super) projection: GitProjection,
+    pub(super) transport: HttpTransport,
+    pub(super) machine_id: [u8; 16],
+}
 
 pub(crate) async fn run_git(ui: &mut Ui, command: &CommandHelper) -> Result<(), CommandError> {
     let git_matches = command
@@ -141,7 +163,7 @@ pub(crate) fn register_remote(
     name: &str,
     url: &str,
 ) -> Result<(), CommandError> {
-    let transport = ProjectionTransport::new(
+    let transport = HttpTransport::new(
         config,
         entry.identity.repository_id.as_str(),
         parse_hex(
@@ -161,7 +183,7 @@ async fn remote_list(ui: &mut Ui, command: &CommandHelper) -> Result<(), Command
     let entry = checkout_entry(ui, command).await?;
     let store = MachineStore::platform_default().map_err(display_error)?;
     let config = store.load_config().map_err(display_error)?;
-    let transport = ProjectionTransport::new(
+    let transport = HttpTransport::new(
         &config,
         entry.identity.repository_id.as_str(),
         parse_hex(
@@ -181,11 +203,17 @@ async fn remote_list(ui: &mut Ui, command: &CommandHelper) -> Result<(), Command
 
 async fn checkout_entry(ui: &Ui, command: &CommandHelper) -> Result<CatalogEntry, CommandError> {
     let workspace = command.workspace_helper_no_snapshot(ui).await?;
-    let owner = read_checkout_owner(workspace.workspace_root()).map_err(|_| {
+    resolve_checkout_entry(workspace.workspace_root()).map(|(_, entry)| entry)
+}
+
+fn resolve_checkout_entry(
+    workspace_root: &Path,
+) -> Result<(MachineStore, CatalogEntry), CommandError> {
+    let owner = read_checkout_owner(workspace_root).map_err(|_| {
         user_error("`ds git` product commands are available only inside a Devspace checkout.")
     })?;
     let store = MachineStore::platform_default().map_err(display_error)?;
-    store
+    let entry = store
         .entries()
         .map_err(display_error)?
         .into_iter()
@@ -193,26 +221,91 @@ async fn checkout_entry(ui: &Ui, command: &CommandHelper) -> Result<CatalogEntry
             entry.identity.repository_id.as_str() == owner.repository_id()
                 && entry.identity.incarnation.as_str() == owner.incarnation()
         })
-        .ok_or_else(|| user_error("This checkout's repository is not registered on this machine."))
+        .ok_or_else(|| {
+            user_error(
+                "repository-not-registered: This checkout's repository is not registered on this machine.",
+            )
+        })?;
+    Ok((store, entry))
 }
 
-fn parse_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], CommandError> {
-    if value.len() != N * 2 {
-        return Err(user_error(format!("{label} has an invalid length")));
-    }
-    let mut bytes = [0; N];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| user_error(format!("{label} is not lowercase hexadecimal")))?;
-    }
-    Ok(bytes)
+pub(super) async fn locked_checkout_entry(
+    workspace_root: &Path,
+    settings: &UserSettings,
+    operation: &str,
+) -> Result<LockedCheckoutEntry, CommandError> {
+    let (store, entry) = resolve_checkout_entry(workspace_root)?;
+    let guard = match run_sync_entry_locked(&store, &entry, settings).await {
+        Ok(LockedSyncRun::Completed(guard)) => guard,
+        Ok(LockedSyncRun::AlreadyLocked) => {
+            return Err(user_error(format!(
+                "Repository `{}` is already being synchronized; retry the {operation} after it finishes.",
+                entry.name
+            )));
+        }
+        Err(error) => return Err(user_error(error)),
+    };
+    Ok(LockedCheckoutEntry {
+        store,
+        entry,
+        _guard: guard,
+    })
 }
 
-fn cloud_runtime() -> Result<tokio::runtime::Runtime, CommandError> {
+pub(super) async fn open_cloud_session(
+    ui: &mut Ui,
+    settings: &UserSettings,
+    store: &MachineStore,
+    entry: &CatalogEntry,
+) -> Result<CloudSession, CommandError> {
+    let repository = MachineRepository::open(&entry.native_repository_path, settings)
+        .await
+        .map_err(display_error)?;
+    let config = store.load_config().map_err(display_error)?;
+    let incarnation = parse_hex(
+        entry.identity.incarnation.as_str(),
+        "repository incarnation",
+    )?;
+    let machine_id = parse_hex(config.machine_id().as_str(), "machine ID")?;
+    let transport = HttpTransport::new(&config, entry.identity.repository_id.as_str(), incarnation)
+        .map_err(display_error)?;
+    let (projection, rebuilt_projection) =
+        open_or_create_projection(&store.repository_projection_path(&entry.identity), settings)
+            .map_err(user_error)?;
+    if rebuilt_projection {
+        writeln!(
+            ui.warning_default(),
+            "Rebuilt the local Git projection sidecar after it failed validation."
+        )?;
+    }
+    Ok(CloudSession {
+        repository,
+        projection,
+        transport,
+        machine_id,
+    })
+}
+
+pub(super) fn parse_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], CommandError> {
+    decode_lower_hex(value).map_err(|error| match error {
+        LowerHexError::InvalidLength { .. } => user_error(format!("{label} has an invalid length")),
+        LowerHexError::InvalidDigit => user_error(format!("{label} is not lowercase hexadecimal")),
+    })
+}
+
+pub(super) fn cloud_runtime() -> Result<tokio::runtime::Runtime, CommandError> {
     tokio::runtime::Runtime::new()
         .map_err(|_| user_error("failed to start the cloud transport runtime"))
 }
 
-fn display_error(error: impl std::fmt::Display) -> CommandError {
+pub(super) fn display_error(error: impl std::fmt::Display) -> CommandError {
     user_error(error.to_string())
+}
+
+pub(super) fn short_oid(oid: GitOid) -> String {
+    oid.to_string()[..12].to_owned()
+}
+
+pub(super) fn failpoint_enabled(name: &str) -> bool {
+    std::env::var_os(FAILPOINT_ENV).as_deref() == Some(std::ffi::OsStr::new(name))
 }

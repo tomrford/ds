@@ -1,15 +1,36 @@
+import { z } from "zod";
+
 import { MAX_PROJECTION_NAME_BYTES } from "./projection_protocol";
+import {
+  boundedStringSchema,
+  firstZodMessage,
+  lowerHexBytesSchema,
+} from "./validation";
 
 export const MAX_REMOTE_REQUEST_BYTES = 2 * 1024;
 export const MAX_REMOTE_URL_BYTES = 1024;
 
-const SHORT_ID_PATTERN = /^[0-9a-f]{32}$/;
 const encoder = new TextEncoder();
 
-export interface SetRemoteRequest {
-  incarnation: Uint8Array;
-  url: string;
-}
+const remoteNameSchema = boundedStringSchema("remote name", MAX_PROJECTION_NAME_BYTES).refine(
+  validRemoteName,
+  { error: "remote name must be a valid single-component Git ref name" },
+);
+
+const remoteUrlSchema = boundedStringSchema("remote URL", MAX_REMOTE_URL_BYTES)
+  .refine((value) => !/[\r\n\u0085\u2028\u2029]/.test(value), {
+    error: "remote URL must be a non-empty single-line string",
+  })
+  .refine((value) => !hasPasswordUserinfo(value), {
+    error: "remote URL must not contain userinfo credentials",
+  });
+
+const setRemoteSchema = z.strictObject({
+  incarnation: lowerHexBytesSchema(16, "incarnation"),
+  url: remoteUrlSchema,
+});
+
+export type SetRemoteRequest = z.output<typeof setRemoteSchema>;
 
 export class RemoteProtocolError extends Error {
   constructor(
@@ -21,12 +42,40 @@ export class RemoteProtocolError extends Error {
 }
 
 export function decodeRemoteName(value: unknown): string {
-  // Remote names appear as single Git ref components in the machine's
-  // observation refs, so registration enforces git-check-ref-format's
-  // single-component rules; the fetch transport shares this contract.
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
+  const result = remoteNameSchema.safeParse(value);
+  if (!result.success) {
+    throw new RemoteProtocolError(firstZodMessage(result.error), "invalid-remote-name");
+  }
+  return result.data;
+}
+
+export function decodeSetRemote(value: unknown): SetRemoteRequest {
+  const result = setRemoteSchema.safeParse(value);
+  if (result.success) return result.data;
+  const path = result.error.issues[0]?.path[0];
+  let code = "invalid-remote-request";
+  if (path === "incarnation") code = "invalid-incarnation";
+  if (path === "url") {
+    code = typeof (value as { url?: unknown })?.url === "string" && hasPasswordUserinfo((value as { url: string }).url)
+      ? "credentials-in-remote-url"
+      : "invalid-remote-url";
+  }
+  throw new RemoteProtocolError(firstZodMessage(result.error), code);
+}
+
+export function decodeRemoteIncarnation(value: unknown): Uint8Array {
+  const result = lowerHexBytesSchema(16, "incarnation").safeParse(value);
+  if (!result.success) {
+    throw new RemoteProtocolError(firstZodMessage(result.error), "invalid-incarnation");
+  }
+  return result.data;
+}
+
+// Remote names appear as single Git ref components in the machine's
+// observation refs, so registration enforces git-check-ref-format's
+// single-component rules; the fetch transport shares this contract.
+function validRemoteName(value: string): boolean {
+  return !(
     value.startsWith("-") ||
     value.startsWith(".") ||
     value.endsWith(".") ||
@@ -42,80 +91,9 @@ export function decodeRemoteName(value: unknown): string {
         (code >= 0xd800 && code <= 0xdfff) ||
         "~^:?*[\\/".includes(character)
       );
-    })
-  ) {
-    throw new RemoteProtocolError(
-      "remote name must be a valid single-component Git ref name",
-      "invalid-remote-name",
-    );
-  }
-  if (encoder.encode(value).byteLength > MAX_PROJECTION_NAME_BYTES) {
-    throw new RemoteProtocolError(
-      `remote name exceeds ${MAX_PROJECTION_NAME_BYTES} UTF-8 bytes`,
-      "invalid-remote-name",
-    );
-  }
-  return value;
-}
-
-export function decodeSetRemote(value: unknown): SetRemoteRequest {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new RemoteProtocolError(
-      "remote request must be a JSON object",
-      "invalid-remote-request",
-    );
-  }
-  const record = value as Record<string, unknown>;
-  const actual = Object.keys(record).sort();
-  const expected = ["incarnation", "url"];
-  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
-    throw new RemoteProtocolError(
-      "remote request fields must be exactly incarnation, url",
-      "invalid-remote-request",
-    );
-  }
-  if (typeof record.incarnation !== "string" || !SHORT_ID_PATTERN.test(record.incarnation)) {
-    throw new RemoteProtocolError(
-      "incarnation must be 32 lowercase hex characters",
-      "invalid-incarnation",
-    );
-  }
-  return {
-    incarnation: decodeHex(record.incarnation),
-    url: decodeRemoteUrl(record.url),
-  };
-}
-
-export function decodeRemoteIncarnation(value: unknown): Uint8Array {
-  if (typeof value !== "string" || !SHORT_ID_PATTERN.test(value)) {
-    throw new RemoteProtocolError(
-      "incarnation must be 32 lowercase hex characters",
-      "invalid-incarnation",
-    );
-  }
-  return decodeHex(value);
-}
-
-function decodeRemoteUrl(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0 || /[\r\n\u0085\u2028\u2029]/.test(value)) {
-    throw new RemoteProtocolError(
-      "remote URL must be a non-empty single-line string",
-      "invalid-remote-url",
-    );
-  }
-  if (encoder.encode(value).byteLength > MAX_REMOTE_URL_BYTES) {
-    throw new RemoteProtocolError(
-      `remote URL exceeds ${MAX_REMOTE_URL_BYTES} UTF-8 bytes`,
-      "invalid-remote-url",
-    );
-  }
-  if (hasPasswordUserinfo(value)) {
-    throw new RemoteProtocolError(
-      "remote URL must not contain userinfo credentials",
-      "credentials-in-remote-url",
-    );
-  }
-  return value;
+    }) ||
+    encoder.encode(value).byteLength > MAX_PROJECTION_NAME_BYTES
+  );
 }
 
 function hasPasswordUserinfo(value: string): boolean {
@@ -135,10 +113,4 @@ function hasPasswordUserinfo(value: string): boolean {
   if (at === -1) return false;
   const userinfo = value.slice(0, at);
   return !userinfo.includes("/") && userinfo.includes(":");
-}
-
-function decodeHex(value: string): Uint8Array {
-  return Uint8Array.from({ length: 16 }, (_, index) =>
-    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
-  );
 }

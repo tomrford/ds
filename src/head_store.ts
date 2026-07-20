@@ -43,6 +43,7 @@ class HeadTransactionError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly code: string,
   ) {
     super(message);
   }
@@ -88,7 +89,11 @@ export class HeadStore {
           identity.repository_id !== authority.repositoryId ||
           identity.retired !== 0
         ) {
-          throw new HeadTransactionError("repository authority does not match", 409);
+          throw new HeadTransactionError(
+            "repository authority does not match",
+            409,
+            "repository-authority-mismatch",
+          );
         }
         return {
           ok: true as const,
@@ -151,6 +156,7 @@ export class HeadStore {
             throw new HeadTransactionError(
               "idempotency key was already used for a different head request",
               409,
+              "head-replay-mismatch",
             );
           }
           return {
@@ -166,6 +172,7 @@ export class HeadStore {
           throw new HeadTransactionError(
             `head closure is missing ${objectLabel(missing.kind)} ${toHex(new Uint8Array(missing.id))}`,
             409,
+            "head-closure-incomplete",
           );
         }
         this.sql.exec("DELETE FROM pending_observed_heads");
@@ -180,6 +187,7 @@ export class HeadStore {
           throw new HeadTransactionError(
             `observed current head is not an ancestor of new head: ${toHex(new Uint8Array(unrelated.id))}`,
             409,
+            "head-observation-stale",
           );
         }
         this.markClosureComplete(newHead);
@@ -197,6 +205,7 @@ export class HeadStore {
           throw new HeadTransactionError(
             `resulting head set exceeds the ${MAX_OPERATION_HEADS}-head limit`,
             409,
+            "head-set-limit",
           );
         }
         if (state.cursor >= Number.MAX_SAFE_INTEGER) {
@@ -305,19 +314,33 @@ export class HeadStore {
       state.receipt_count >= MAX_RECEIPTS ||
       state.receipt_head_count + newHeadCount > MAX_RECEIPT_HEADS
     ) {
-      throw new HeadTransactionError("idempotency receipt quota is exhausted", 429);
+      throw new HeadTransactionError(
+        "idempotency receipt quota is exhausted",
+        429,
+        "head-receipt-limit",
+      );
     }
   }
 
   private requireRepositoryState(): RepositoryStateRow {
     const state = this.repositoryState();
-    if (state === undefined) throw new HeadTransactionError("repository is not initialized", 409);
+    if (state === undefined) {
+      throw new HeadTransactionError(
+        "repository is not initialized",
+        409,
+        "repository-not-initialized",
+      );
+    }
     return state;
   }
 
   private requireIncarnation(state: RepositoryStateRow, incarnation: ArrayBuffer) {
     if (!equalBytes(new Uint8Array(state.incarnation), new Uint8Array(incarnation))) {
-      throw new HeadTransactionError("repository incarnation does not match", 409);
+      throw new HeadTransactionError(
+        "repository incarnation does not match",
+        409,
+        "repository-incarnation-mismatch",
+      );
     }
   }
 
@@ -432,6 +455,7 @@ function failure(error: unknown, status: number) {
     ok: false as const,
     status,
     error: error instanceof Error ? error.message : "head request failed",
+    code: error instanceof HeadTransactionError ? error.code : "invalid-head-request",
   };
 }
 

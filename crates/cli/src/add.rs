@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use devspace_machine::{
     CatalogEntry, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
     MachineConfig, MachineRepository, MachineStore, MachineStoreError, RepositoryName,
+    sync_directory,
 };
 use jj_cli::cli_util::{CommandHelper, RevisionArg};
 use jj_cli::command_error::{CommandError, user_error};
@@ -16,7 +17,7 @@ use jj_lib::op_store::OperationId;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::Repo as _;
 use jj_lib::repo::StoreFactories;
-use jj_lib::workspace::{Workspace, default_working_copy_factories, default_working_copy_factory};
+use jj_lib::workspace::Workspace;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
 use crate::bare_workspace::{is_stock_bare_repository, workspace_for_repository};
@@ -25,6 +26,10 @@ use crate::checkout::{
     destination_hash, ensure_destination_parent, owned_directory_matches,
     reject_unsupported_global_options, workspace_name,
 };
+use crate::tx::{
+    MaterializeCheckoutError, RepoTransactionError, commit_repo_transaction, materialize_checkout,
+};
+use crate::working_copy::{devspace_working_copy_factories, devspace_working_copy_factory};
 
 #[derive(clap::Args)]
 pub(crate) struct AddArgs {
@@ -420,18 +425,22 @@ async fn register_workspace(
         .edit(workspace_name.to_owned(), &working_copy_commit)
         .await
         .map_err(|error| format!("failed to register checkout commit: {error}"))?;
-    transaction
-        .repo_mut()
-        .rebase_descendants()
-        .await
-        .map_err(|error| format!("failed to rebase checkout descendants: {error}"))?;
-    let repo = transaction
-        .commit(format!(
+    let repo = commit_repo_transaction(
+        transaction,
+        format!(
             "create initial working-copy commit in workspace {}",
             workspace_name.as_symbol()
-        ))
-        .await
-        .map_err(|error| format!("failed to publish checkout registration: {error}"))?;
+        ),
+    )
+    .await
+    .map_err(|error| match error {
+        RepoTransactionError::Rebase(source) => {
+            format!("failed to rebase checkout descendants: {source}")
+        }
+        RepoTransactionError::Commit(source) => {
+            format!("failed to publish checkout registration: {source}")
+        }
+    })?;
     Ok((repo, working_copy_commit))
 }
 
@@ -488,16 +497,16 @@ async fn rebuild_checkout(
     ensure_repository_pointer(&staging, &repository_path)?;
     let mut workspace =
         initialize_working_copy(&staging, repo.as_ref(), workspace_name.to_owned())?;
-    let working_copy_commit = workspace
-        .repo_loader()
-        .store()
-        .get_commit_async(working_copy_commit.id())
+    materialize_checkout(&mut workspace, repo.op_id().clone(), working_copy_commit)
         .await
-        .map_err(|error| format!("failed to reload checkout commit: {error}"))?;
-    workspace
-        .check_out(repo.op_id().clone(), None, &working_copy_commit)
-        .await
-        .map_err(|error| format!("failed to materialize checkout files: {error}"))?;
+        .map_err(|error| match error {
+            MaterializeCheckoutError::Reload(source) => {
+                format!("failed to reload checkout commit: {source}")
+            }
+            MaterializeCheckoutError::Checkout(source) => {
+                format!("failed to materialize checkout files: {source}")
+            }
+        })?;
     sync_directory(&staging).map_err(|error| format!("failed to sync staged checkout: {error}"))?;
     failpoint("after_checkout_staging");
     publish_directory_noclobber(&staging, destination)?;
@@ -607,7 +616,7 @@ fn initialize_working_copy(
     let state_path = staging.join(".jj/working_copy");
     fs::create_dir(&state_path)
         .map_err(|error| format!("failed to create checkout working-copy state: {error}"))?;
-    let working_copy_factory = default_working_copy_factory();
+    let working_copy_factory = devspace_working_copy_factory();
     let working_copy = working_copy_factory
         .init_working_copy(
             repo.store().clone(),
@@ -627,7 +636,7 @@ fn initialize_working_copy(
         repo.settings(),
         staging,
         &StoreFactories::default(),
-        &default_working_copy_factories(),
+        &devspace_working_copy_factories(),
     )
     .map_err(|error| format!("failed to load checkout metadata: {error}"))
 }
@@ -719,16 +728,6 @@ fn publish_directory_noclobber(staging: &Path, destination: &Path) -> Result<(),
             .expect("checkout destination has a parent"),
     )
     .map_err(|error| format!("failed to sync checkout parent: {error}"))
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    fs::File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn failpoint(name: &str) {

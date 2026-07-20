@@ -1,4 +1,11 @@
+import { z } from "zod";
+
 import { compareBytes, toHex } from "./kernel";
+import {
+  firstZodMessage,
+  lowerHexBytesSchema,
+  nonNegativeSafeIntegerSchema,
+} from "./validation";
 
 export const MAX_PROJECTION_REQUEST_BYTES = 4 * 1024 * 1024;
 export const MAX_PROJECTION_REFS = 256;
@@ -7,74 +14,106 @@ export const MAX_FETCH_RECEIPTS = MAX_PROJECTION_STATES;
 export const MAX_REPOSITORY_PROJECTION_REFS = 512;
 export const MAX_PROJECTION_NAME_BYTES = 256;
 
-const SHORT_ID_PATTERN = /^[0-9a-f]{32}$/;
-const GIT_OID_PATTERN = /^[0-9a-f]{40}$/;
-const OBJECT_ID_PATTERN = /^[0-9a-f]{128}$/;
 const encoder = new TextEncoder();
 
-export interface ProjectionState {
-  gitOid: Uint8Array;
-  canonicalCommitId: Uint8Array;
-  publicCommitId: Uint8Array;
-  hiddenSetId: Uint8Array | null;
-}
+const shortIdSchema = (label: string) => lowerHexBytesSchema(16, label);
+const nonZeroHexSchema = (bytes: number, label: string) =>
+  lowerHexBytesSchema(bytes, label).refine((value) => value.some((byte) => byte !== 0), {
+    error: `${label} must not be zero`,
+  });
+const gitOidSchema = (label: string) => nonZeroHexSchema(20, label);
+const objectIdSchema = (label: string) => nonZeroHexSchema(64, label);
+const nullableGitOidSchema = (label: string) => gitOidSchema(label).nullable();
+const nameSchema = (label: string) =>
+  z
+    .string()
+    .min(1, `${label} must be non-empty`)
+    .refine(
+      (value) =>
+        ![...value].some((character) => {
+          const code = character.codePointAt(0) ?? 0;
+          return code < 0x20 || code === 0x7f || (code >= 0xd800 && code <= 0xdfff);
+        }),
+      { error: `${label} must not contain control characters` },
+    )
+    .refine((value) => encoder.encode(value).byteLength <= MAX_PROJECTION_NAME_BYTES, {
+      error: `${label} exceeds ${MAX_PROJECTION_NAME_BYTES} UTF-8 bytes`,
+    });
 
-export interface ProjectionUpdate {
-  bookmark: string;
-  expectedOldOid: Uint8Array | null;
-  states: ProjectionState[];
-  proposedState: number | null;
-}
+const projectionStateSchema = z.strictObject({
+  gitOid: gitOidSchema("gitOid"),
+  canonicalCommitId: objectIdSchema("canonicalCommitId"),
+  publicCommitId: objectIdSchema("publicCommitId"),
+  hiddenSetId: lowerHexBytesSchema(64, "hiddenSetId").nullable(),
+});
 
-export interface BeginProjectionBatchRequest {
-  incarnation: Uint8Array;
-  batchId: Uint8Array;
-  machineId: Uint8Array;
-  remote: string;
-  updates: ProjectionUpdate[];
-}
+const projectionUpdateSchema = z.strictObject({
+  bookmark: nameSchema("bookmark"),
+  expectedOldOid: nullableGitOidSchema("expectedOldOid"),
+  states: z.array(projectionStateSchema),
+  proposedState: nonNegativeSafeIntegerSchema.nullable(),
+});
 
-export interface FetchReceipt {
-  gitOid: Uint8Array;
-  publicCommitId: Uint8Array;
-}
+const beginProjectionBatchSchema = z.strictObject({
+  incarnation: shortIdSchema("incarnation"),
+  batchId: shortIdSchema("batchId"),
+  machineId: shortIdSchema("machineId"),
+  remote: nameSchema("remote"),
+  updates: z.array(projectionUpdateSchema).min(1).max(MAX_PROJECTION_REFS),
+});
 
-export interface FetchRef {
-  bookmark: string;
-  observedGitOid: Uint8Array;
-  expectedCursorOid: Uint8Array | null;
-  states: ProjectionState[];
-  proposedState: number | null;
-}
+const fetchReceiptSchema = z.strictObject({
+  gitOid: gitOidSchema("gitOid"),
+  publicCommitId: objectIdSchema("publicCommitId"),
+});
 
-export interface RecordFetchRequest {
-  incarnation: Uint8Array;
-  fetchId: Uint8Array;
-  machineId: Uint8Array;
-  remote: string;
-  refs: FetchRef[];
-  receipts: FetchReceipt[];
-}
+const fetchRefSchema = z.strictObject({
+  bookmark: nameSchema("bookmark"),
+  observedGitOid: gitOidSchema("observedGitOid"),
+  expectedCursorOid: nullableGitOidSchema("expectedCursorOid"),
+  states: z.array(projectionStateSchema),
+  proposedState: nonNegativeSafeIntegerSchema.nullable(),
+});
 
-export interface ProjectionFenceRequest {
-  incarnation: Uint8Array;
-  machineId: Uint8Array;
-  fence: number;
-}
+const recordFetchSchema = z.strictObject({
+  incarnation: shortIdSchema("incarnation"),
+  fetchId: shortIdSchema("fetchId"),
+  machineId: shortIdSchema("machineId"),
+  remote: nameSchema("remote"),
+  refs: z.array(fetchRefSchema).min(1).max(MAX_PROJECTION_REFS),
+  receipts: z.array(fetchReceiptSchema).max(MAX_FETCH_RECEIPTS),
+});
 
-export interface ClaimProjectionBatchRequest {
-  incarnation: Uint8Array;
-  machineId: Uint8Array;
-}
+const claimProjectionBatchSchema = z.strictObject({
+  incarnation: shortIdSchema("incarnation"),
+  machineId: shortIdSchema("machineId"),
+});
 
-export interface ProjectionObservation {
-  bookmark: string;
-  liveOid: Uint8Array | null;
-}
+const projectionFenceSchema = z.strictObject({
+  incarnation: shortIdSchema("incarnation"),
+  machineId: shortIdSchema("machineId"),
+  fence: nonNegativeSafeIntegerSchema,
+});
 
-export interface RecoverProjectionBatchRequest extends ProjectionFenceRequest {
-  observations: ProjectionObservation[];
-}
+const projectionObservationSchema = z.strictObject({
+  bookmark: nameSchema("bookmark"),
+  liveOid: nullableGitOidSchema("liveOid"),
+});
+
+const recoverProjectionBatchSchema = projectionFenceSchema.extend({
+  observations: z.array(projectionObservationSchema).max(MAX_PROJECTION_REFS),
+});
+
+export type ProjectionState = z.output<typeof projectionStateSchema>;
+export type ProjectionUpdate = z.output<typeof projectionUpdateSchema>;
+export type BeginProjectionBatchRequest = z.output<typeof beginProjectionBatchSchema>;
+export type FetchReceipt = z.output<typeof fetchReceiptSchema>;
+export type FetchRef = z.output<typeof fetchRefSchema>;
+export type RecordFetchRequest = z.output<typeof recordFetchSchema>;
+export type ProjectionFenceRequest = z.output<typeof projectionFenceSchema>;
+export type ClaimProjectionBatchRequest = z.output<typeof claimProjectionBatchSchema>;
+export type ProjectionObservation = z.output<typeof projectionObservationSchema>;
+export type RecoverProjectionBatchRequest = z.output<typeof recoverProjectionBatchSchema>;
 
 export class ProjectionProtocolError extends Error {
   constructor(
@@ -86,174 +125,47 @@ export class ProjectionProtocolError extends Error {
 }
 
 export function decodeBeginProjectionBatch(value: unknown): BeginProjectionBatchRequest {
-  const record = requireRecord(value, "projection batch");
-  requireExactKeys(record, ["incarnation", "batchId", "machineId", "remote", "updates"]);
-  const updatesValue = record.updates;
-  if (!Array.isArray(updatesValue) || updatesValue.length === 0) {
-    throw new Error("updates must be a non-empty array");
-  }
-  if (updatesValue.length > MAX_PROJECTION_REFS) {
-    throw new Error(`updates exceeds the ${MAX_PROJECTION_REFS}-ref limit`);
-  }
-  const updates = updatesValue.map((update, index) => decodeUpdate(update, index));
-  const stateCount = updates.reduce((count, update) => count + update.states.length, 0);
-  if (stateCount > MAX_PROJECTION_STATES) {
-    throw new Error(`updates exceeds the ${MAX_PROJECTION_STATES}-state limit`);
-  }
-  updates.sort((left, right) => compareNames(left.bookmark, right.bookmark));
-  requireUniqueNames(updates, "updates");
-  return {
-    incarnation: decodeHex(record.incarnation, SHORT_ID_PATTERN, "incarnation", 16),
-    batchId: decodeHex(record.batchId, SHORT_ID_PATTERN, "batchId", 16),
-    machineId: decodeHex(record.machineId, SHORT_ID_PATTERN, "machineId", 16),
-    remote: decodeName(record.remote, "remote"),
-    updates,
-  };
+  const request = parseProjection(beginProjectionBatchSchema, value);
+  for (const [index, update] of request.updates.entries()) validateUpdate(update, index);
+  requireStateLimit(request.updates, "updates");
+  request.updates.sort((left, right) => compareNames(left.bookmark, right.bookmark));
+  requireUniqueNames(request.updates, "updates");
+  return request;
 }
 
 export function decodeRecordFetch(value: unknown): RecordFetchRequest {
-  const record = requireRecord(value, "fetch request");
-  requireExactKeys(record, [
-    "incarnation",
-    "fetchId",
-    "machineId",
-    "remote",
-    "refs",
-    "receipts",
-  ]);
-  if (!Array.isArray(record.refs) || record.refs.length === 0) {
-    throw new Error("refs must be a non-empty array");
-  }
-  if (record.refs.length > MAX_PROJECTION_REFS) {
-    throw new Error(`refs exceeds the ${MAX_PROJECTION_REFS}-ref limit`);
-  }
-  const refs = record.refs.map((value, index): FetchRef => {
-    const item = requireRecord(value, `refs[${index}]`);
-    requireExactKeys(item, [
-      "bookmark",
-      "observedGitOid",
-      "expectedCursorOid",
-      "states",
-      "proposedState",
-    ]);
-    if (!Array.isArray(item.states)) {
-      throw new Error(`refs[${index}].states must be an array`);
-    }
-    const states = item.states.map((state, stateIndex) =>
-      decodeProjectionState(state, `refs[${index}].states[${stateIndex}]`),
-    );
-    const observedGitOid = decodeNullableGitOid(
-      item.observedGitOid,
-      `refs[${index}].observedGitOid`,
-    );
-    if (observedGitOid === null) {
-      throw new Error(`refs[${index}].observedGitOid must not be null`);
-    }
-    const proposedState =
-      item.proposedState === null
-        ? null
-        : decodeSafeInteger(item.proposedState, `refs[${index}].proposedState`);
-    if (proposedState !== null && proposedState >= states.length) {
+  const request = parseProjection(recordFetchSchema, value);
+  for (const [index, ref] of request.refs.entries()) {
+    if (ref.proposedState !== null && ref.proposedState >= ref.states.length) {
       throw new Error(`refs[${index}].proposedState is outside states`);
     }
     if (
-      proposedState !== null &&
-      compareBytes(states[proposedState].gitOid, observedGitOid) !== 0
+      ref.proposedState !== null &&
+      compareBytes(ref.states[ref.proposedState].gitOid, ref.observedGitOid) !== 0
     ) {
       throw new Error(`refs[${index}].proposedState must map the observed Git ID`);
     }
-    return {
-      bookmark: decodeName(item.bookmark, `refs[${index}].bookmark`),
-      observedGitOid,
-      expectedCursorOid: decodeNullableGitOid(
-        item.expectedCursorOid,
-        `refs[${index}].expectedCursorOid`,
-      ),
-      states,
-      proposedState,
-    };
-  });
-  const stateCount = refs.reduce((count, ref) => count + ref.states.length, 0);
-  if (stateCount > MAX_PROJECTION_STATES) {
-    throw new Error(`refs exceeds the ${MAX_PROJECTION_STATES}-state limit`);
   }
-  refs.sort((left, right) => compareNames(left.bookmark, right.bookmark));
-  requireUniqueNames(refs, "refs");
-
-  if (!Array.isArray(record.receipts)) throw new Error("receipts must be an array");
-  if (record.receipts.length > MAX_FETCH_RECEIPTS) {
-    throw new Error(`receipts exceeds the ${MAX_FETCH_RECEIPTS}-receipt limit`);
-  }
-  const receipts = record.receipts.map((value, index): FetchReceipt => {
-    const receipt = requireRecord(value, `receipts[${index}]`);
-    requireExactKeys(receipt, ["gitOid", "publicCommitId"]);
-    const decoded = {
-      gitOid: decodeHex(receipt.gitOid, GIT_OID_PATTERN, `receipts[${index}].gitOid`, 20),
-      publicCommitId: decodeHex(
-        receipt.publicCommitId,
-        OBJECT_ID_PATTERN,
-        `receipts[${index}].publicCommitId`,
-        64,
-      ),
-    };
-    requireNonZero(decoded.gitOid, `receipts[${index}].gitOid`);
-    requireNonZero(decoded.publicCommitId, `receipts[${index}].publicCommitId`);
-    return decoded;
-  });
-  receipts.sort((left, right) => compareBytes(left.gitOid, right.gitOid));
-
-  return {
-    incarnation: decodeHex(record.incarnation, SHORT_ID_PATTERN, "incarnation", 16),
-    fetchId: decodeHex(record.fetchId, SHORT_ID_PATTERN, "fetchId", 16),
-    machineId: decodeHex(record.machineId, SHORT_ID_PATTERN, "machineId", 16),
-    remote: decodeName(record.remote, "remote"),
-    refs,
-    receipts,
-  };
+  requireStateLimit(request.refs, "refs");
+  request.refs.sort((left, right) => compareNames(left.bookmark, right.bookmark));
+  requireUniqueNames(request.refs, "refs");
+  request.receipts.sort((left, right) => compareBytes(left.gitOid, right.gitOid));
+  return request;
 }
 
 export function decodeClaimProjectionBatch(value: unknown): ClaimProjectionBatchRequest {
-  const record = requireRecord(value, "projection claim");
-  requireExactKeys(record, ["incarnation", "machineId"]);
-  return {
-    incarnation: decodeHex(record.incarnation, SHORT_ID_PATTERN, "incarnation", 16),
-    machineId: decodeHex(record.machineId, SHORT_ID_PATTERN, "machineId", 16),
-  };
-}
-
-export function decodeProjectionFence(value: unknown): ProjectionFenceRequest {
-  const record = requireRecord(value, "projection fence");
-  requireExactKeys(record, ["incarnation", "machineId", "fence"]);
-  return {
-    incarnation: decodeHex(record.incarnation, SHORT_ID_PATTERN, "incarnation", 16),
-    machineId: decodeHex(record.machineId, SHORT_ID_PATTERN, "machineId", 16),
-    fence: decodeSafeInteger(record.fence, "fence"),
-  };
+  return parseProjection(claimProjectionBatchSchema, value);
 }
 
 export function decodeRecoverProjectionBatch(value: unknown): RecoverProjectionBatchRequest {
-  const record = requireRecord(value, "projection recovery");
-  requireExactKeys(record, ["incarnation", "machineId", "fence", "observations"]);
-  if (!Array.isArray(record.observations)) throw new Error("observations must be an array");
-  if (record.observations.length > MAX_PROJECTION_REFS) {
-    throw new Error(`observations exceeds the ${MAX_PROJECTION_REFS}-ref limit`);
-  }
-  const observations = record.observations.map((observation, index) => {
-    const item = requireRecord(observation, `observations[${index}]`);
-    requireExactKeys(item, ["bookmark", "liveOid"]);
-    return {
-      bookmark: decodeName(item.bookmark, `observations[${index}].bookmark`),
-      liveOid: decodeNullableGitOid(item.liveOid, `observations[${index}].liveOid`),
-    };
-  });
-  observations.sort((left, right) => compareNames(left.bookmark, right.bookmark));
-  requireUniqueNames(observations, "observations");
-  return {
-    incarnation: decodeHex(record.incarnation, SHORT_ID_PATTERN, "incarnation", 16),
-    machineId: decodeHex(record.machineId, SHORT_ID_PATTERN, "machineId", 16),
-    fence: decodeSafeInteger(record.fence, "fence"),
-    observations,
-  };
+  const request = parseProjection(recoverProjectionBatchSchema, value);
+  request.observations.sort((left, right) => compareNames(left.bookmark, right.bookmark));
+  requireUniqueNames(request.observations, "observations");
+  return request;
+}
+
+export function decodeProjectionShortId(value: unknown, label: string): Uint8Array {
+  return shortIdSchema(label).parse(value);
 }
 
 export function canonicalProjectionBatchBytes(request: BeginProjectionBatchRequest): Uint8Array {
@@ -266,12 +178,7 @@ export function canonicalProjectionBatchBytes(request: BeginProjectionBatchReque
       updates: request.updates.map((update) => ({
         bookmark: update.bookmark,
         expectedOldOid: update.expectedOldOid === null ? null : toHex(update.expectedOldOid),
-        states: update.states.map((state) => ({
-          gitOid: toHex(state.gitOid),
-          canonicalCommitId: toHex(state.canonicalCommitId),
-          publicCommitId: toHex(state.publicCommitId),
-          hiddenSetId: state.hiddenSetId === null ? null : toHex(state.hiddenSetId),
-        })),
+        states: update.states.map(encodeProjectionState),
         proposedState: update.proposedState,
       })),
     }),
@@ -310,58 +217,38 @@ export function compareNullableBytes(
   return compareBytes(left, right);
 }
 
-function decodeUpdate(value: unknown, index: number): ProjectionUpdate {
-  const record = requireRecord(value, `updates[${index}]`);
-  requireExactKeys(record, ["bookmark", "expectedOldOid", "states", "proposedState"]);
-  if (!Array.isArray(record.states)) throw new Error(`updates[${index}].states must be an array`);
-  const states = record.states.map((value, stateIndex): ProjectionState =>
-    decodeProjectionState(value, `updates[${index}].states[${stateIndex}]`),
-  );
-  const proposedState =
-    record.proposedState === null
-      ? null
-      : decodeSafeInteger(record.proposedState, `updates[${index}].proposedState`);
-  if (proposedState !== null && proposedState >= states.length) {
+function parseProjection<T>(schema: z.ZodType<T>, value: unknown): T {
+  const result = schema.safeParse(value);
+  if (result.success) return result.data;
+  if (result.error.issues.some((issue) => issue.path.includes("hiddenSetId"))) {
+    throw new ProjectionProtocolError(
+      "hiddenSetId must be null or 128 lowercase hex characters",
+      "invalid-hidden-set-id",
+    );
+  }
+  throw new Error(firstZodMessage(result.error));
+}
+
+function validateUpdate(update: ProjectionUpdate, index: number) {
+  if (update.proposedState !== null && update.proposedState >= update.states.length) {
     throw new Error(`updates[${index}].proposedState is outside states`);
   }
-  if (proposedState === null && states.length !== 0) {
+  if (update.proposedState === null && update.states.length !== 0) {
     throw new Error(`updates[${index}].states must be empty for a deletion`);
   }
-  const stateKeys = states
+  const stateKeys = update.states
     .map((state) => `${toHex(state.gitOid)}:${toHex(state.canonicalCommitId)}`)
     .sort();
   if (stateKeys.some((key, stateIndex) => stateIndex > 0 && key === stateKeys[stateIndex - 1])) {
     throw new Error(`updates[${index}].states must not contain duplicate mappings`);
   }
-  return {
-    bookmark: decodeName(record.bookmark, `updates[${index}].bookmark`),
-    expectedOldOid: decodeNullableGitOid(
-      record.expectedOldOid,
-      `updates[${index}].expectedOldOid`,
-    ),
-    states,
-    proposedState,
-  };
 }
 
-function decodeProjectionState(value: unknown, field: string): ProjectionState {
-  const state = requireRecord(value, field);
-  requireExactKeys(state, ["gitOid", "canonicalCommitId", "publicCommitId", "hiddenSetId"]);
-  const decoded = {
-    gitOid: decodeHex(state.gitOid, GIT_OID_PATTERN, "gitOid", 20),
-    canonicalCommitId: decodeHex(
-      state.canonicalCommitId,
-      OBJECT_ID_PATTERN,
-      "canonicalCommitId",
-      64,
-    ),
-    publicCommitId: decodeHex(state.publicCommitId, OBJECT_ID_PATTERN, "publicCommitId", 64),
-    hiddenSetId: decodeHiddenSetId(state.hiddenSetId),
-  };
-  requireNonZero(decoded.gitOid, "gitOid");
-  requireNonZero(decoded.canonicalCommitId, "canonicalCommitId");
-  requireNonZero(decoded.publicCommitId, "publicCommitId");
-  return decoded;
+function requireStateLimit(values: Array<{ states: ProjectionState[] }>, field: string) {
+  const count = values.reduce((total, value) => total + value.states.length, 0);
+  if (count > MAX_PROJECTION_STATES) {
+    throw new Error(`${field} exceeds the ${MAX_PROJECTION_STATES}-state limit`);
+  }
 }
 
 function encodeProjectionState(state: ProjectionState) {
@@ -371,83 +258,6 @@ function encodeProjectionState(state: ProjectionState) {
     publicCommitId: toHex(state.publicCommitId),
     hiddenSetId: state.hiddenSetId === null ? null : toHex(state.hiddenSetId),
   };
-}
-
-function decodeNullableGitOid(value: unknown, field: string): Uint8Array | null {
-  if (value === null) return null;
-  const oid = decodeHex(value, GIT_OID_PATTERN, field, 20);
-  requireNonZero(oid, field);
-  return oid;
-}
-
-function decodeHiddenSetId(value: unknown): Uint8Array | null {
-  if (value === null) return null;
-  if (typeof value !== "string" || !OBJECT_ID_PATTERN.test(value)) {
-    throw new ProjectionProtocolError(
-      "hiddenSetId must be null or 128 lowercase hex characters",
-      "invalid-hidden-set-id",
-    );
-  }
-  return decodeHex(value, OBJECT_ID_PATTERN, "hiddenSetId", 64);
-}
-
-function decodeHex(
-  value: unknown,
-  pattern: RegExp,
-  field: string,
-  expectedLength: number,
-): Uint8Array {
-  if (typeof value !== "string" || !pattern.test(value)) {
-    throw new Error(`${field} has invalid lowercase hexadecimal encoding`);
-  }
-  const bytes = Uint8Array.from({ length: value.length / 2 }, (_, index) =>
-    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
-  );
-  if (bytes.byteLength !== expectedLength) throw new Error(`${field} has invalid length`);
-  return bytes;
-}
-
-function decodeName(value: unknown, field: string): string {
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
-    [...value].some((character) => {
-      const code = character.codePointAt(0) ?? 0;
-      return code < 0x20 || code === 0x7f || (code >= 0xd800 && code <= 0xdfff);
-    })
-  ) {
-    throw new Error(`${field} must be a non-empty string without control characters`);
-  }
-  if (encoder.encode(value).byteLength > MAX_PROJECTION_NAME_BYTES) {
-    throw new Error(`${field} exceeds ${MAX_PROJECTION_NAME_BYTES} UTF-8 bytes`);
-  }
-  return value;
-}
-
-function requireNonZero(value: Uint8Array, field: string) {
-  if (value.every((byte) => byte === 0)) throw new Error(`${field} must not be zero`);
-}
-
-function decodeSafeInteger(value: unknown, field: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`${field} must be a non-negative safe integer`);
-  }
-  return value;
-}
-
-function requireRecord(value: unknown, field: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(`${field} must be a JSON object`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function requireExactKeys(value: Record<string, unknown>, expected: string[]) {
-  const keys = Object.keys(value).sort();
-  const wanted = [...expected].sort();
-  if (keys.length !== wanted.length || keys.some((key, index) => key !== wanted[index])) {
-    throw new Error(`request fields must be exactly ${expected.join(", ")}`);
-  }
 }
 
 function requireUniqueNames(values: Array<{ bookmark: string }>, field: string) {

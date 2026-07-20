@@ -5,8 +5,8 @@ use devspace_machine::{
     CatalogEntry, CommitMapping, ExportMappings, GitOid, GitProcessEnvironment, GitProjection,
     HttpTransport, ImportMappings, LeaseUpdate, MachineRepository, MachineStore, PackOptions,
     PendingProjectionBatch, ProjectionCursor, ProjectionMapping, ProjectionObservation,
-    ProjectionSnapshot, ProjectionState, ProjectionTransport, ProjectionUpdate, PushErrorKind,
-    PushRefStatus, QualifiedRef, RegisteredRemote, RemoteUrl, upload_object_closure,
+    ProjectionSnapshot, ProjectionState, ProjectionUpdate, PushErrorKind, PushRefStatus,
+    QualifiedRef, RegisteredRemote, RemoteUrl, upload_object_closure,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -16,12 +16,13 @@ use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::RefName;
 use jj_lib::repo::Repo as _;
 
-use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
-use crate::sync::{LockedSyncRun, run_sync_entry_locked};
+use crate::checkout::reject_unsupported_global_options;
 
-use super::projection_sidecar::open_or_create_projection;
+use super::{
+    cloud_runtime, display_error, failpoint_enabled, locked_checkout_entry, open_cloud_session,
+    short_oid,
+};
 
-const FAILPOINT_ENV: &str = "DEVSPACE_FAILPOINT";
 const AFTER_PUSH_FAILPOINT: &str = "after_git_push_before_finalize";
 
 #[derive(Clone, Debug)]
@@ -70,20 +71,7 @@ pub(super) async fn push_bookmarks(
     }
 
     let workspace = command.workspace_helper(ui).await?;
-    let owner = read_checkout_owner(workspace.workspace_root())
-        .map_err(|_| user_error("`ds git push` is available only inside a Devspace checkout."))?;
-    let store = MachineStore::platform_default().map_err(display_error)?;
-    let entry = store
-        .entries()
-        .map_err(display_error)?
-        .into_iter()
-        .find(|entry| {
-            entry.identity.repository_id.as_str() == owner.repository_id()
-                && entry.identity.incarnation.as_str() == owner.incarnation()
-        })
-        .ok_or_else(|| {
-            user_error("This checkout's repository is not registered on this machine.")
-        })?;
+    let workspace_root = workspace.workspace_root().to_owned();
     let mut requested = Vec::with_capacity(bookmark_names.len());
     for name in bookmark_names {
         let target = workspace
@@ -102,53 +90,17 @@ pub(super) async fn push_bookmarks(
     }
     drop(workspace);
 
-    let sync_guard = match run_sync_entry_locked(&store, &entry, command.settings()).await {
-        Ok(LockedSyncRun::Completed(guard)) => guard,
-        Ok(LockedSyncRun::AlreadyLocked) => {
-            return Err(user_error(format!(
-                "Repository `{}` is already being synchronized; retry the push after it finishes.",
-                entry.name
-            )));
-        }
-        Err(error) => return Err(user_error(error)),
-    };
-
-    let repository = MachineRepository::open(&entry.native_repository_path, command.settings())
-        .await
-        .map_err(display_error)?;
-    let config = store.load_config().map_err(display_error)?;
-    let incarnation = parse_hex(
-        entry.identity.incarnation.as_str(),
-        "repository incarnation",
-    )?;
-    let machine_id = parse_hex(config.machine_id().as_str(), "machine ID")?;
-    let projection_transport =
-        ProjectionTransport::new(&config, entry.identity.repository_id.as_str(), incarnation)
-            .map_err(display_error)?;
-    let http_transport =
-        HttpTransport::new(&config, entry.identity.repository_id.as_str(), incarnation)
-            .map_err(display_error)?;
-    let (projection, rebuilt_projection) = open_or_create_projection(
-        &store.repository_projection_path(&entry.identity),
-        command.settings(),
-    )
-    .map_err(user_error)?;
-    if rebuilt_projection {
-        writeln!(
-            ui.warning_default(),
-            "Rebuilt the local Git projection sidecar after it failed validation."
-        )?;
-    }
+    let locked = locked_checkout_entry(&workspace_root, command.settings(), "push").await?;
+    let session = open_cloud_session(ui, command.settings(), &locked.store, &locked.entry).await?;
     let runtime = cloud_runtime()?;
     let lines = runtime
         .block_on(push_with_cloud(
-            &store,
-            &entry,
-            &repository,
-            &projection,
-            projection_transport,
-            http_transport,
-            machine_id,
+            &locked.store,
+            &locked.entry,
+            &session.repository,
+            &session.projection,
+            session.transport,
+            session.machine_id,
             &remote_name,
             &requested,
         ))
@@ -156,7 +108,6 @@ pub(super) async fn push_bookmarks(
     for line in lines {
         writeln!(ui.status(), "{line}")?;
     }
-    drop(sync_guard);
     Ok(())
 }
 
@@ -166,13 +117,12 @@ async fn push_with_cloud(
     entry: &CatalogEntry,
     repository: &MachineRepository,
     projection: &GitProjection,
-    journal: ProjectionTransport,
     mut cloud: HttpTransport,
     machine_id: [u8; 16],
     remote_name: &str,
     requested: &[RequestedBookmark],
 ) -> Result<Vec<String>, String> {
-    let remotes = journal
+    let remotes = cloud
         .list_remotes()
         .await
         .map_err(|error| error.to_string())?;
@@ -181,38 +131,37 @@ async fn push_with_cloud(
         .iter()
         .map(|request| request.name.as_str())
         .collect::<BTreeSet<_>>();
-    let mut snapshot = load_projection_snapshot(&journal).await?;
+    let mut snapshot = load_projection_snapshot(&cloud).await?;
 
     while let Some(pending) = overlapping_pending(&snapshot, remote_name, &requested_names) {
         recover_pending_batch(
-            repository, projection, &journal, &mut cloud, machine_id, remote, &snapshot, &pending,
+            repository, projection, &mut cloud, machine_id, remote, &snapshot, &pending,
         )
         .await?;
-        snapshot = load_projection_snapshot(&journal).await?;
+        snapshot = load_projection_snapshot(&cloud).await?;
     }
-
-    let mut prepared =
-        prepare_updates(repository, projection, remote_name, requested, &snapshot).await?;
-    let mut output = prepared.output.clone();
-    if prepared.updates.is_empty() {
-        return Ok(output);
-    }
-
-    let closure = repository
-        .commit_closure(&prepared.durable_heads)
-        .map_err(|error| error.to_string())?;
-    upload_object_closure(
-        &closure,
-        store.repository_packs_path(&entry.identity),
-        PackOptions::default(),
-        &mut cloud,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
 
     loop {
+        let mut prepared =
+            prepare_updates(repository, projection, remote_name, requested, &snapshot).await?;
+        let mut output = prepared.output.clone();
+        if prepared.updates.is_empty() {
+            return Ok(output);
+        }
+        let closure = repository
+            .commit_closure(&prepared.durable_heads)
+            .map_err(|error| error.to_string())?;
+        upload_object_closure(
+            &closure,
+            store.repository_packs_path(&entry.identity),
+            PackOptions::default(),
+            &mut cloud,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
         let batch_id = new_batch_id()?;
-        match journal
+        match cloud
             .begin_push(batch_id, machine_id, remote_name, &prepared.updates)
             .await
         {
@@ -224,7 +173,7 @@ async fn push_with_cloud(
                     Some(AFTER_PUSH_FAILPOINT),
                 )?;
                 let observations = observations(&prepared.updates, &report)?;
-                let finalized = journal
+                let finalized = cloud
                     .recover_push(batch_id, machine_id, result.fence, &observations)
                     .await;
                 match finalized {
@@ -254,8 +203,8 @@ async fn push_with_cloud(
             }
             Ok(_) => return Err("projection journal returned an invalid batch state".to_owned()),
             Err(begin_error) => {
-                let refreshed = load_projection_snapshot(&journal).await;
-                let Ok(mut refreshed) = refreshed else {
+                let refreshed = load_projection_snapshot(&cloud).await;
+                let Ok(refreshed) = refreshed else {
                     return Err(begin_error.to_string());
                 };
                 let Some(pending) = overlapping_pending(&refreshed, remote_name, &requested_names)
@@ -263,29 +212,10 @@ async fn push_with_cloud(
                     return Err(begin_error.to_string());
                 };
                 recover_pending_batch(
-                    repository, projection, &journal, &mut cloud, machine_id, remote, &refreshed,
-                    &pending,
+                    repository, projection, &mut cloud, machine_id, remote, &refreshed, &pending,
                 )
                 .await?;
-                refreshed = load_projection_snapshot(&journal).await?;
-                prepared =
-                    prepare_updates(repository, projection, remote_name, requested, &refreshed)
-                        .await?;
-                output = prepared.output.clone();
-                if prepared.updates.is_empty() {
-                    return Ok(output);
-                }
-                let closure = repository
-                    .commit_closure(&prepared.durable_heads)
-                    .map_err(|error| error.to_string())?;
-                upload_object_closure(
-                    &closure,
-                    store.repository_packs_path(&entry.identity),
-                    PackOptions::default(),
-                    &mut cloud,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+                snapshot = load_projection_snapshot(&cloud).await?;
             }
         }
     }
@@ -542,7 +472,7 @@ fn export_mapping(mapping: &ProjectionMapping) -> CommitMapping {
 }
 
 pub(super) async fn load_projection_snapshot(
-    journal: &ProjectionTransport,
+    journal: &HttpTransport,
 ) -> Result<ProjectionSnapshot, String> {
     let mut snapshot = journal
         .get(0, None)
@@ -586,18 +516,17 @@ pub(super) fn overlapping_pending(
 pub(super) async fn recover_pending_batch(
     repository: &MachineRepository,
     projection: &GitProjection,
-    journal: &ProjectionTransport,
     cloud: &mut HttpTransport,
     machine_id: [u8; 16],
     remote: &RegisteredRemote,
     snapshot: &ProjectionSnapshot,
     pending: &PendingProjectionBatch,
 ) -> Result<(), String> {
-    let claim = journal
+    let claim = cloud
         .claim_push(pending.batch_id, machine_id)
         .await
         .map_err(|error| error.to_string())?;
-    let replay = journal
+    let replay = cloud
         .get_push_replay(pending.batch_id)
         .await
         .map_err(|error| error.to_string())?;
@@ -621,7 +550,7 @@ pub(super) async fn recover_pending_batch(
     let leases = replay_leases(&replay)?;
     let report = observed_push(projection, remote, &leases, Some(AFTER_PUSH_FAILPOINT))?;
     let observations = observations(&replay.updates, &report)?;
-    match journal
+    match cloud
         .recover_push(pending.batch_id, machine_id, claim.fence, &observations)
         .await
     {
@@ -857,39 +786,10 @@ pub(super) fn find_remote<'a>(
         .ok_or_else(|| format!("remote-not-found: no such Git remote `{name}`"))
 }
 
-fn failpoint_enabled(name: &str) -> bool {
-    std::env::var_os(FAILPOINT_ENV).as_deref() == Some(std::ffi::OsStr::new(name))
-}
-
 fn new_batch_id() -> Result<[u8; 16], String> {
     let mut id = [0; 16];
     getrandom::fill(&mut id).map_err(|_| "failed to generate a projection batch ID".to_owned())?;
     Ok(id)
-}
-
-fn parse_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], CommandError> {
-    if value.len() != N * 2 {
-        return Err(user_error(format!("{label} has an invalid length")));
-    }
-    let mut bytes = [0; N];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| user_error(format!("{label} is not lowercase hexadecimal")))?;
-    }
-    Ok(bytes)
-}
-
-fn short_oid(oid: GitOid) -> String {
-    oid.to_string()[..12].to_owned()
-}
-
-fn cloud_runtime() -> Result<tokio::runtime::Runtime, CommandError> {
-    tokio::runtime::Runtime::new()
-        .map_err(|_| user_error("failed to start the cloud transport runtime"))
-}
-
-fn display_error(error: impl std::fmt::Display) -> CommandError {
-    user_error(error.to_string())
 }
 
 #[cfg(test)]

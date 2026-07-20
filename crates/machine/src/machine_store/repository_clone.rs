@@ -9,7 +9,7 @@ use super::{
     RepositorySyncGuard,
 };
 use crate::MachineRepository;
-use crate::locked_json::sync_directory;
+use crate::sync_directory;
 
 const CLONE_STAGING_DIRECTORY: &str = ".clone-staging";
 
