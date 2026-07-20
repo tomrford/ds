@@ -1,16 +1,15 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use devspace_kernel::hidden::{HiddenPath, HiddenPathSet};
 use devspace_machine::{
-    ExactPathFilter, ExportMappings, GitProjection, ImportMappings, MachineRepository,
-    ProjectionError,
+    ExportMappings, GitProjection, ImportMappings, MachineRepository, ProjectionError,
 };
 use jj_lib::backend::{
     ChangeId, Commit as BackendCommit, CommitId, CopyId, MillisSinceEpoch, Signature, Timestamp,
-    Tree as BackendTree, TreeValue,
+    Tree as BackendTree, TreeId, TreeValue,
 };
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::merge::Merge;
@@ -40,6 +39,10 @@ fn component(name: &str) -> RepoPathComponentBuf {
     RepoPathComponentBuf::new(name.to_owned()).unwrap()
 }
 
+fn path(value: &str) -> RepoPathBuf {
+    RepoPathBuf::from_internal_string(value).unwrap()
+}
+
 fn signature(seed: i64) -> Signature {
     Signature {
         name: "Devspace Test".to_owned(),
@@ -61,57 +64,85 @@ async fn write_file(store: &Arc<Store>, path: &RepoPath, bytes: &[u8]) -> TreeVa
     }
 }
 
-async fn write_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
-    let hidden_path = RepoPathBuf::from_internal_string("secrets/.env").unwrap();
-    let visible_path = RepoPathBuf::from_internal_string("visible.txt").unwrap();
+async fn write_tree(store: &Arc<Store>, dir: &RepoPath, entries: Vec<(&str, TreeValue)>) -> TreeId {
+    let mut entries = entries
+        .into_iter()
+        .map(|(name, value)| (component(name), value))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    store
+        .write_tree(dir, BackendTree::from_sorted_entries(entries))
+        .await
+        .unwrap()
+        .id()
+        .clone()
+}
+
+async fn write_commit(
+    store: &Arc<Store>,
+    parent: CommitId,
+    root_tree: Merge<TreeId>,
+    conflict_labels: Merge<String>,
+    seed: u8,
+) -> CommitId {
+    store
+        .write_commit(
+            BackendCommit {
+                parents: vec![parent],
+                predecessors: Vec::new(),
+                root_tree,
+                conflict_labels,
+                change_id: ChangeId::new(vec![seed; store.change_id_length()]),
+                description: format!("projection fixture {seed}"),
+                author: signature(seed.into()),
+                committer: signature(seed.into()),
+                secure_sig: None,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .id()
+        .clone()
+}
+
+async fn write_private_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
+    let hidden_path = path("secrets/.env");
+    let dshide_path = path(".dshide");
     let hidden_values = vec![
         b"DEVSPACE_PRIVATE_SENTINEL=first\0\xff".to_vec(),
         b"DEVSPACE_PRIVATE_SENTINEL=second\0\xfe".to_vec(),
     ];
+    let dshide = write_file(store, &dshide_path, b"/secrets/.env\n").await;
     let mut parent = store.root_commit_id().clone();
     for (index, hidden) in hidden_values.iter().enumerate() {
         let hidden_value = write_file(store, &hidden_path, hidden).await;
-        let secrets_tree = store
-            .write_tree(
-                RepoPath::from_internal_string("secrets").unwrap(),
-                BackendTree::from_sorted_entries(vec![(component(".env"), hidden_value)]),
-            )
-            .await
-            .unwrap();
+        let secrets_tree = write_tree(
+            store,
+            RepoPath::from_internal_string("secrets").unwrap(),
+            vec![(".env", hidden_value)],
+        )
+        .await;
         let visible = format!("visible revision {index}\n");
-        let visible_value = write_file(store, &visible_path, visible.as_bytes()).await;
-        let root_tree = store
-            .write_tree(
-                RepoPath::root(),
-                BackendTree::from_sorted_entries(vec![
-                    (
-                        component("secrets"),
-                        TreeValue::Tree(secrets_tree.id().clone()),
-                    ),
-                    (component("visible.txt"), visible_value),
-                ]),
-            )
-            .await
-            .unwrap();
-        parent = store
-            .write_commit(
-                BackendCommit {
-                    parents: vec![parent],
-                    predecessors: Vec::new(),
-                    root_tree: Merge::resolved(root_tree.id().clone()),
-                    conflict_labels: Merge::resolved(String::new()),
-                    change_id: ChangeId::new(vec![index as u8 + 1; store.change_id_length()]),
-                    description: format!("projection fixture {index}"),
-                    author: signature(index as i64),
-                    committer: signature(index as i64),
-                    secure_sig: None,
-                },
-                None,
-            )
-            .await
-            .unwrap()
-            .id()
-            .clone();
+        let visible_value = write_file(store, &path("visible.txt"), visible.as_bytes()).await;
+        let root_tree = write_tree(
+            store,
+            RepoPath::root(),
+            vec![
+                (".dshide", dshide.clone()),
+                ("secrets", TreeValue::Tree(secrets_tree)),
+                ("visible.txt", visible_value),
+            ],
+        )
+        .await;
+        parent = write_commit(
+            store,
+            parent,
+            Merge::resolved(root_tree),
+            Merge::resolved(String::new()),
+            index as u8 + 1,
+        )
+        .await;
     }
     (parent, hidden_values)
 }
@@ -178,21 +209,36 @@ async fn fixture() -> (
     let repository = MachineRepository::init(temp.path().join("native"), &settings)
         .await
         .unwrap();
-    let (head, hidden) = write_history(repository.repo().store()).await;
+    let (head, hidden) = write_private_history(repository.repo().store()).await;
     (temp, repository, settings, head, hidden)
+}
+
+async fn projected_value(
+    projection: &GitProjection,
+    commit_id: &CommitId,
+    value_path: &str,
+) -> Option<TreeValue> {
+    projection
+        .store()
+        .get_commit_async(commit_id)
+        .await
+        .unwrap()
+        .tree()
+        .path_value(&path(value_path))
+        .await
+        .unwrap()
+        .into_resolved()
+        .unwrap()
 }
 
 #[tokio::test]
 async fn hidden_bytes_never_enter_fresh_sidecar() {
     let (temp, repository, settings, head, hidden_values) = fixture().await;
     let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
-    let hidden = HiddenPathSet::from_paths([HiddenPath::parse("secrets/.env").unwrap()]);
-    let filter = ExactPathFilter::from_hidden_paths(&hidden).unwrap();
     let exported = projection
         .export_reachable(
             repository.repo().store(),
             std::slice::from_ref(&head),
-            &filter,
             &mut ExportMappings::default(),
         )
         .await
@@ -202,36 +248,320 @@ async fn hidden_bytes_never_enter_fresh_sidecar() {
     assert_eq!(exported.git_heads[0].as_bytes().len(), 20);
     assert_eq!(exported.new_mappings.len(), 2);
     assert_hidden_bytes_absent(projection.git_repo_path(), &hidden_values);
-
-    let projected = projection
-        .store()
-        .get_commit_async(&exported.git_heads[0])
-        .await
-        .unwrap();
     assert!(
-        projected
-            .tree()
-            .path_value(&RepoPathBuf::from_internal_string("secrets/.env").unwrap())
+        projected_value(&projection, &exported.git_heads[0], "secrets/.env")
             .await
-            .unwrap()
-            .into_resolved()
-            .unwrap()
             .is_none()
     );
+    assert!(
+        projected_value(&projection, &exported.git_heads[0], ".dshide")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn each_commit_uses_its_own_hidden_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = settings();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings)
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+    let secret_a = write_file(store, &path("secrets/secret-a"), b"a").await;
+    let secret_b = write_file(store, &path("secrets/secret-b"), b"b").await;
+    let secrets_tree = write_tree(
+        store,
+        RepoPath::from_internal_string("secrets").unwrap(),
+        vec![("secret-a", secret_a), ("secret-b", secret_b)],
+    )
+    .await;
+    let root_without_policy = write_tree(
+        store,
+        RepoPath::root(),
+        vec![("secrets", TreeValue::Tree(secrets_tree.clone()))],
+    )
+    .await;
+    let first = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::resolved(root_without_policy),
+        Merge::resolved(String::new()),
+        10,
+    )
+    .await;
+    let hide_a = write_file(store, &path(".dshide"), b"secrets/secret-a\n").await;
+    let second_tree = write_tree(
+        store,
+        RepoPath::root(),
+        vec![
+            (".dshide", hide_a),
+            ("secrets", TreeValue::Tree(secrets_tree.clone())),
+        ],
+    )
+    .await;
+    let second = write_commit(
+        store,
+        first.clone(),
+        Merge::resolved(second_tree),
+        Merge::resolved(String::new()),
+        11,
+    )
+    .await;
+    let hide_b = write_file(store, &path(".dshide"), b"secrets/secret-b\n").await;
+    let third_tree = write_tree(
+        store,
+        RepoPath::root(),
+        vec![
+            (".dshide", hide_b),
+            ("secrets", TreeValue::Tree(secrets_tree)),
+        ],
+    )
+    .await;
+    let third = write_commit(
+        store,
+        second.clone(),
+        Merge::resolved(third_tree),
+        Merge::resolved(String::new()),
+        12,
+    )
+    .await;
+
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    assert!(
+        projection
+            .hidden_set_for_commit(store, &first)
+            .await
+            .unwrap()
+            .identity()
+            .file_id()
+            .is_none()
+    );
+    assert!(
+        projection
+            .hidden_set_for_commit(store, &second)
+            .await
+            .unwrap()
+            .identity()
+            .file_id()
+            .is_some()
+    );
+    let exported = projection
+        .export_reachable(
+            store,
+            std::slice::from_ref(&third),
+            &mut ExportMappings::default(),
+        )
+        .await
+        .unwrap();
+    let mapped = exported
+        .new_mappings
+        .iter()
+        .map(|row| (row.canonical_id.clone(), row.git_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    assert!(
+        projected_value(&projection, &mapped[&first], "secrets/secret-a")
+            .await
+            .is_some()
+    );
+    assert!(
+        projected_value(&projection, &mapped[&first], "secrets/secret-b")
+            .await
+            .is_some()
+    );
+    assert!(
+        projected_value(&projection, &mapped[&second], "secrets/secret-a")
+            .await
+            .is_none()
+    );
+    assert!(
+        projected_value(&projection, &mapped[&second], "secrets/secret-b")
+            .await
+            .is_some()
+    );
+    assert!(
+        projected_value(&projection, &mapped[&third], "secrets/secret-a")
+            .await
+            .is_some()
+    );
+    assert!(
+        projected_value(&projection, &mapped[&third], "secrets/secret-b")
+            .await
+            .is_none()
+    );
+    for git_id in mapped.values() {
+        assert!(
+            projected_value(&projection, git_id, ".dshide")
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn hidden_directory_is_pruned_before_negation_can_reinclude_a_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = settings();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings)
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+    let private_tree = write_tree(
+        store,
+        RepoPath::from_internal_string("private").unwrap(),
+        vec![
+            (
+                "drop.txt",
+                write_file(store, &path("private/drop.txt"), b"drop").await,
+            ),
+            (
+                "keep.txt",
+                write_file(store, &path("private/keep.txt"), b"keep").await,
+            ),
+        ],
+    )
+    .await;
+    let root = write_tree(
+        store,
+        RepoPath::root(),
+        vec![
+            (
+                ".dshide",
+                write_file(store, &path(".dshide"), b"private/\n!private/keep.txt\n").await,
+            ),
+            ("private", TreeValue::Tree(private_tree)),
+            (
+                "visible",
+                write_file(store, &path("visible"), b"public").await,
+            ),
+        ],
+    )
+    .await;
+    let head = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::resolved(root),
+        Merge::resolved(String::new()),
+        20,
+    )
+    .await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let exported = projection
+        .export_reachable(store, &[head], &mut ExportMappings::default())
+        .await
+        .unwrap();
+
+    assert!(
+        projected_value(&projection, &exported.git_heads[0], "private")
+            .await
+            .is_none()
+    );
+    assert!(
+        projected_value(&projection, &exported.git_heads[0], "visible")
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn conflicted_dshide_fails_closed_with_the_commit_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = settings();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings)
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+    let left = write_tree(
+        store,
+        RepoPath::root(),
+        vec![(
+            ".dshide",
+            write_file(store, &path(".dshide"), b"left\n").await,
+        )],
+    )
+    .await;
+    let right = write_tree(
+        store,
+        RepoPath::root(),
+        vec![(
+            ".dshide",
+            write_file(store, &path(".dshide"), b"right\n").await,
+        )],
+    )
+    .await;
+    let head = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::from_vec(vec![store.empty_tree_id().clone(), left, right]),
+        Merge::from_vec(vec![String::new(), String::new(), String::new()]),
+        30,
+    )
+    .await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let error = projection
+        .export_reachable(
+            store,
+            std::slice::from_ref(&head),
+            &mut ExportMappings::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProjectionError::ConflictedDshide(id) if id == head));
+}
+
+#[tokio::test]
+async fn directory_at_dshide_fails_closed_with_the_commit_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = settings();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings)
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+    let policy_tree = write_tree(
+        store,
+        RepoPath::from_internal_string(".dshide").unwrap(),
+        vec![(
+            "pattern",
+            write_file(store, &path(".dshide/pattern"), b"secret").await,
+        )],
+    )
+    .await;
+    let root = write_tree(
+        store,
+        RepoPath::root(),
+        vec![(".dshide", TreeValue::Tree(policy_tree))],
+    )
+    .await;
+    let head = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::resolved(root),
+        Merge::resolved(String::new()),
+        31,
+    )
+    .await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let error = projection
+        .export_reachable(
+            store,
+            std::slice::from_ref(&head),
+            &mut ExportMappings::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProjectionError::InvalidDshideEntry(id) if id == head));
 }
 
 #[tokio::test]
 async fn sidecar_rebuilds_from_durable_mapping_rows() {
     let (temp, repository, settings, head, hidden_values) = fixture().await;
     let sidecar = temp.path().join("projection");
-    let hidden = HiddenPathSet::from_paths([HiddenPath::parse("secrets/.env").unwrap()]);
-    let filter = ExactPathFilter::from_hidden_paths(&hidden).unwrap();
     let first = GitProjection::init(&sidecar, &settings).unwrap();
     let first_export = first
         .export_reachable(
             repository.repo().store(),
             std::slice::from_ref(&head),
-            &filter,
             &mut ExportMappings::default(),
         )
         .await
@@ -247,7 +577,6 @@ async fn sidecar_rebuilds_from_durable_mapping_rows() {
         .export_reachable(
             repository.repo().store(),
             std::slice::from_ref(&head),
-            &filter,
             &mut mappings,
         )
         .await
@@ -255,6 +584,53 @@ async fn sidecar_rebuilds_from_durable_mapping_rows() {
     assert_eq!(rebuilt_export.git_heads, [first_head]);
     assert!(rebuilt_export.new_mappings.is_empty());
     assert_hidden_bytes_absent(rebuilt.git_repo_path(), &hidden_values);
+}
+
+#[tokio::test]
+async fn full_tree_scan_finds_a_planted_public_leak() {
+    let (temp, repository, settings, head, _) = fixture().await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let hidden_set = projection
+        .hidden_set_for_commit(repository.repo().store(), &head)
+        .await
+        .unwrap();
+    let leaked_tree = write_tree(
+        projection.store(),
+        RepoPath::from_internal_string("secrets").unwrap(),
+        vec![(
+            ".env",
+            write_file(projection.store(), &path("secrets/.env"), b"planted").await,
+        )],
+    )
+    .await;
+    let root = write_tree(
+        projection.store(),
+        RepoPath::root(),
+        vec![
+            (
+                ".dshide",
+                write_file(projection.store(), &path(".dshide"), b"also planted").await,
+            ),
+            ("secrets", TreeValue::Tree(leaked_tree)),
+        ],
+    )
+    .await;
+    let public = write_commit(
+        projection.store(),
+        projection.store().root_commit_id().clone(),
+        Merge::resolved(root),
+        Merge::resolved(String::new()),
+        40,
+    )
+    .await;
+
+    assert_eq!(
+        projection
+            .scan_hidden_paths(&public, &hidden_set)
+            .await
+            .unwrap(),
+        [path(".dshide"), path("secrets/.env")]
+    );
 }
 
 #[tokio::test]
@@ -266,49 +642,30 @@ async fn gitlink_import_fails_before_simple_encoding() {
         .unwrap();
     let initial_operation = repository.repo().op_id().clone();
     let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
-    let gitlink_path = RepoPathBuf::from_internal_string("vendor/dependency").unwrap();
-    let vendor_tree = projection
-        .store()
-        .write_tree(
-            RepoPath::from_internal_string("vendor").unwrap(),
-            BackendTree::from_sorted_entries(vec![(
-                component("dependency"),
-                TreeValue::GitSubmodule(CommitId::new(vec![0x11; 20])),
-            )]),
-        )
-        .await
-        .unwrap();
-    let root_tree = projection
-        .store()
-        .write_tree(
-            RepoPath::root(),
-            BackendTree::from_sorted_entries(vec![(
-                component("vendor"),
-                TreeValue::Tree(vendor_tree.id().clone()),
-            )]),
-        )
-        .await
-        .unwrap();
-    let git_head = projection
-        .store()
-        .write_commit(
-            BackendCommit {
-                parents: vec![projection.store().root_commit_id().clone()],
-                predecessors: Vec::new(),
-                root_tree: Merge::resolved(root_tree.id().clone()),
-                conflict_labels: Merge::resolved(String::new()),
-                change_id: ChangeId::new(vec![7; projection.store().change_id_length()]),
-                description: "gitlink fixture".to_owned(),
-                author: signature(7),
-                committer: signature(7),
-                secure_sig: None,
-            },
-            None,
-        )
-        .await
-        .unwrap()
-        .id()
-        .clone();
+    let gitlink_path = path("vendor/dependency");
+    let vendor_tree = write_tree(
+        projection.store(),
+        RepoPath::from_internal_string("vendor").unwrap(),
+        vec![(
+            "dependency",
+            TreeValue::GitSubmodule(CommitId::new(vec![0x11; 20])),
+        )],
+    )
+    .await;
+    let root_tree = write_tree(
+        projection.store(),
+        RepoPath::root(),
+        vec![("vendor", TreeValue::Tree(vendor_tree))],
+    )
+    .await;
+    let git_head = write_commit(
+        projection.store(),
+        projection.store().root_commit_id().clone(),
+        Merge::resolved(root_tree),
+        Merge::resolved(String::new()),
+        50,
+    )
+    .await;
 
     let error = projection
         .import_reachable(
@@ -338,67 +695,9 @@ async fn gitlink_import_fails_before_simple_encoding() {
 }
 
 #[tokio::test]
-async fn policy_cutover_rejects_stale_mapping_and_creates_public_child() {
-    let (temp, repository, settings, head, _) = fixture().await;
-    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
-    let initial = projection
-        .export_reachable(
-            repository.repo().store(),
-            std::slice::from_ref(&head),
-            &ExactPathFilter::default(),
-            &mut ExportMappings::default(),
-        )
-        .await
-        .unwrap();
-    let public_tip = initial.git_heads[0].clone();
-    let hidden = HiddenPathSet::from_paths([HiddenPath::parse("secrets/.env").unwrap()]);
-    let filter = ExactPathFilter::from_hidden_paths(&hidden).unwrap();
-    assert_eq!(
-        projection
-            .scan_hidden_paths(&public_tip, &filter)
-            .await
-            .unwrap(),
-        [RepoPathBuf::from_internal_string("secrets/.env").unwrap()]
-    );
-
-    let error = projection
-        .export_reachable(
-            repository.repo().store(),
-            std::slice::from_ref(&head),
-            &filter,
-            &mut ExportMappings::from_rows(initial.new_mappings).unwrap(),
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(error, ProjectionError::StaleMapping { .. }));
-
-    let cutover = projection
-        .project_snapshot_after(repository.repo().store(), &head, &public_tip, &filter, true)
-        .await
-        .unwrap();
-    assert_ne!(cutover, public_tip);
-    assert_eq!(
-        projection
-            .store()
-            .get_commit_async(&cutover)
-            .await
-            .unwrap()
-            .parent_ids(),
-        [public_tip]
-    );
-    assert!(
-        projection
-            .scan_hidden_paths(&cutover, &filter)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
 async fn hidden_leaf_is_filtered_before_its_bytes_are_read() {
     let (temp, repository, settings, head, _) = fixture().await;
-    let hidden_path = RepoPathBuf::from_internal_string("secrets/.env").unwrap();
+    let hidden_path = path("secrets/.env");
     let hidden_id = match repository
         .repo()
         .store()
@@ -417,13 +716,11 @@ async fn hidden_leaf_is_filtered_before_its_bytes_are_read() {
         value => panic!("expected hidden file, got {value:?}"),
     };
     fs::remove_file(repository.path().join("store/files").join(hidden_id.hex())).unwrap();
-    let hidden = HiddenPathSet::from_paths([HiddenPath::parse("secrets/.env").unwrap()]);
     let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
     projection
         .export_reachable(
             repository.repo().store(),
             &[head],
-            &ExactPathFilter::from_hidden_paths(&hidden).unwrap(),
             &mut ExportMappings::default(),
         )
         .await

@@ -41,8 +41,8 @@ pub use creation_intent::{
 };
 pub use devspace_kernel::ObjectKind;
 pub use git_projection::{
-    CommitMapping, ExactPathFilter, ExportMappings, ExportResult, GitProjection, ImportMappings,
-    ImportResult, ProjectionError,
+    CommitMapping, ExportMappings, ExportResult, GitProjection, HiddenSet, HiddenSetIdentity,
+    ImportMappings, ImportResult, ProjectionError,
 };
 pub use http_transport::HttpTransport;
 pub use install::{InstalledPack, PackInstallError};

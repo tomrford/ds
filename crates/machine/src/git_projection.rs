@@ -3,7 +3,7 @@
 //! The sidecar contains only public Git objects. Canonical jj objects and all
 //! durable projection receipts remain outside it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fs;
 use std::future::Future;
@@ -11,12 +11,14 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use devspace_kernel::hidden::HiddenPathSet;
 use jj_lib::backend::{
     Commit as BackendCommit, CommitId, CopyId, FileId, SymlinkId, Tree as BackendTree, TreeId,
     TreeValue,
 };
+use jj_lib::conflict_labels::ConflictLabels;
 use jj_lib::git_backend::GitBackend;
+use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
 use jj_lib::signing::Signer;
@@ -25,6 +27,7 @@ use jj_lib::tree_merge::MergeOptions;
 use thiserror::Error;
 
 const STORE_DIR: &str = "store";
+const DSHIDE: &str = ".dshide";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitMapping {
@@ -115,29 +118,24 @@ fn record_mapping(
     Ok(true)
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ExactPathFilter {
-    excluded: BTreeSet<RepoPathBuf>,
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HiddenSetIdentity(Option<FileId>);
+
+impl HiddenSetIdentity {
+    pub fn file_id(&self) -> Option<&FileId> {
+        self.0.as_ref()
+    }
 }
 
-impl ExactPathFilter {
-    pub fn from_hidden_paths(paths: &HiddenPathSet) -> Result<Self, ProjectionError> {
-        let excluded = paths
-            .iter()
-            .map(|path| {
-                RepoPathBuf::from_internal_string(path.as_str().to_owned()).map_err(|source| {
-                    ProjectionError::InvalidHiddenPath {
-                        path: path.as_str().to_owned(),
-                        source: Box::new(source),
-                    }
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Self { excluded })
-    }
+#[derive(Clone, Debug)]
+pub struct HiddenSet {
+    identity: HiddenSetIdentity,
+    matcher: Arc<GitIgnoreFile>,
+}
 
-    fn excludes(&self, path: &RepoPath) -> bool {
-        self.excluded.contains(path)
+impl HiddenSet {
+    pub fn identity(&self) -> &HiddenSetIdentity {
+        &self.identity
     }
 }
 
@@ -217,14 +215,12 @@ impl GitProjection {
         &self,
         canonical_store: &Arc<Store>,
         canonical_heads: &[CommitId],
-        hidden_paths: &ExactPathFilter,
         mappings: &mut ExportMappings,
     ) -> Result<ExportResult, ProjectionError> {
         let translated = translate_reachable(
             canonical_store,
             &self.store,
             canonical_heads,
-            hidden_paths,
             &mut mappings.by_canonical,
             TranslationDirection::Export,
         )
@@ -252,7 +248,6 @@ impl GitProjection {
             &self.store,
             canonical_store,
             git_heads,
-            &ExactPathFilter::default(),
             &mut mappings.by_git,
             TranslationDirection::Import,
         )
@@ -278,55 +273,19 @@ impl GitProjection {
         })
     }
 
-    /// Projects one canonical snapshot as a Git-only child of an existing
-    /// public tip. Policy changes are not canonical history, so an unchanged
-    /// private commit can still require a new public tree.
-    pub async fn project_snapshot_after(
+    pub async fn hidden_set_for_commit(
         &self,
         canonical_store: &Arc<Store>,
         canonical_id: &CommitId,
-        git_parent: &CommitId,
-        hidden_paths: &ExactPathFilter,
-        force_policy_commit: bool,
-    ) -> Result<CommitId, ProjectionError> {
+    ) -> Result<HiddenSet, ProjectionError> {
         let canonical = canonical_store.backend().read_commit(canonical_id).await?;
-        let source_tree_id = canonical
-            .root_tree
-            .as_resolved()
-            .ok_or_else(|| ProjectionError::ConflictedCommit(canonical_id.clone()))?;
-        let projected_tree_id = copy_tree(
+        resolve_hidden_set(
             canonical_store,
-            &self.store,
-            RepoPath::root(),
-            source_tree_id,
-            hidden_paths,
+            canonical_id,
+            &canonical,
             &mut BTreeMap::new(),
-            TranslationDirection::Export,
         )
-        .await?;
-        let parent = self.store.backend().read_commit(git_parent).await?;
-        if !force_policy_commit && parent.root_tree.as_resolved() == Some(&projected_tree_id) {
-            return Ok(git_parent.clone());
-        }
-        Ok(self
-            .store
-            .write_commit(
-                BackendCommit {
-                    parents: vec![git_parent.clone()],
-                    predecessors: Vec::new(),
-                    root_tree: jj_lib::merge::Merge::resolved(projected_tree_id),
-                    conflict_labels: jj_lib::merge::Merge::resolved(String::new()),
-                    change_id: canonical.change_id,
-                    description: "Apply Devspace Git projection policy\n".to_owned(),
-                    author: canonical.author,
-                    committer: canonical.committer,
-                    secure_sig: None,
-                },
-                None,
-            )
-            .await?
-            .id()
-            .clone())
+        .await
     }
 
     /// Defense-in-depth check for the selected public tip immediately before
@@ -334,9 +293,9 @@ impl GitProjection {
     pub async fn scan_hidden_paths(
         &self,
         git_head: &CommitId,
-        hidden_paths: &ExactPathFilter,
+        hidden_set: &HiddenSet,
     ) -> Result<Vec<RepoPathBuf>, ProjectionError> {
-        scan_hidden_paths(&self.store, git_head, hidden_paths).await
+        scan_hidden_paths(&self.store, git_head, hidden_set).await
     }
 }
 
@@ -361,13 +320,13 @@ async fn translate_reachable(
     source: &Arc<Store>,
     target: &Arc<Store>,
     source_heads: &[CommitId],
-    filter: &ExactPathFilter,
     source_to_target: &mut BTreeMap<CommitId, CommitId>,
     direction: TranslationDirection,
 ) -> Result<TranslationResult, ProjectionError> {
     let mut states = BTreeMap::<CommitId, bool>::new();
     let mut commits = BTreeMap::<CommitId, BackendCommit>::new();
-    let mut tree_cache = BTreeMap::<(RepoPathBuf, TreeId), TreeId>::new();
+    let mut tree_cache = BTreeMap::<(HiddenSetIdentity, RepoPathBuf, TreeId), TreeId>::new();
+    let mut matcher_cache = BTreeMap::<FileId, Arc<GitIgnoreFile>>::new();
     let mut new_pairs = Vec::new();
     let mut reached_pairs = BTreeMap::new();
 
@@ -383,8 +342,20 @@ async fn translate_reachable(
                         match target.backend().read_commit(target_id).await {
                             Ok(_) => {
                                 if matches!(direction, TranslationDirection::Export) {
+                                    let source_commit =
+                                        source.backend().read_commit(&source_id).await?;
+                                    let hidden_set = resolve_hidden_set(
+                                        source,
+                                        &source_id,
+                                        &source_commit,
+                                        &mut matcher_cache,
+                                    )
+                                    .await?;
+                                    if source_commit.root_tree.as_resolved().is_none() {
+                                        return Err(ProjectionError::ConflictedCommit(source_id));
+                                    }
                                     let leaked =
-                                        scan_hidden_paths(target, target_id, filter).await?;
+                                        scan_hidden_paths(target, target_id, &hidden_set).await?;
                                     if !leaked.is_empty() {
                                         return Err(ProjectionError::StaleMapping {
                                             canonical_id: source_id,
@@ -428,6 +399,18 @@ async fn translate_reachable(
                             mapped_commit_id(source, target, source_to_target, parent_id)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
+                    let hidden_set = match direction {
+                        TranslationDirection::Export => Some(
+                            resolve_hidden_set(
+                                source,
+                                &source_id,
+                                &source_commit,
+                                &mut matcher_cache,
+                            )
+                            .await?,
+                        ),
+                        TranslationDirection::Import => None,
+                    };
                     let source_tree_id = source_commit
                         .root_tree
                         .as_resolved()
@@ -437,7 +420,7 @@ async fn translate_reachable(
                         target,
                         RepoPath::root(),
                         source_tree_id,
-                        filter,
+                        hidden_set.as_ref(),
                         &mut tree_cache,
                         direction,
                     )
@@ -482,22 +465,56 @@ async fn translate_reachable(
 async fn scan_hidden_paths(
     store: &Arc<Store>,
     commit_id: &CommitId,
-    hidden_paths: &ExactPathFilter,
+    hidden_set: &HiddenSet,
 ) -> Result<Vec<RepoPathBuf>, ProjectionError> {
-    let commit = store.get_commit_async(commit_id).await?;
-    let tree = commit.tree();
+    let commit = store.backend().read_commit(commit_id).await?;
+    let tree_id = commit
+        .root_tree
+        .as_resolved()
+        .ok_or_else(|| ProjectionError::ConflictedProjectedCommit(commit_id.clone()))?;
     let mut leaked = Vec::new();
-    for path in &hidden_paths.excluded {
-        let value = tree
-            .path_value(path)
-            .await?
-            .into_resolved()
-            .map_err(|_| ProjectionError::ConflictedProjectedPath(path.clone()))?;
-        if value.is_some() {
-            leaked.push(path.clone());
-        }
-    }
+    scan_tree(
+        store,
+        RepoPath::root(),
+        tree_id,
+        &hidden_set.matcher,
+        &mut leaked,
+    )
+    .await?;
     Ok(leaked)
+}
+
+fn scan_tree<'a>(
+    store: &'a Arc<Store>,
+    path: &'a RepoPath,
+    tree_id: &'a TreeId,
+    matcher: &'a GitIgnoreFile,
+    leaked: &'a mut Vec<RepoPathBuf>,
+) -> Pin<Box<dyn Future<Output = Result<(), ProjectionError>> + 'a>> {
+    Box::pin(async move {
+        let tree = store.get_tree(path.to_owned(), tree_id).await?;
+        for entry in tree.entries_non_recursive() {
+            let entry_path = path.join(entry.name());
+            if is_root_dshide(path, entry.name()) {
+                leaked.push(entry_path);
+                continue;
+            }
+            match entry.value() {
+                TreeValue::Tree(id) => {
+                    if matcher.matches_dir(&entry_path) {
+                        leaked.push(entry_path);
+                    } else {
+                        scan_tree(store, &entry_path, id, matcher, leaked).await?;
+                    }
+                }
+                _ if matcher.matches_file(&entry_path) => {
+                    leaked.push(entry_path);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
 }
 
 fn mapped_commit_id(
@@ -568,15 +585,21 @@ fn copy_tree<'a>(
     target: &'a Arc<Store>,
     path: &'a RepoPath,
     source_tree_id: &'a TreeId,
-    filter: &'a ExactPathFilter,
-    cache: &'a mut BTreeMap<(RepoPathBuf, TreeId), TreeId>,
+    hidden_set: Option<&'a HiddenSet>,
+    cache: &'a mut BTreeMap<(HiddenSetIdentity, RepoPathBuf, TreeId), TreeId>,
     direction: TranslationDirection,
 ) -> Pin<Box<dyn Future<Output = Result<TreeId, ProjectionError>> + 'a>> {
     Box::pin(async move {
         if source_tree_id == source.empty_tree_id() {
             return Ok(target.empty_tree_id().clone());
         }
-        let cache_key = (path.to_owned(), source_tree_id.clone());
+        let cache_key = (
+            hidden_set
+                .map(|hidden_set| hidden_set.identity.clone())
+                .unwrap_or(HiddenSetIdentity(None)),
+            path.to_owned(),
+            source_tree_id.clone(),
+        );
         if let Some(target_tree_id) = cache.get(&cache_key) {
             return Ok(target_tree_id.clone());
         }
@@ -586,11 +609,17 @@ fn copy_tree<'a>(
         let mut leaf_copies = Vec::new();
         for entry in source_tree.entries_non_recursive() {
             let entry_path = path.join(entry.name());
-            if filter.excludes(&entry_path) {
-                if matches!(entry.value(), TreeValue::Tree(_)) {
-                    return Err(ProjectionError::HiddenDirectory(entry_path));
+            if let Some(hidden_set) = hidden_set {
+                let excluded = match entry.value() {
+                    TreeValue::Tree(_) => hidden_set.matcher.matches_dir(&entry_path),
+                    _ => {
+                        is_root_dshide(path, entry.name())
+                            || hidden_set.matcher.matches_file(&entry_path)
+                    }
+                };
+                if excluded {
+                    continue;
                 }
-                continue;
             }
             let target_value = match entry.value() {
                 TreeValue::File {
@@ -615,9 +644,16 @@ fn copy_tree<'a>(
                     continue;
                 }
                 TreeValue::Tree(id) => {
-                    let target_id =
-                        copy_tree(source, target, &entry_path, id, filter, cache, direction)
-                            .await?;
+                    let target_id = copy_tree(
+                        source,
+                        target,
+                        &entry_path,
+                        id,
+                        hidden_set,
+                        cache,
+                        direction,
+                    )
+                    .await?;
                     if target_id == *target.empty_tree_id() {
                         continue;
                     }
@@ -645,6 +681,60 @@ fn copy_tree<'a>(
     })
 }
 
+async fn resolve_hidden_set(
+    store: &Arc<Store>,
+    commit_id: &CommitId,
+    commit: &BackendCommit,
+    cache: &mut BTreeMap<FileId, Arc<GitIgnoreFile>>,
+) -> Result<HiddenSet, ProjectionError> {
+    let merged_tree = MergedTree::new(
+        store.clone(),
+        commit.root_tree.clone(),
+        ConflictLabels::from_merge(commit.conflict_labels.clone()),
+    );
+    let dshide_path = RepoPath::from_internal_string(DSHIDE).expect(".dshide is a repository path");
+    let value = merged_tree
+        .path_value(dshide_path)
+        .await?
+        .into_resolved()
+        .map_err(|_| ProjectionError::ConflictedDshide(commit_id.clone()))?;
+    let Some(value) = value else {
+        return Ok(HiddenSet {
+            identity: HiddenSetIdentity(None),
+            matcher: GitIgnoreFile::empty(),
+        });
+    };
+    let TreeValue::File { id, .. } = value else {
+        return Err(ProjectionError::InvalidDshideEntry(commit_id.clone()));
+    };
+    if let Some(matcher) = cache.get(&id) {
+        return Ok(HiddenSet {
+            identity: HiddenSetIdentity(Some(id)),
+            matcher: matcher.clone(),
+        });
+    }
+    let mut bytes = Vec::new();
+    let contents = store.read_file(dshide_path, &id).await?;
+    jj_lib::file_util::copy_async_to_sync(contents, &mut bytes)
+        .await
+        .map_err(|source| ProjectionError::ReadDshide {
+            commit_id: commit_id.clone(),
+            source,
+        })?;
+    let matcher = GitIgnoreFile::empty()
+        .chain(RepoPath::root(), Path::new(DSHIDE), &bytes)
+        .expect("in-memory gitignore patterns have no parse errors");
+    cache.insert(id.clone(), matcher.clone());
+    Ok(HiddenSet {
+        identity: HiddenSetIdentity(Some(id)),
+        matcher,
+    })
+}
+
+fn is_root_dshide(path: &RepoPath, name: &jj_lib::repo_path::RepoPathComponent) -> bool {
+    path.is_root() && name.as_internal_str() == DSHIDE
+}
+
 #[derive(Debug, Error)]
 pub enum ProjectionError {
     #[error("failed to create Git projection sidecar at {path}")]
@@ -655,12 +745,6 @@ pub enum ProjectionError {
     },
     #[error("failed to configure Git projection sidecar")]
     Setup(#[source] Box<dyn StdError + Send + Sync>),
-    #[error("hidden path {path:?} is not a valid jj repository path")]
-    InvalidHiddenPath {
-        path: String,
-        #[source]
-        source: Box<dyn StdError + Send + Sync>,
-    },
     #[error("{source_name} {source_id} is already mapped to {existing}, not {proposed}")]
     ConflictingMapping {
         source_name: &'static str,
@@ -676,18 +760,26 @@ pub enum ProjectionError {
     MissingParentMapping(CommitId),
     #[error("cannot project conflicted commit {0}")]
     ConflictedCommit(CommitId),
-    #[error("projected path {0:?} is conflicted")]
-    ConflictedProjectedPath(RepoPathBuf),
+    #[error("cannot inspect conflicted projected commit {0}")]
+    ConflictedProjectedCommit(CommitId),
+    #[error("cannot export commit {0}: .dshide is conflicted")]
+    ConflictedDshide(CommitId),
+    #[error("cannot export commit {0}: .dshide is not a regular file")]
+    InvalidDshideEntry(CommitId),
+    #[error("cannot read .dshide in commit {commit_id}")]
+    ReadDshide {
+        commit_id: CommitId,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(
-        "Git mapping {canonical_id} -> {git_id} violates the active hidden policy at {leaked:?}"
+        "Git mapping {canonical_id} -> {git_id} violates that canonical commit's hidden set at {leaked:?}"
     )]
     StaleMapping {
         canonical_id: CommitId,
         git_id: CommitId,
         leaked: Vec<RepoPathBuf>,
     },
-    #[error("cannot hide directory {0:?}; hidden paths must name exact files")]
-    HiddenDirectory(RepoPathBuf),
     #[error("cannot {operation} Git link at {path:?}")]
     GitLink {
         path: RepoPathBuf,
@@ -703,5 +795,52 @@ impl TranslationDirection {
             Self::Export => "export",
             Self::Import => "import",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn matcher(bytes: &[u8]) -> Arc<GitIgnoreFile> {
+        GitIgnoreFile::empty()
+            .chain(RepoPath::root(), Path::new(DSHIDE), bytes)
+            .unwrap()
+    }
+
+    fn repo_path(value: &str) -> &RepoPath {
+        RepoPath::from_internal_string(value).unwrap()
+    }
+
+    #[test]
+    fn dshide_gitignore_semantics_are_canonical() {
+        let anchored = matcher(b"/root-only\nunanchored\n");
+        assert!(anchored.matches_file(repo_path("root-only")));
+        assert!(!anchored.matches_file(repo_path("nested/root-only")));
+        assert!(anchored.matches_file(repo_path("unanchored")));
+        assert!(anchored.matches_file(repo_path("nested/unanchored")));
+
+        let globs = matcher(b"*.tmp\ncache/**/token\n");
+        assert!(globs.matches_file(repo_path("scratch.tmp")));
+        assert!(globs.matches_file(repo_path("nested/scratch.tmp")));
+        assert!(globs.matches_file(repo_path("cache/token")));
+        assert!(globs.matches_file(repo_path("cache/a/b/token")));
+        assert!(!globs.matches_file(repo_path("cache/a/b/token.txt")));
+
+        let directory = matcher(b"build/\n");
+        assert!(directory.matches_dir(repo_path("build")));
+        assert!(directory.matches_dir(repo_path("nested/build")));
+        assert!(!directory.matches_file(repo_path("build")));
+
+        let negation = matcher(b"*.pem\n!public.pem\nprivate/\n!private/keep.pem\n");
+        assert!(negation.matches_file(repo_path("secret.pem")));
+        assert!(!negation.matches_file(repo_path("public.pem")));
+        assert!(negation.matches_dir(repo_path("private")));
+        assert!(!negation.matches_file(repo_path("private/keep.pem")));
+
+        let syntax = matcher(b"# comment\n\n\\#literal\n\\!literal\n");
+        assert!(!syntax.matches_file(repo_path("comment")));
+        assert!(syntax.matches_file(repo_path("#literal")));
+        assert!(syntax.matches_file(repo_path("!literal")));
     }
 }

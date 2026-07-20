@@ -3,7 +3,8 @@
 Git projection maintains 2 invariants across the machine-store path and the
 repository Durable Object:
 
-- bytes hidden by the active policy do not enter public Git objects; and
+- bytes matched by each canonical commit's hidden set do not enter public Git
+  objects; and
 - a push remains recoverable when the remote ref moves but the machine does
   not finalise the cloud journal.
 
@@ -11,10 +12,13 @@ repository Durable Object:
 
 `GitProjection` owns a rebuildable bare-Git sidecar backed by jj's Git backend.
 It translates commits between a stock native `SimpleBackend` store and Git
-without making the sidecar authoritative. Export applies the exact hidden-path
-set before reading excluded leaves, omits directories made empty by filtering,
-and rejects conflicts and Git links with typed errors. Import also rejects Git
-links before asking the simple backend to encode a tree.
+without making the sidecar authoritative. Export resolves each commit's root
+`.dshide` blob as a gitignore matcher, caches matchers by `FileId`, prunes
+matching directories without descent and filters matching leaves before
+reading them. The root `.dshide` is always excluded. Export rejects conflicts,
+non-file root `.dshide` entries and Git links with typed errors. Import is
+unfiltered and rejects Git links before asking the simple backend to encode a
+tree.
 
 Translation receipts are external inputs and outputs. The adapter accepts
 durable canonical-to-Git or Git-to-public mappings, reuses consistent rows and
@@ -67,10 +71,11 @@ ancestry and a durable projection state first.
 
 ## Verification
 
-The normal Rust tests prove filtering before leaf reads, scan every blob in a
-fresh sidecar for binary private sentinels, rebuild a deleted sidecar from
-durable mapping rows, and reject a Git link without changing the native
-operation head.
+The normal Rust tests pin the gitignore matcher behavior, resolve different
+`.dshide` blobs across one history walk, prove filtering before leaf reads,
+scan every blob in a fresh sidecar for binary private sentinels, rebuild a
+deleted sidecar from durable mapping rows, and reject a Git link without
+changing the native operation head.
 
 Workers Vitest exercises the authenticated HTTP routes and real SQLite-backed
 Durable Object. It covers policy epochs, hidden drafts, eviction, overlapping
@@ -97,11 +102,11 @@ probe because its repository authority and Git remote are supplied explicitly.
 ## Budgets and benchmarks
 
 The journal bounds one request to 4 MiB, 256 refs and 8,192 projection states.
-Repository-wide pending and active ref sets are each bounded to 512. Names and
-hidden paths are bounded to 256 UTF-8 bytes; one policy is bounded to 4,096
-exact paths and 256 KiB of path text. Mapping reads page 256 rows under one
-fixed activation high-water. These are current safety limits, not settled
-production quotas.
+Repository-wide pending and active ref sets are each bounded to 512. The
+current server epoch routes bound names and hidden paths to 256 UTF-8 bytes and
+one policy to 4,096 exact paths and 256 KiB of path text. Mapping reads page
+256 rows under one fixed activation high-water. These are current safety
+limits, not settled production quotas.
 
 The projection path does not run during warm repository open. The release-only
 comparison remains inside the 2 times budget; 3 current local runs measure
@@ -122,10 +127,10 @@ The validation Wasm is 142,859 bytes and remains below its 200 KiB build gate.
   is not connected to the command runner.
 - Fetch-side hidden-lineage lifting, remote identity and production Git
   credential handling are specified in [`git-fetch.md`](git-fetch.md) and
-  [`git-push.md`](git-push.md) but not yet implemented. The per-commit hidden
-  model in [`hidden.md`](hidden.md) supersedes the repository-scoped policy
-  epochs this journal currently implements; the epoch surface is retired by
-  the fetch work.
+  [`git-push.md`](git-push.md) but not yet implemented. The machine projection
+  uses the per-commit hidden model in [`hidden.md`](hidden.md). The cloud
+  journal still exposes the repository-scoped policy epoch surface, which is
+  retired in the next implementation chunk.
 - Projection width and depth need observational scaling measurements before
   production limits are set. Exercise at least 1,000, 10,000 and 100,000 tree
   entries, and history depths of 1, 100 and 1,000 commits, recording cold

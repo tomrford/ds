@@ -2,12 +2,10 @@
 //!
 //! This manual probe requires an explicitly supplied live repository authority.
 
-use devspace_kernel::hidden::{HiddenPath, HiddenPathSet};
 use devspace_machine::{
-    CommitMapping, ExactPathFilter, ExportMappings, GitProjection, HttpTransport, ImportMappings,
-    MachineConfig, MachineId, MachineRepository, PackOptions, ProjectionObservation,
-    ProjectionState, ProjectionTransport, ProjectionUpdate, SharedSecret, SyncTransport,
-    build_packs,
+    CommitMapping, ExportMappings, GitProjection, HttpTransport, ImportMappings, MachineConfig,
+    MachineId, MachineRepository, PackOptions, ProjectionObservation, ProjectionState,
+    ProjectionTransport, ProjectionUpdate, SharedSecret, SyncTransport, build_packs,
 };
 use jj_lib::backend::{
     ChangeId, Commit as BackendCommit, CommitId, CopyId, MillisSinceEpoch, Signature, Timestamp,
@@ -70,6 +68,8 @@ async fn write_private_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
         b"LIVE_PROJECTION_PRIVATE=first\0\xff".to_vec(),
         b"LIVE_PROJECTION_PRIVATE=second\0\xfe".to_vec(),
     ];
+    let dshide_path = RepoPathBuf::from_internal_string(".dshide").unwrap();
+    let dshide = write_file(store, &dshide_path, b"/secrets/.env\n").await;
     let mut parent = store.root_commit_id().clone();
     for (index, hidden) in hidden_values.iter().enumerate() {
         let hidden_value = write_file(store, &hidden_path, hidden).await;
@@ -93,6 +93,10 @@ async fn write_private_history(store: &Arc<Store>) -> (CommitId, Vec<Vec<u8>>) {
             .write_tree(
                 RepoPath::root(),
                 BackendTree::from_sorted_entries(vec![
+                    (
+                        RepoPathComponentBuf::new(".dshide".to_owned()).unwrap(),
+                        dshide.clone(),
+                    ),
                     (
                         RepoPathComponentBuf::new("secrets".to_owned()).unwrap(),
                         TreeValue::Tree(secrets.id().clone()),
@@ -175,13 +179,14 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
 
     let sidecar = temp.path().join("machine-a/projection");
     let projection = GitProjection::init(&sidecar, &settings).unwrap();
-    let hidden = HiddenPathSet::from_paths([HiddenPath::parse("secrets/.env").unwrap()]);
-    let filter = ExactPathFilter::from_hidden_paths(&hidden).unwrap();
+    let hidden_set = projection
+        .hidden_set_for_commit(first.repo().store(), &private_head)
+        .await
+        .unwrap();
     let exported = projection
         .export_reachable(
             first.repo().store(),
             std::slice::from_ref(&private_head),
-            &filter,
             &mut ExportMappings::default(),
         )
         .await
@@ -266,7 +271,7 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
     assert!(begun.pending);
     assert!(
         projection
-            .scan_hidden_paths(&git_head, &filter)
+            .scan_hidden_paths(&git_head, &hidden_set)
             .await
             .unwrap()
             .is_empty()
@@ -332,7 +337,6 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
         .export_reachable(
             second.repo().store(),
             std::slice::from_ref(&private_head),
-            &filter,
             &mut ExportMappings::from_rows(replay_rows).unwrap(),
         )
         .await

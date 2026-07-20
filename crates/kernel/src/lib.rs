@@ -9,7 +9,6 @@
 mod backend;
 mod error;
 mod hash;
-pub mod hidden;
 mod op_store;
 mod proto;
 

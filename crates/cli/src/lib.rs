@@ -3,6 +3,7 @@ mod bare_workspace;
 mod boundary_sync;
 mod checkout;
 mod daemon;
+mod hidden;
 mod remove;
 mod repo;
 mod sync;

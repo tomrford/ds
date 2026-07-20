@@ -10,6 +10,7 @@ use jj_cli::ui::Ui;
 
 use crate::add::{AddArgs, add_checkout};
 use crate::daemon::{DaemonArgs, run_daemon};
+use crate::hidden::{HiddenArgs, run_hidden};
 use crate::remove::{RemoveArgs, remove_checkout};
 use crate::sync::{SyncArgs, run_sync};
 
@@ -21,6 +22,8 @@ pub(crate) enum DevspaceCommand {
     Remove(RemoveArgs),
     #[command(hide = true)]
     Daemon(DaemonArgs),
+    /// Manage per-commit Git projection hiding.
+    Hidden(HiddenArgs),
     /// Manage cloud repositories.
     Repo(RepoArgs),
     /// Manage machine synchronization.
@@ -51,6 +54,7 @@ pub(crate) async fn run(
             crate::boundary_sync::suppress();
             run_daemon(ui, command, args).await
         }
+        DevspaceCommand::Hidden(args) => run_hidden(ui, command, args).await,
         DevspaceCommand::Repo(RepoArgs {
             command: RepoCommand::New { name },
         }) => create_empty_repository(ui, command, name).await,
