@@ -19,12 +19,18 @@
   mid-flight. Failure is loud and the new registration stays consistent, but
   proper remote-generation fencing belongs in production hardening.
 - `ds context` (grepo parity): external-context management inside ds-managed
-  repos; v1 has it, v3 does not. Config belongs in a committed `devspace.toml`.
-- `devspace.toml` (committed, public): setup hooks (`pnpm install` on add) and
-  context config. Ruling: three config lifecycles stay separate — committed
-  `devspace.toml` for public repo conventions, `.dsprivate` for
-  devspace-shared/Git-hidden content, machine store for user-local state.
-  Auto-executing hooks from repo content is the agent-plants-a-hook threat;
-  execution needs confirmation or server-side arming, design open.
+  repos; v1 has it, v3 does not. Keeps grepo's existing committed `.repos` /
+  `.lock` files and syntax; not folded into any devspace config file.
+- `devspace.toml` (committed, public): run-on-add commands (`pnpm install`)
+  and similar repo conventions. Ruling: config lifecycles stay separate —
+  committed `devspace.toml` (public conventions), `.repos`/`.lock` (context,
+  public), `.dsprivate` (devspace-shared, Git-hidden), machine store
+  (user-local). Auto-executing hooks from repo content is the
+  agent-plants-a-hook threat; execution needs confirmation or server-side
+  arming, design open.
+- Multiuser private boundary: `.dsprivate` currently assumes one devspace is
+  one user — every devspace collaborator sees all private content. Multiuser
+  needs a third boundary between public and private (share some secrets with
+  some collaborators, not all). Design item, unscheduled.
 - `ds skill` surface (v1 parity): agent-facing usage docs incl. the private-file
   model, once docs stabilise. Needed before T3 dogfooding.
