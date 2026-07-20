@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use jj_lib::merged_tree::MergedTree;
 use jj_lib::op_store::OperationId;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::StoreFactories;
-use jj_lib::repo_path::{RepoPath, RepoPathBuf};
+use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::working_copy::{
@@ -210,46 +211,132 @@ impl LockedWorkingCopy for LockedDevspaceWorkingCopy {
 }
 
 fn hidden_track_matcher(root: &Path) -> Result<Option<HiddenTrackMatcher>, SnapshotError> {
-    let path = root.join(DSPRIVATE);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(SnapshotError::Other {
-                message: format!("Failed to read {}", path.display()),
-                err: error.into(),
-            });
-        }
-    };
-    let matcher = GitIgnoreFile::empty().chain(RepoPath::root(), Path::new(DSPRIVATE), &bytes)?;
-    Ok(Some(HiddenTrackMatcher { matcher }))
+    let mut hidden = HiddenTrackMatcher::default();
+    discover_hidden_paths(
+        root,
+        RepoPath::root(),
+        &GitIgnoreFile::empty(),
+        &GitIgnoreFile::empty(),
+        &mut hidden,
+    )?;
+    if hidden.files.is_empty() && hidden.directories.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hidden))
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct HiddenTrackMatcher {
-    matcher: Arc<GitIgnoreFile>,
+    files: BTreeSet<RepoPathBuf>,
+    directories: BTreeSet<RepoPathBuf>,
+    visited_directories: BTreeSet<RepoPathBuf>,
 }
 
 impl Matcher for HiddenTrackMatcher {
     fn matches(&self, file: &RepoPath) -> bool {
-        file.as_internal_file_string() == DSPRIVATE || hidden_file_matches(&self.matcher, file)
+        self.files.contains(file)
+            || file
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| self.directories.contains(ancestor))
     }
 
-    fn visit(&self, _dir: &RepoPath) -> Visit {
-        Visit::Specific {
-            dirs: VisitDirs::All,
-            files: VisitFiles::All,
+    fn visit(&self, dir: &RepoPath) -> Visit {
+        if self.visited_directories.contains(dir)
+            || dir
+                .ancestors()
+                .any(|ancestor| self.directories.contains(ancestor))
+        {
+            Visit::Specific {
+                dirs: VisitDirs::All,
+                files: VisitFiles::All,
+            }
+        } else {
+            Visit::Nothing
         }
     }
 }
 
-fn hidden_file_matches(matcher: &GitIgnoreFile, path: &RepoPath) -> bool {
-    matcher.matches_file(path)
-        || path
-            .ancestors()
-            .skip(1)
-            .filter(|ancestor| !ancestor.is_root())
-            .any(|ancestor| matcher.matches_dir(ancestor))
+fn discover_hidden_paths(
+    disk_dir: &Path,
+    dir: &RepoPath,
+    inherited_hidden: &Arc<GitIgnoreFile>,
+    inherited_gitignore: &Arc<GitIgnoreFile>,
+    result: &mut HiddenTrackMatcher,
+) -> Result<(), SnapshotError> {
+    let entries = fs::read_dir(disk_dir)
+        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| SnapshotError::Other {
+            message: format!("Failed to read directory {}", disk_dir.display()),
+            err: error.into(),
+        })?;
+    result.visited_directories.insert(dir.to_owned());
+
+    let mut hidden = inherited_hidden.clone();
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.file_name().as_encoded_bytes() == DSPRIVATE.as_bytes())
+    {
+        let path = entry.path();
+        let bytes = read_ignore_file(&path)?;
+        hidden = hidden.chain(dir, &path, &bytes)?;
+        result.files.insert(
+            dir.join(
+                &RepoPathComponentBuf::new(DSPRIVATE.to_owned())
+                    .expect(".dsprivate is a valid path component"),
+            ),
+        );
+    }
+
+    let mut gitignore = inherited_gitignore.clone();
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.file_name().as_encoded_bytes() == b".gitignore")
+    {
+        let path = entry.path();
+        if path.is_file() {
+            let bytes = read_ignore_file(&path)?;
+            gitignore = gitignore.chain(dir, &path, &bytes)?;
+        }
+    }
+
+    for entry in entries {
+        let file_name = entry.file_name();
+        let name = file_name
+            .into_string()
+            .map_err(|path| SnapshotError::InvalidUtf8Path { path })?;
+        if name == DSPRIVATE {
+            continue;
+        }
+        if dir.is_root() && matches!(name.as_str(), ".git" | ".jj") {
+            continue;
+        }
+        let component = RepoPathComponentBuf::new(name)
+            .expect("filesystem entry name is a valid path component");
+        let path = dir.join(&component);
+        let file_type = entry.file_type().map_err(|error| SnapshotError::Other {
+            message: format!("Failed to inspect {}", entry.path().display()),
+            err: error.into(),
+        })?;
+        if file_type.is_dir() {
+            if hidden.matches_dir(&path) {
+                result.directories.insert(path);
+            } else if !gitignore.matches_dir(&path) {
+                discover_hidden_paths(&entry.path(), &path, &hidden, &gitignore, result)?;
+            }
+        } else if hidden.matches_file(&path) {
+            result.files.insert(path);
+        }
+    }
+    Ok(())
+}
+
+fn read_ignore_file(path: &Path) -> Result<Vec<u8>, SnapshotError> {
+    fs::read(path).map_err(|error| SnapshotError::Other {
+        message: format!("Failed to read {}", path.display()),
+        err: error.into(),
+    })
 }
 
 #[cfg(test)]
@@ -258,10 +345,12 @@ mod tests {
 
     #[test]
     fn force_tracking_includes_children_of_a_hidden_directory() {
-        let matcher = GitIgnoreFile::empty()
-            .chain(RepoPath::root(), Path::new(DSPRIVATE), b"private/\n")
-            .unwrap();
-        let matcher = HiddenTrackMatcher { matcher };
+        let matcher = HiddenTrackMatcher {
+            directories: [RepoPathBuf::from_internal_string("private").unwrap()]
+                .into_iter()
+                .collect(),
+            ..HiddenTrackMatcher::default()
+        };
         assert!(matcher.matches(RepoPath::from_internal_string("private/secret").unwrap()));
     }
 }

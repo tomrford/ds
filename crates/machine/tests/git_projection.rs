@@ -334,7 +334,7 @@ async fn each_commit_uses_its_own_hidden_set() {
             .await
             .unwrap()
             .identity()
-            .file_id()
+            .to_projection_id()
             .is_none()
     );
     assert!(
@@ -343,7 +343,7 @@ async fn each_commit_uses_its_own_hidden_set() {
             .await
             .unwrap()
             .identity()
-            .file_id()
+            .to_projection_id()
             .is_some()
     );
     let exported = projection
@@ -397,6 +397,270 @@ async fn each_commit_uses_its_own_hidden_set() {
                 .is_none()
         );
     }
+}
+
+#[tokio::test]
+async fn nested_dsprivate_is_anchored_to_its_directory_and_always_hidden() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = settings();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings)
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+    let secret = write_file(store, &path("sub/secret"), b"private").await;
+    let sub_without_policy = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![("secret", secret.clone())],
+    )
+    .await;
+    let root_policy = write_file(store, &path(".dsprivate"), b"/secret\n").await;
+    let first_tree = write_tree(
+        store,
+        RepoPath::root(),
+        vec![
+            (".dsprivate", root_policy.clone()),
+            ("sub", TreeValue::Tree(sub_without_policy)),
+        ],
+    )
+    .await;
+    let first = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::resolved(first_tree),
+        Merge::resolved(String::new()),
+        13,
+    )
+    .await;
+    let nested_policy = write_file(store, &path("sub/.dsprivate"), b"secret\n").await;
+    let sub_with_policy = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![(".dsprivate", nested_policy), ("secret", secret)],
+    )
+    .await;
+    let second_tree = write_tree(
+        store,
+        RepoPath::root(),
+        vec![
+            (".dsprivate", root_policy),
+            ("sub", TreeValue::Tree(sub_with_policy)),
+        ],
+    )
+    .await;
+    let second = write_commit(
+        store,
+        first.clone(),
+        Merge::resolved(second_tree),
+        Merge::resolved(String::new()),
+        14,
+    )
+    .await;
+
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let exported = projection
+        .export_reachable(store, &[second], &mut ExportMappings::default())
+        .await
+        .unwrap();
+    let mapped = exported
+        .new_mappings
+        .iter()
+        .map(|row| (row.canonical_id.clone(), row.git_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert!(
+        projected_value(&projection, &mapped[&first], "sub/secret")
+            .await
+            .is_some()
+    );
+    let second_public = exported.git_heads.last().unwrap();
+    assert!(
+        projected_value(&projection, second_public, "sub/secret")
+            .await
+            .is_none()
+    );
+    assert!(
+        projected_value(&projection, second_public, "sub/.dsprivate")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn nested_negation_overrides_a_shallower_file_pattern() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = settings();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings)
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+    let sub = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![
+            (
+                ".dsprivate",
+                write_file(store, &path("sub/.dsprivate"), b"!secret.txt\n").await,
+            ),
+            (
+                "other.txt",
+                write_file(store, &path("sub/other.txt"), b"hidden").await,
+            ),
+            (
+                "secret.txt",
+                write_file(store, &path("sub/secret.txt"), b"public").await,
+            ),
+        ],
+    )
+    .await;
+    let root = write_tree(
+        store,
+        RepoPath::root(),
+        vec![
+            (
+                ".dsprivate",
+                write_file(store, &path(".dsprivate"), b"sub/*.txt\n").await,
+            ),
+            ("sub", TreeValue::Tree(sub)),
+        ],
+    )
+    .await;
+    let head = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::resolved(root),
+        Merge::resolved(String::new()),
+        15,
+    )
+    .await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let exported = projection
+        .export_reachable(store, &[head], &mut ExportMappings::default())
+        .await
+        .unwrap();
+    assert!(
+        projected_value(&projection, &exported.git_heads[0], "sub/secret.txt")
+            .await
+            .is_some()
+    );
+    assert!(
+        projected_value(&projection, &exported.git_heads[0], "sub/other.txt")
+            .await
+            .is_none()
+    );
+    assert!(
+        projected_value(&projection, &exported.git_heads[0], "sub/.dsprivate")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn hidden_set_identity_covers_nested_policy_add_edit_and_remove() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = settings();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings)
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+    let empty_sub = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![],
+    )
+    .await;
+    let no_policy_tree = write_tree(
+        store,
+        RepoPath::root(),
+        vec![("sub", TreeValue::Tree(empty_sub))],
+    )
+    .await;
+    let none = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::resolved(no_policy_tree.clone()),
+        Merge::resolved(String::new()),
+        16,
+    )
+    .await;
+    let first_policy = write_file(store, &path("sub/.dsprivate"), b"first\n").await;
+    let first_sub = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![(".dsprivate", first_policy)],
+    )
+    .await;
+    let first_tree = write_tree(
+        store,
+        RepoPath::root(),
+        vec![("sub", TreeValue::Tree(first_sub))],
+    )
+    .await;
+    let added = write_commit(
+        store,
+        none.clone(),
+        Merge::resolved(first_tree),
+        Merge::resolved(String::new()),
+        17,
+    )
+    .await;
+    let second_policy = write_file(store, &path("sub/.dsprivate"), b"second\n").await;
+    let second_sub = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![(".dsprivate", second_policy)],
+    )
+    .await;
+    let second_tree = write_tree(
+        store,
+        RepoPath::root(),
+        vec![("sub", TreeValue::Tree(second_sub))],
+    )
+    .await;
+    let edited = write_commit(
+        store,
+        added.clone(),
+        Merge::resolved(second_tree),
+        Merge::resolved(String::new()),
+        18,
+    )
+    .await;
+    let removed = write_commit(
+        store,
+        edited.clone(),
+        Merge::resolved(no_policy_tree),
+        Merge::resolved(String::new()),
+        19,
+    )
+    .await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let none_id = projection
+        .hidden_set_for_commit(store, &none)
+        .await
+        .unwrap()
+        .identity()
+        .to_projection_id();
+    let added_id = projection
+        .hidden_set_for_commit(store, &added)
+        .await
+        .unwrap()
+        .identity()
+        .to_projection_id();
+    let edited_id = projection
+        .hidden_set_for_commit(store, &edited)
+        .await
+        .unwrap()
+        .identity()
+        .to_projection_id();
+    let removed_id = projection
+        .hidden_set_for_commit(store, &removed)
+        .await
+        .unwrap()
+        .identity()
+        .to_projection_id();
+    assert!(none_id.is_none());
+    assert!(added_id.is_some());
+    assert_ne!(added_id, edited_id);
+    assert!(removed_id.is_none());
 }
 
 #[tokio::test]
@@ -507,7 +771,180 @@ async fn conflicted_dsprivate_fails_closed_with_the_commit_id() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, ProjectionError::ConflictedDsprivate(id) if id == head));
+    assert!(matches!(
+        error,
+        ProjectionError::ConflictedDsprivate { commit_id, path: policy_path }
+            if commit_id == head && policy_path == path(".dsprivate")
+    ));
+}
+
+#[tokio::test]
+async fn conflicted_nested_dsprivate_fails_closed_with_commit_and_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = settings();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings)
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+    let left_sub = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![(
+            ".dsprivate",
+            write_file(store, &path("sub/.dsprivate"), b"left\n").await,
+        )],
+    )
+    .await;
+    let right_sub = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![(
+            ".dsprivate",
+            write_file(store, &path("sub/.dsprivate"), b"right\n").await,
+        )],
+    )
+    .await;
+    let left = write_tree(
+        store,
+        RepoPath::root(),
+        vec![("sub", TreeValue::Tree(left_sub))],
+    )
+    .await;
+    let right = write_tree(
+        store,
+        RepoPath::root(),
+        vec![("sub", TreeValue::Tree(right_sub))],
+    )
+    .await;
+    let head = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::from_vec(vec![store.empty_tree_id().clone(), left, right]),
+        Merge::from_vec(vec![String::new(), String::new(), String::new()]),
+        32,
+    )
+    .await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let error = projection
+        .export_reachable(
+            store,
+            std::slice::from_ref(&head),
+            &mut ExportMappings::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ProjectionError::ConflictedDsprivate { commit_id, path: policy_path }
+            if commit_id == head && policy_path == path("sub/.dsprivate")
+    ));
+}
+
+#[tokio::test]
+async fn shared_subtree_cache_is_partitioned_by_nested_chain_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = settings();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings)
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+    let payload = write_tree(
+        store,
+        RepoPath::from_internal_string("sub/payload").unwrap(),
+        vec![
+            (
+                "secret-a",
+                write_file(store, &path("sub/payload/secret-a"), b"a").await,
+            ),
+            (
+                "secret-b",
+                write_file(store, &path("sub/payload/secret-b"), b"b").await,
+            ),
+        ],
+    )
+    .await;
+    let policy_a = write_file(store, &path("sub/.dsprivate"), b"payload/secret-a\n").await;
+    let policy_b = write_file(store, &path("sub/.dsprivate"), b"payload/secret-b\n").await;
+    let sub_a = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![
+            (".dsprivate", policy_a),
+            ("payload", TreeValue::Tree(payload.clone())),
+        ],
+    )
+    .await;
+    let sub_b = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![
+            (".dsprivate", policy_b),
+            ("payload", TreeValue::Tree(payload)),
+        ],
+    )
+    .await;
+    let root_a = write_tree(
+        store,
+        RepoPath::root(),
+        vec![("sub", TreeValue::Tree(sub_a))],
+    )
+    .await;
+    let root_b = write_tree(
+        store,
+        RepoPath::root(),
+        vec![("sub", TreeValue::Tree(sub_b))],
+    )
+    .await;
+    let first = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::resolved(root_a),
+        Merge::resolved(String::new()),
+        33,
+    )
+    .await;
+    let second = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::resolved(root_b),
+        Merge::resolved(String::new()),
+        34,
+    )
+    .await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let exported = projection
+        .export_reachable(
+            store,
+            &[first.clone(), second.clone()],
+            &mut ExportMappings::default(),
+        )
+        .await
+        .unwrap();
+    let mapped = exported
+        .new_mappings
+        .iter()
+        .map(|row| (row.canonical_id.clone(), row.git_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert!(
+        projected_value(&projection, &mapped[&first], "sub/payload/secret-a")
+            .await
+            .is_none()
+    );
+    assert!(
+        projected_value(&projection, &mapped[&first], "sub/payload/secret-b")
+            .await
+            .is_some()
+    );
+    assert!(
+        projected_value(&projection, &mapped[&second], "sub/payload/secret-a")
+            .await
+            .is_some()
+    );
+    assert!(
+        projected_value(&projection, &mapped[&second], "sub/payload/secret-b")
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -550,7 +987,11 @@ async fn directory_at_dsprivate_fails_closed_with_the_commit_id() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, ProjectionError::InvalidDsprivateEntry(id) if id == head));
+    assert!(matches!(
+        error,
+        ProjectionError::InvalidDsprivateEntry { commit_id, path: policy_path }
+            if commit_id == head && policy_path == path(".dsprivate")
+    ));
 }
 
 #[tokio::test]
@@ -630,6 +1071,92 @@ async fn full_tree_scan_finds_a_planted_public_leak() {
             .await
             .unwrap(),
         [path(".dsprivate"), path("secrets/.env")]
+    );
+}
+
+#[tokio::test]
+async fn full_tree_scan_uses_nested_canonical_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = settings();
+    let repository = MachineRepository::init(temp.path().join("native"), &settings)
+        .await
+        .unwrap();
+    let store = repository.repo().store();
+    let canonical_sub = write_tree(
+        store,
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![
+            (
+                ".dsprivate",
+                write_file(store, &path("sub/.dsprivate"), b"secret\n").await,
+            ),
+            (
+                "secret",
+                write_file(store, &path("sub/secret"), b"private").await,
+            ),
+        ],
+    )
+    .await;
+    let canonical_root = write_tree(
+        store,
+        RepoPath::root(),
+        vec![("sub", TreeValue::Tree(canonical_sub))],
+    )
+    .await;
+    let canonical = write_commit(
+        store,
+        store.root_commit_id().clone(),
+        Merge::resolved(canonical_root),
+        Merge::resolved(String::new()),
+        41,
+    )
+    .await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let hidden_set = projection
+        .hidden_set_for_commit(store, &canonical)
+        .await
+        .unwrap();
+    let public_sub = write_tree(
+        projection.store(),
+        RepoPath::from_internal_string("sub").unwrap(),
+        vec![
+            (
+                ".dsprivate",
+                write_file(
+                    projection.store(),
+                    &path("sub/.dsprivate"),
+                    b"planted policy",
+                )
+                .await,
+            ),
+            (
+                "secret",
+                write_file(projection.store(), &path("sub/secret"), b"planted").await,
+            ),
+        ],
+    )
+    .await;
+    let public_root = write_tree(
+        projection.store(),
+        RepoPath::root(),
+        vec![("sub", TreeValue::Tree(public_sub))],
+    )
+    .await;
+    let public = write_commit(
+        projection.store(),
+        projection.store().root_commit_id().clone(),
+        Merge::resolved(public_root),
+        Merge::resolved(String::new()),
+        42,
+    )
+    .await;
+
+    assert_eq!(
+        projection
+            .scan_hidden_paths(&public, &hidden_set)
+            .await
+            .unwrap(),
+        [path("sub/.dsprivate"), path("sub/secret")]
     );
 }
 

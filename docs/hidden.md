@@ -6,14 +6,16 @@ consumers, not from the machine owner or the cloud authority.
 
 ## Policy model
 
-The hidden set is per-commit content. A file named `.dsprivate` at the repository
-root contains gitignore patterns. It is part of each commit's tree, so the
-hidden set branches, merges and conflicts through ordinary jj machinery, and
-every descendant inherits its parent's set until a commit changes it. Nested
-`.dsprivate` files are ordinary content and may themselves match the root policy.
+The hidden set is per-commit content. A `.dsprivate` file in any directory
+contains gitignore patterns anchored at that directory. Files are chained from
+the repository root down: deeper files override shallower files through
+ordinary last-match-wins gitignore semantics. The files are part of each
+commit's tree, so the hidden set branches, merges and conflicts through
+ordinary jj machinery, and every descendant inherits its parent's set until a
+commit changes it.
 
-`.dsprivate` is itself always hidden. This rule is fixed and not expressed inside
-the file.
+Every `.dsprivate` file is always hidden, at every depth. This rule is fixed and
+not expressed inside the files.
 
 Patterns use the semantics of jj-lib's `GitIgnoreFile`, backed by gix-ignore.
 Anchoring, `*`, `**`, directory patterns, negation, comments, blank lines and
@@ -22,11 +24,14 @@ handling. Directories are hideable. An excluded directory is pruned without
 descent, so a later negation cannot re-include a child beneath it. Gitignore
 syntax has no parse-error state.
 
-The hidden-set identity is the `FileId` of the root `.dsprivate` blob, or `None`
-when the commit has no `.dsprivate`. A conflicted `.dsprivate`, or a root `.dsprivate`
-entry that is not a regular file, fails export closed for that commit. The
-executable bit is allowed. Nothing is projected until the conflict or entry
-type is repaired.
+The hidden-set identity is `None` when the commit contains no `.dsprivate`
+files. Otherwise it is BLAKE2b-512 over this canonical byte encoding:
+`devspace-hidden-set-v1`, followed by every `.dsprivate` in repository-path
+byte order; each entry is its path byte length as an unsigned 64-bit
+little-endian integer, its UTF-8 repository-path bytes, then its 64-byte blob
+`FileId`. A conflicted `.dsprivate`, or a `.dsprivate` entry that is not a
+regular file, fails export closed for that commit. The executable bit is
+allowed. Nothing is projected until the conflict or entry type is repaired.
 
 There is no repository-level policy registry, no policy epoch and no
 cloud-synchronous policy mutation. Changing the hidden set is an ordinary
@@ -34,11 +39,16 @@ commit, serialized and replicated like any other.
 
 ## User contract
 
-Edit the root `.dsprivate` file to change the hidden set. Every snapshot in a
-Devspace checkout force-tracks `.dsprivate` itself and all working-copy files its
-current contents match, including files beneath matched directories. An
-existing gitignored secret therefore becomes canonical as soon as its pattern
-is present for the next ordinary command or explicit snapshot.
+Edit the applicable `.dsprivate` file to change the hidden set. Every snapshot
+in a Devspace checkout discovers `.dsprivate` files top-down, chains each file
+at its directory, and force-tracks every discovered policy file and matching
+working-copy path, including files beneath matched directories. Discovery does
+not descend into a directory already hidden by the chained private matcher;
+the directory match force-tracks everything below it. It also does not descend
+into a gitignored directory unless that directory is privately matched. Root
+`.jj` and `.git` directories are skipped. An existing gitignored secret
+therefore becomes canonical as soon as an applicable pattern is present for
+the next ordinary command or explicit snapshot.
 
 `.dsprivate` is not an ignore file: matching a path versions it privately and
 hides it from Git. Keep hidden paths covered by gitignore as well so plain-Git
@@ -52,16 +62,20 @@ Git publication from descendants of that commit.
 
 ## Projection
 
-Export resolves each commit's matcher from that commit's root `.dsprivate` and
-caches matchers by `FileId`. `.dsprivate` itself is always excluded. Matching
-files and symlinks are removed before their objects are read into Git
+Export resolves and validates every `.dsprivate` in each commit. As the tree
+walk enters a directory, it chains that directory's policy before filtering
+the directory entries. Policy blob reads are cached by `FileId`; copied
+subtrees are cached by their source tree, path and the digest of the ordered
+policy chain active at that directory. Every `.dsprivate` is excluded.
+Matching files and symlinks are removed before their objects are read into Git
 (filter-before-read); matching directories are pruned without descent;
 directories made empty by filtering are omitted. Before push, the projected
-tree is walked in full under the canonical head's matcher and any matching
-path or root `.dsprivate` is reported as a leak. Export fails closed on any
-conflict in an exported commit. Exporting around an unresolved hidden conflict
-would silently publish a deletion of the public side, a public effect nobody
-chose, so publication always waits for an explicit resolution.
+tree is walked in full under the complete prefix-aware matcher resolved from
+the canonical head, and any matching path or `.dsprivate` is reported as a
+leak. Export fails closed on any conflict in an exported commit. Exporting
+around an unresolved hidden conflict would silently publish a deletion of the
+public side, a public effect nobody chose, so publication always waits for an
+explicit resolution.
 
 Changing the hidden set does not rewrite existing Git history. Hiding an
 already-published path makes the next public commit delete it; older public
@@ -70,7 +84,7 @@ commits keep the bytes they published.
 ## Journal binding
 
 Projection states bind each published Git object to one private canonical
-commit and the identity of the `.dsprivate` blob under which it was exported.
+commit and the identity of the hidden set under which it was exported.
 Fetch interprets a seed under the hidden set recorded by its exact state; when
 ancestry reaches a Git object recorded through several bookmarks, the newest
 state per bookmark must agree on one private commit and hidden-set identity,

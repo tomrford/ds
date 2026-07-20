@@ -155,6 +155,57 @@ async fn ordinary_snapshot_tracks_files_beneath_hidden_directory() {
 }
 
 #[tokio::test]
+async fn nested_dsprivate_tracks_itself_and_a_gitignored_secret() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    let checkout = checkout(temp.path(), &config, "nested-hidden-file").await;
+    fs::write(
+        checkout.join(".gitignore"),
+        "sub/.dsprivate\nsub/secret.env\n",
+    )
+    .unwrap();
+    fs::create_dir(checkout.join("sub")).unwrap();
+    fs::write(checkout.join("sub/.dsprivate"), "secret.env\n").unwrap();
+    fs::write(checkout.join("sub/secret.env"), "private\n").unwrap();
+
+    let tracked = ds(
+        &checkout,
+        &config,
+        &["file", "list", "sub/.dsprivate", "sub/secret.env"],
+    );
+    assert!(tracked.status.success(), "{}", stderr(&tracked));
+    assert_eq!(stdout(&tracked), "sub/.dsprivate\nsub/secret.env\n");
+}
+
+#[tokio::test]
+async fn gitignored_directory_is_not_searched_for_nested_dsprivate() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    let checkout = checkout(temp.path(), &config, "ignored-policy-directory").await;
+    fs::write(checkout.join(".gitignore"), "node_modules/\n").unwrap();
+    fs::create_dir(checkout.join("node_modules")).unwrap();
+    fs::write(
+        checkout.join("node_modules/.dsprivate"),
+        "generated-secret\n",
+    )
+    .unwrap();
+    fs::write(checkout.join("node_modules/generated-secret"), "private\n").unwrap();
+
+    let untracked = ds(
+        &checkout,
+        &config,
+        &[
+            "file",
+            "list",
+            "node_modules/.dsprivate",
+            "node_modules/generated-secret",
+        ],
+    );
+    assert!(untracked.status.success(), "{}", stderr(&untracked));
+    assert_eq!(stdout(&untracked), "");
+}
+
+#[tokio::test]
 async fn removing_hidden_pattern_keeps_file_tracked() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());

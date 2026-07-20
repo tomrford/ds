@@ -222,13 +222,13 @@ pass. Killing the daemon cannot remove native operations or its durable sync
 sidecar; restart drains the surviving work under the same per-repository lock.
 
 `GitProjection` translates between the native store and a rebuildable bare-Git
-sidecar. Each commit's root `.dsprivate` applies gitignore semantics before
-excluded leaves are read, and Git links fail before native tree encoding. The
-Durable Object journals immutable Git receipts, quarantined projection states
-that bind each mapping to its hidden-set identity, exact ref cursors and fenced
-pending batches. A second machine can recover a remote ref move after the first
-machine omits finalisation, then rebuild an empty sidecar from cloud objects
-and accepted mappings.
+sidecar. Root and nested `.dsprivate` files form a per-directory gitignore chain
+before excluded leaves are read, and Git links fail before native tree
+encoding. The Durable Object journals immutable Git receipts, quarantined
+projection states that bind each mapping to its hidden-set identity, exact ref
+cursors and fenced pending batches. A second machine can recover a remote ref
+move after the first machine omits finalisation, then rebuild an empty sidecar
+from cloud objects and accepted mappings.
 
 The warm local repository-open wrapper measures 1.297 to 1.300 times stock jj in
 the release-only probe against a 64-operation fixture repository and cannot

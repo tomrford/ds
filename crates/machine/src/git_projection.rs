@@ -3,7 +3,7 @@
 //! The sidecar contains only public Git objects. Canonical jj objects and all
 //! durable projection receipts remain outside it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fs;
 use std::future::Future;
@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use blake2::{Blake2b512, Digest as _};
 use jj_lib::backend::{
     Commit as BackendCommit, CommitId, CopyId, FileId, SymlinkId, Tree as BackendTree, TreeId,
     TreeValue,
@@ -119,18 +120,19 @@ fn record_mapping(
     Ok(true)
 }
 
+const HIDDEN_SET_DOMAIN: &[u8] = b"devspace-hidden-set-v1";
+const HIDDEN_CHAIN_DOMAIN: &[u8] = b"devspace-hidden-chain-v1";
+
+/// Canonical identity of every `.dsprivate` path and blob in a commit.
+///
+/// The projection journal binds a public object to the identity of the hidden
+/// set under which it was exported.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct HiddenSetIdentity(Option<FileId>);
+pub struct HiddenSetIdentity(Option<[u8; 64]>);
 
 impl HiddenSetIdentity {
-    pub fn file_id(&self) -> Option<&FileId> {
-        self.0.as_ref()
-    }
-
     pub fn to_projection_id(&self) -> Option<[u8; 64]> {
         self.0
-            .as_ref()
-            .map(|id| id.as_bytes().try_into().expect("FileId is 64 bytes"))
     }
 }
 
@@ -138,11 +140,69 @@ impl HiddenSetIdentity {
 pub struct HiddenSet {
     identity: HiddenSetIdentity,
     matcher: Arc<GitIgnoreFile>,
+    files: BTreeMap<RepoPathBuf, FileId>,
 }
 
 impl HiddenSet {
     pub fn identity(&self) -> &HiddenSetIdentity {
         &self.identity
+    }
+}
+
+#[derive(Default)]
+struct HiddenSetCache {
+    blobs: BTreeMap<FileId, Arc<Vec<u8>>>,
+    trees: BTreeMap<TreeId, Arc<Vec<RepoPathBuf>>>,
+}
+
+#[derive(Default)]
+struct TranslationCache {
+    hidden_sets: HiddenSetCache,
+    trees: BTreeMap<(HiddenChainIdentity, RepoPathBuf, TreeId), TreeId>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct HiddenChainIdentity([u8; 64]);
+
+#[derive(Clone)]
+struct HiddenChain {
+    identity: HiddenChainIdentity,
+    hasher: Blake2b512,
+    matcher: Arc<GitIgnoreFile>,
+}
+
+struct TreeCopyContext<'a> {
+    source: &'a Arc<Store>,
+    target: &'a Arc<Store>,
+    hidden_set: Option<&'a HiddenSet>,
+    direction: TranslationDirection,
+}
+
+impl HiddenChain {
+    fn empty() -> Self {
+        let mut hasher = Blake2b512::new();
+        hasher.update(HIDDEN_CHAIN_DOMAIN);
+        let identity = HiddenChainIdentity(hasher.clone().finalize().into());
+        Self {
+            identity,
+            hasher,
+            matcher: GitIgnoreFile::empty(),
+        }
+    }
+
+    fn chain(&self, prefix: &RepoPath, id: &FileId, bytes: &[u8]) -> Self {
+        let mut hasher = self.hasher.clone();
+        hash_hidden_file(&mut hasher, prefix, id);
+        let identity = HiddenChainIdentity(hasher.clone().finalize().into());
+        let matcher = self
+            .matcher
+            .chain(prefix, Path::new(DSPRIVATE), bytes)
+            .expect("in-memory gitignore patterns have no parse errors");
+        Self {
+            identity,
+            hasher,
+            matcher,
+        }
     }
 }
 
@@ -290,7 +350,7 @@ impl GitProjection {
             canonical_store,
             canonical_id,
             &canonical,
-            &mut BTreeMap::new(),
+            &mut HiddenSetCache::default(),
         )
         .await
     }
@@ -332,8 +392,7 @@ async fn translate_reachable(
 ) -> Result<TranslationResult, ProjectionError> {
     let mut states = BTreeMap::<CommitId, bool>::new();
     let mut commits = BTreeMap::<CommitId, BackendCommit>::new();
-    let mut tree_cache = BTreeMap::<(HiddenSetIdentity, RepoPathBuf, TreeId), TreeId>::new();
-    let mut matcher_cache = BTreeMap::<FileId, Arc<GitIgnoreFile>>::new();
+    let mut cache = TranslationCache::default();
     let mut new_pairs = Vec::new();
     let mut reached_pairs = BTreeMap::new();
 
@@ -355,7 +414,7 @@ async fn translate_reachable(
                                         source,
                                         &source_id,
                                         &source_commit,
-                                        &mut matcher_cache,
+                                        &mut cache.hidden_sets,
                                     )
                                     .await?;
                                     if source_commit.root_tree.as_resolved().is_none() {
@@ -412,7 +471,7 @@ async fn translate_reachable(
                                 source,
                                 &source_id,
                                 &source_commit,
-                                &mut matcher_cache,
+                                &mut cache.hidden_sets,
                             )
                             .await?,
                         ),
@@ -422,14 +481,18 @@ async fn translate_reachable(
                         .root_tree
                         .as_resolved()
                         .ok_or_else(|| ProjectionError::ConflictedCommit(source_id.clone()))?;
-                    let target_tree_id = copy_tree(
+                    let context = TreeCopyContext {
                         source,
                         target,
+                        hidden_set: hidden_set.as_ref(),
+                        direction,
+                    };
+                    let target_tree_id = copy_tree(
+                        &context,
                         RepoPath::root(),
                         source_tree_id,
-                        hidden_set.as_ref(),
-                        &mut tree_cache,
-                        direction,
+                        &HiddenChain::empty(),
+                        &mut cache,
                     )
                     .await?;
                     let target_commit = BackendCommit {
@@ -502,7 +565,7 @@ fn scan_tree<'a>(
         let tree = store.get_tree(path.to_owned(), tree_id).await?;
         for entry in tree.entries_non_recursive() {
             let entry_path = path.join(entry.name());
-            if is_root_dsprivate(path, entry.name()) {
+            if is_dsprivate(entry.name()) {
                 leaked.push(entry_path);
                 continue;
             }
@@ -588,41 +651,53 @@ impl LeafCopy {
 }
 
 fn copy_tree<'a>(
-    source: &'a Arc<Store>,
-    target: &'a Arc<Store>,
+    context: &'a TreeCopyContext<'a>,
     path: &'a RepoPath,
     source_tree_id: &'a TreeId,
-    hidden_set: Option<&'a HiddenSet>,
-    cache: &'a mut BTreeMap<(HiddenSetIdentity, RepoPathBuf, TreeId), TreeId>,
-    direction: TranslationDirection,
+    inherited_chain: &'a HiddenChain,
+    cache: &'a mut TranslationCache,
 ) -> Pin<Box<dyn Future<Output = Result<TreeId, ProjectionError>> + 'a>> {
     Box::pin(async move {
-        if source_tree_id == source.empty_tree_id() {
-            return Ok(target.empty_tree_id().clone());
+        if source_tree_id == context.source.empty_tree_id() {
+            return Ok(context.target.empty_tree_id().clone());
+        }
+
+        let source_tree = context
+            .source
+            .get_tree(path.to_owned(), source_tree_id)
+            .await?;
+        let mut chain = inherited_chain.clone();
+        if let Some(hidden_set) = context.hidden_set {
+            let dsprivate_path = path.join(
+                &RepoPathComponentBuf::new(DSPRIVATE.to_owned())
+                    .expect(".dsprivate is a valid path component"),
+            );
+            if let Some(id) = hidden_set.files.get(&dsprivate_path) {
+                let bytes = cache
+                    .hidden_sets
+                    .blobs
+                    .get(id)
+                    .expect("hidden-set resolution caches every policy blob");
+                chain = chain.chain(path, id, bytes);
+            }
         }
         let cache_key = (
-            hidden_set
-                .map(|hidden_set| hidden_set.identity.clone())
-                .unwrap_or(HiddenSetIdentity(None)),
+            chain.identity.clone(),
             path.to_owned(),
             source_tree_id.clone(),
         );
-        if let Some(target_tree_id) = cache.get(&cache_key) {
+        if let Some(target_tree_id) = cache.trees.get(&cache_key) {
             return Ok(target_tree_id.clone());
         }
 
-        let source_tree = source.get_tree(path.to_owned(), source_tree_id).await?;
         let mut target_entries = Vec::new();
         let mut leaf_copies = Vec::new();
         for entry in source_tree.entries_non_recursive() {
             let entry_path = path.join(entry.name());
-            if let Some(hidden_set) = hidden_set {
+            if context.hidden_set.is_some() {
                 let excluded = match entry.value() {
-                    TreeValue::Tree(_) => hidden_set.matcher.matches_dir(&entry_path),
-                    _ => {
-                        is_root_dsprivate(path, entry.name())
-                            || hidden_set.matcher.matches_file(&entry_path)
-                    }
+                    TreeValue::Tree(_) => chain.matcher.matches_dir(&entry_path),
+                    _ => is_dsprivate(entry.name()) || chain.matcher.matches_file(&entry_path),
                 };
                 if excluded {
                     continue;
@@ -651,17 +726,8 @@ fn copy_tree<'a>(
                     continue;
                 }
                 TreeValue::Tree(id) => {
-                    let target_id = copy_tree(
-                        source,
-                        target,
-                        &entry_path,
-                        id,
-                        hidden_set,
-                        cache,
-                        direction,
-                    )
-                    .await?;
-                    if target_id == *target.empty_tree_id() {
+                    let target_id = copy_tree(context, &entry_path, id, &chain, cache).await?;
+                    if target_id == *context.target.empty_tree_id() {
                         continue;
                     }
                     TreeValue::Tree(target_id)
@@ -669,21 +735,22 @@ fn copy_tree<'a>(
                 TreeValue::GitSubmodule(_) => {
                     return Err(ProjectionError::GitLink {
                         path: entry_path,
-                        operation: direction.label(),
+                        operation: context.direction.label(),
                     });
                 }
             };
             target_entries.push((entry.name().to_owned(), target_value));
         }
         for leaf in leaf_copies {
-            target_entries.push(leaf.copy(source, target).await?);
+            target_entries.push(leaf.copy(context.source, context.target).await?);
         }
         target_entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        let target_tree = target
+        let target_tree = context
+            .target
             .write_tree(path, BackendTree::from_sorted_entries(target_entries))
             .await?;
         let target_tree_id = target_tree.id().clone();
-        cache.insert(cache_key, target_tree_id.clone());
+        cache.trees.insert(cache_key, target_tree_id.clone());
         Ok(target_tree_id)
     })
 }
@@ -692,55 +759,161 @@ async fn resolve_hidden_set(
     store: &Arc<Store>,
     commit_id: &CommitId,
     commit: &BackendCommit,
-    cache: &mut BTreeMap<FileId, Arc<GitIgnoreFile>>,
+    cache: &mut HiddenSetCache,
 ) -> Result<HiddenSet, ProjectionError> {
     let merged_tree = MergedTree::new(
         store.clone(),
         commit.root_tree.clone(),
         ConflictLabels::from_merge(commit.conflict_labels.clone()),
     );
-    let dsprivate_path =
-        RepoPath::from_internal_string(DSPRIVATE).expect(".dsprivate is a repository path");
-    let value = merged_tree
-        .path_value(dsprivate_path)
-        .await?
-        .into_resolved()
-        .map_err(|_| ProjectionError::ConflictedDsprivate(commit_id.clone()))?;
-    let Some(value) = value else {
-        return Ok(HiddenSet {
-            identity: HiddenSetIdentity(None),
-            matcher: GitIgnoreFile::empty(),
-        });
-    };
-    let TreeValue::File { id, .. } = value else {
-        return Err(ProjectionError::InvalidDsprivateEntry(commit_id.clone()));
-    };
-    if let Some(matcher) = cache.get(&id) {
-        return Ok(HiddenSet {
-            identity: HiddenSetIdentity(Some(id)),
-            matcher: matcher.clone(),
-        });
+    let mut candidate_paths = BTreeSet::new();
+    for tree_id in commit.root_tree.iter() {
+        for path in
+            collect_dsprivate_paths(store, RepoPath::root(), tree_id, &mut cache.trees).await?
+        {
+            candidate_paths.insert(path);
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    for path in &candidate_paths {
+        let value = merged_tree
+            .path_value(path)
+            .await?
+            .into_resolved()
+            .map_err(|_| ProjectionError::ConflictedDsprivate {
+                commit_id: commit_id.clone(),
+                path: path.clone(),
+            })?;
+        let Some(TreeValue::File { id, .. }) = value else {
+            return Err(ProjectionError::InvalidDsprivateEntry {
+                commit_id: commit_id.clone(),
+                path: path.clone(),
+            });
+        };
+        files.insert(path.clone(), id);
+    }
+
+    let mut matcher = GitIgnoreFile::empty();
+    for (path, id) in &files {
+        let bytes = read_hidden_blob(store, path, id, &mut cache.blobs, commit_id).await?;
+        matcher = matcher
+            .chain(
+                path.parent().expect(".dsprivate has a parent directory"),
+                Path::new(DSPRIVATE),
+                &bytes,
+            )
+            .expect("in-memory gitignore patterns have no parse errors");
+    }
+    Ok(HiddenSet {
+        identity: hidden_set_identity(&files),
+        matcher,
+        files,
+    })
+}
+
+fn collect_dsprivate_paths<'a>(
+    store: &'a Arc<Store>,
+    path: &'a RepoPath,
+    tree_id: &'a TreeId,
+    cache: &'a mut BTreeMap<TreeId, Arc<Vec<RepoPathBuf>>>,
+) -> Pin<Box<dyn Future<Output = Result<Vec<RepoPathBuf>, ProjectionError>> + 'a>> {
+    Box::pin(async move {
+        if let Some(relative_paths) = cache.get(tree_id) {
+            return Ok(relative_paths
+                .iter()
+                .map(|relative| join_repo_paths(path, relative))
+                .collect());
+        }
+        let tree = store.get_tree(path.to_owned(), tree_id).await?;
+        let mut relative_paths = Vec::new();
+        for entry in tree.entries_non_recursive() {
+            let relative = RepoPathBuf::from_internal_string(entry.name().as_internal_str())
+                .expect("tree entry name is a repository path");
+            if is_dsprivate(entry.name()) {
+                relative_paths.push(relative);
+            } else if let TreeValue::Tree(child_id) = entry.value() {
+                let child_path = path.join(entry.name());
+                for child_relative in
+                    collect_dsprivate_paths(store, &child_path, child_id, cache).await?
+                {
+                    let child_relative = child_relative
+                        .strip_prefix(&child_path)
+                        .expect("child path is beneath its directory");
+                    relative_paths.push(join_repo_paths(&relative, child_relative));
+                }
+            }
+        }
+        relative_paths.sort_unstable();
+        let relative_paths = Arc::new(relative_paths);
+        cache.insert(tree_id.clone(), relative_paths.clone());
+        Ok(relative_paths
+            .iter()
+            .map(|relative| join_repo_paths(path, relative))
+            .collect())
+    })
+}
+
+async fn read_hidden_blob(
+    store: &Arc<Store>,
+    path: &RepoPath,
+    id: &FileId,
+    cache: &mut BTreeMap<FileId, Arc<Vec<u8>>>,
+    commit_id: &CommitId,
+) -> Result<Arc<Vec<u8>>, ProjectionError> {
+    if let Some(bytes) = cache.get(id) {
+        return Ok(bytes.clone());
     }
     let mut bytes = Vec::new();
-    let contents = store.read_file(dsprivate_path, &id).await?;
+    let contents = store.read_file(path, id).await?;
     jj_lib::file_util::copy_async_to_sync(contents, &mut bytes)
         .await
         .map_err(|source| ProjectionError::ReadDsprivate {
             commit_id: commit_id.clone(),
+            path: path.to_owned(),
             source,
         })?;
-    let matcher = GitIgnoreFile::empty()
-        .chain(RepoPath::root(), Path::new(DSPRIVATE), &bytes)
-        .expect("in-memory gitignore patterns have no parse errors");
-    cache.insert(id.clone(), matcher.clone());
-    Ok(HiddenSet {
-        identity: HiddenSetIdentity(Some(id)),
-        matcher,
-    })
+    let bytes = Arc::new(bytes);
+    cache.insert(id.clone(), bytes.clone());
+    Ok(bytes)
 }
 
-fn is_root_dsprivate(path: &RepoPath, name: &jj_lib::repo_path::RepoPathComponent) -> bool {
-    path.is_root() && name.as_internal_str() == DSPRIVATE
+fn hidden_set_identity(files: &BTreeMap<RepoPathBuf, FileId>) -> HiddenSetIdentity {
+    if files.is_empty() {
+        return HiddenSetIdentity(None);
+    }
+    let mut hasher = Blake2b512::new();
+    hasher.update(HIDDEN_SET_DOMAIN);
+    for (path, id) in files {
+        hash_hidden_file(&mut hasher, path, id);
+    }
+    HiddenSetIdentity(Some(hasher.finalize().into()))
+}
+
+fn hash_hidden_file(hasher: &mut Blake2b512, path: &RepoPath, id: &FileId) {
+    let path = path.as_internal_file_string();
+    hasher.update((path.len() as u64).to_le_bytes());
+    hasher.update(path.as_bytes());
+    hasher.update(id.as_bytes());
+}
+
+fn join_repo_paths(prefix: &RepoPath, suffix: &RepoPath) -> RepoPathBuf {
+    if prefix.is_root() {
+        return suffix.to_owned();
+    }
+    if suffix.is_root() {
+        return prefix.to_owned();
+    }
+    RepoPathBuf::from_internal_string(format!(
+        "{}/{}",
+        prefix.as_internal_file_string(),
+        suffix.as_internal_file_string()
+    ))
+    .expect("joined repository paths are valid")
+}
+
+fn is_dsprivate(name: &jj_lib::repo_path::RepoPathComponent) -> bool {
+    name.as_internal_str() == DSPRIVATE
 }
 
 #[derive(Debug, Error)]
@@ -770,13 +943,20 @@ pub enum ProjectionError {
     ConflictedCommit(CommitId),
     #[error("cannot inspect conflicted projected commit {0}")]
     ConflictedProjectedCommit(CommitId),
-    #[error("cannot export commit {0}: .dsprivate is conflicted")]
-    ConflictedDsprivate(CommitId),
-    #[error("cannot export commit {0}: .dsprivate is not a regular file")]
-    InvalidDsprivateEntry(CommitId),
-    #[error("cannot read .dsprivate in commit {commit_id}")]
+    #[error("cannot export commit {commit_id}: {path:?} is conflicted")]
+    ConflictedDsprivate {
+        commit_id: CommitId,
+        path: RepoPathBuf,
+    },
+    #[error("cannot export commit {commit_id}: {path:?} is not a regular file")]
+    InvalidDsprivateEntry {
+        commit_id: CommitId,
+        path: RepoPathBuf,
+    },
+    #[error("cannot read {path:?} in commit {commit_id}")]
     ReadDsprivate {
         commit_id: CommitId,
+        path: RepoPathBuf,
         #[source]
         source: std::io::Error,
     },
@@ -850,5 +1030,29 @@ mod tests {
         assert!(!syntax.matches_file(repo_path("comment")));
         assert!(syntax.matches_file(repo_path("#literal")));
         assert!(syntax.matches_file(repo_path("!literal")));
+    }
+
+    #[test]
+    fn hidden_set_identity_encoding_is_canonical() {
+        let files = BTreeMap::from([
+            (
+                RepoPathBuf::from_internal_string(".dsprivate").unwrap(),
+                FileId::new(vec![0x11; 64]),
+            ),
+            (
+                RepoPathBuf::from_internal_string("sub/.dsprivate").unwrap(),
+                FileId::new(vec![0x22; 64]),
+            ),
+        ]);
+        let digest = hidden_set_identity(&files).to_projection_id().unwrap();
+        let hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            "4896563e1c9edb27e10b76091cf6b552541340818fbc2ce3d04d3674e8b9e4a8\
+             ee60ce371af0bac792c3dc9bac6a506fca7973252e1439f7baeb1c5a5552cfbd"
+        );
     }
 }

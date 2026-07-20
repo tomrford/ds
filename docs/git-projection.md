@@ -13,12 +13,12 @@ repository Durable Object:
 `GitProjection` owns a rebuildable bare-Git sidecar backed by jj's Git backend.
 It translates commits between a stock native `SimpleBackend` store and Git
 without making the sidecar authoritative. Export resolves each commit's root
-`.dsprivate` blob as a gitignore matcher, caches matchers by `FileId`, prunes
-matching directories without descent and filters matching leaves before
-reading them. The root `.dsprivate` is always excluded. Export rejects conflicts,
-non-file root `.dsprivate` entries and Git links with typed errors. Import is
-unfiltered and rejects Git links before asking the simple backend to encode a
-tree.
+and nested `.dsprivate` files as a prefix-aware gitignore chain, caches policy
+blobs by `FileId`, prunes matching directories without descent and filters
+matching leaves before reading them. Every `.dsprivate` is always excluded.
+Export rejects conflicts, non-file `.dsprivate` entries and Git links with
+typed errors. Import is unfiltered and rejects Git links before asking the
+simple backend to encode a tree.
 
 Translation receipts are external inputs and outputs. The adapter accepts
 durable canonical-to-Git or Git-to-public mappings, reuses consistent rows and
@@ -71,11 +71,12 @@ ancestry and a durable projection state first.
 
 ## Verification
 
-The normal Rust tests pin the gitignore matcher behavior, resolve different
-`.dsprivate` blobs across one history walk, prove filtering before leaf reads,
-scan every blob in a fresh sidecar for binary private sentinels, rebuild a
-deleted sidecar from durable mapping rows, and reject a Git link without
-changing the native operation head.
+The normal Rust tests pin nested gitignore chaining and the canonical
+hidden-set digest, resolve different policy sets across one history walk,
+partition shared-subtree caches by the active policy chain, prove filtering
+before leaf reads, scan every blob in a fresh sidecar for binary private
+sentinels, rebuild a deleted sidecar from durable mapping rows, and reject a
+Git link without changing the native operation head.
 
 Workers Vitest exercises the authenticated HTTP routes and real SQLite-backed
 Durable Object. It covers nullable and concrete hidden-set identities through
