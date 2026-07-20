@@ -17,7 +17,9 @@ use jj_lib::ref_name::RefName;
 use jj_lib::repo::Repo as _;
 
 use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
-use crate::sync::{SyncRun, run_sync_entry};
+use crate::sync::{LockedSyncRun, run_sync_entry_locked};
+
+use super::projection_sidecar::open_or_create_projection;
 
 const FAILPOINT_ENV: &str = "DEVSPACE_FAILPOINT";
 const AFTER_PUSH_FAILPOINT: &str = "after_git_push_before_finalize";
@@ -100,16 +102,16 @@ pub(super) async fn push_bookmarks(
     }
     drop(workspace);
 
-    match run_sync_entry(&store, &entry, command.settings()).await {
-        Ok(SyncRun::Completed) => {}
-        Ok(SyncRun::AlreadyLocked) => {
+    let sync_guard = match run_sync_entry_locked(&store, &entry, command.settings()).await {
+        Ok(LockedSyncRun::Completed(guard)) => guard,
+        Ok(LockedSyncRun::AlreadyLocked) => {
             return Err(user_error(format!(
                 "Repository `{}` is already being synchronized; retry the push after it finishes.",
                 entry.name
             )));
         }
         Err(error) => return Err(user_error(error)),
-    }
+    };
 
     let repository = MachineRepository::open(&entry.native_repository_path, command.settings())
         .await
@@ -126,10 +128,17 @@ pub(super) async fn push_bookmarks(
     let http_transport =
         HttpTransport::new(&config, entry.identity.repository_id.as_str(), incarnation)
             .map_err(display_error)?;
-    let projection = open_or_create_projection(
+    let (projection, rebuilt_projection) = open_or_create_projection(
         &store.repository_projection_path(&entry.identity),
         command.settings(),
-    )?;
+    )
+    .map_err(user_error)?;
+    if rebuilt_projection {
+        writeln!(
+            ui.warning_default(),
+            "Rebuilt the local Git projection sidecar after it failed validation."
+        )?;
+    }
     let runtime = cloud_runtime()?;
     let lines = runtime
         .block_on(push_with_cloud(
@@ -147,18 +156,8 @@ pub(super) async fn push_bookmarks(
     for line in lines {
         writeln!(ui.status(), "{line}")?;
     }
+    drop(sync_guard);
     Ok(())
-}
-
-fn open_or_create_projection(
-    path: &std::path::Path,
-    settings: &jj_lib::settings::UserSettings,
-) -> Result<GitProjection, CommandError> {
-    if path.join("store").is_dir() {
-        GitProjection::open(path, settings).map_err(display_error)
-    } else {
-        GitProjection::init(path, settings).map_err(display_error)
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

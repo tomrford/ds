@@ -4,7 +4,8 @@ use std::path::Path;
 
 use devspace_machine::{
     CatalogEntry, HttpTransport, MachineConfig, MachineRepository, MachineStore, MachineStoreError,
-    MachineSyncStore, RepositoryIdentity, RepositoryName, SyncEngine, SyncEngineError,
+    MachineSyncStore, RepositoryIdentity, RepositoryName, RepositorySyncGuard, SyncEngine,
+    SyncEngineError,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -79,11 +80,27 @@ pub(crate) enum SyncRun {
     AlreadyLocked,
 }
 
+pub(crate) enum LockedSyncRun {
+    Completed(RepositorySyncGuard),
+    AlreadyLocked,
+}
+
 pub(crate) async fn run_sync_entry(
     store: &MachineStore,
     entry: &CatalogEntry,
     settings: &UserSettings,
 ) -> Result<SyncRun, String> {
+    match run_sync_entry_locked(store, entry, settings).await? {
+        LockedSyncRun::Completed(_guard) => Ok(SyncRun::Completed),
+        LockedSyncRun::AlreadyLocked => Ok(SyncRun::AlreadyLocked),
+    }
+}
+
+pub(crate) async fn run_sync_entry_locked(
+    store: &MachineStore,
+    entry: &CatalogEntry,
+    settings: &UserSettings,
+) -> Result<LockedSyncRun, String> {
     let name = &entry.name;
     if !entry.native_repository_path.exists() {
         return Err(format!(
@@ -96,10 +113,10 @@ pub(crate) async fn run_sync_entry(
         ));
     }
 
-    let _guard = match store.try_lock_repository_sync(&entry.identity) {
+    let guard = match store.try_lock_repository_sync(&entry.identity) {
         Ok(guard) => guard,
         Err(MachineStoreError::RepositorySyncAlreadyLocked { .. }) => {
-            return Ok(SyncRun::AlreadyLocked);
+            return Ok(LockedSyncRun::AlreadyLocked);
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -114,7 +131,7 @@ pub(crate) async fn run_sync_entry(
         &store.repository_sync_path(&entry.identity),
         &store.repository_packs_path(&entry.identity),
     )?;
-    Ok(SyncRun::Completed)
+    Ok(LockedSyncRun::Completed(guard))
 }
 
 pub(crate) fn run_sync_engine(

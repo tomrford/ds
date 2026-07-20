@@ -1,14 +1,16 @@
 use std::fs;
 use std::io::{Read as _, Write as _};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
-    ProjectionSnapshot, ProjectionTransport, RepositoryId, RepositoryIdentity,
-    RepositoryIncarnation, RepositoryName, SharedSecret,
+    GitProjection, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository,
+    MachineStore, MachineStoreError, ProjectionSnapshot, ProjectionTransport, RepositoryId,
+    RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
 };
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::settings::UserSettings;
@@ -55,6 +57,83 @@ async fn devspace_checkout_fences_unowned_git_commands_before_contacting_git() {
         "{}",
         stderr(&broad_push)
     );
+}
+
+#[tokio::test]
+async fn git_push_fails_fast_while_the_repository_sync_lock_is_held() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("machine");
+    fs::create_dir_all(&home).unwrap();
+    configure_machine(
+        &home,
+        "http://127.0.0.1:1",
+        FIRST_MACHINE_ID,
+        DEVELOPMENT_SECRET,
+    );
+    let config = write_cli_config(&home);
+    let checkout = local_checkout(&home, &config, "locked-push").await;
+    let store = machine_store(&home);
+    let entry = store
+        .resolve(&RepositoryName::parse("locked-push").unwrap())
+        .unwrap()
+        .unwrap();
+    let _guard = store.try_lock_repository_sync(&entry.identity).unwrap();
+
+    let started = Instant::now();
+    let output = ds(&checkout, &home, &config, &["git", "push", "-b", "main"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "push took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        stderr(&output).contains("already being synchronized"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[tokio::test]
+async fn git_push_holds_the_repository_sync_lock_after_sync_completes() {
+    let (base_url, push_reached, release_push, server) = cloud_paused_at_remote_list();
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("machine");
+    fs::create_dir_all(&home).unwrap();
+    configure_machine(&home, &base_url, FIRST_MACHINE_ID, DEVELOPMENT_SECRET);
+    let config = write_cli_config(&home);
+    let checkout = local_checkout(&home, &config, "lock-lifetime").await;
+    let store = machine_store(&home);
+    let entry = store
+        .resolve(&RepositoryName::parse("lock-lifetime").unwrap())
+        .unwrap()
+        .unwrap();
+    let projection_path = store.repository_projection_path(&entry.identity);
+    fs::create_dir_all(projection_path.join("store")).unwrap();
+    let child = ds_command(&checkout, &home, &config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["git", "push", "-b", "main"])
+        .spawn()
+        .unwrap();
+
+    push_reached
+        .recv_timeout(Duration::from_secs(10))
+        .expect("push did not reach the post-sync projection request");
+    assert!(matches!(
+        store.try_lock_repository_sync(&entry.identity),
+        Err(MachineStoreError::RepositorySyncAlreadyLocked { .. })
+    ));
+    release_push.send(()).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("no such Git remote `origin`"));
+    assert!(stderr(&output).contains("Rebuilt the local Git projection sidecar"));
+    GitProjection::open(&projection_path, &settings()).unwrap();
+    drop(store.try_lock_repository_sync(&entry.identity).unwrap());
 }
 
 #[tokio::test]
@@ -527,6 +606,92 @@ impl LiveFixture {
         .unwrap();
         load_snapshot(&transport).await
     }
+}
+
+fn cloud_paused_at_remote_list() -> (String, Receiver<()>, SyncSender<()>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (push_reached_tx, push_reached_rx) = sync_channel(0);
+    let (release_push_tx, release_push_rx) = sync_channel(0);
+    let server = thread::spawn(move || {
+        loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let request_line = request.lines().next().unwrap();
+            if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
+                push_reached_tx.send(()).unwrap();
+                release_push_rx.recv().unwrap();
+                respond_json(&mut stream, r#"{"remotes":[]}"#);
+                return;
+            }
+            if request_line.starts_with("GET ") && request_line.contains("/packs?") {
+                respond_json(
+                    &mut stream,
+                    r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
+                );
+            } else if request_line.starts_with("GET ") && request_line.contains("/heads?") {
+                respond_json(&mut stream, r#"{"cursor":0,"heads":[]}"#);
+            } else if request_line.starts_with("POST ")
+                && request_line.contains("/objects/inventory ")
+            {
+                let body: serde_json::Value = serde_json::from_str(request_body(&request)).unwrap();
+                respond_json(
+                    &mut stream,
+                    &serde_json::json!({ "objects": body["objects"] }).to_string(),
+                );
+            } else if request_line.starts_with("POST ") && request_line.contains("/heads ") {
+                let body: serde_json::Value = serde_json::from_str(request_body(&request)).unwrap();
+                respond_json(
+                    &mut stream,
+                    &serde_json::json!({ "cursor": 1, "heads": [body["newHead"]] }).to_string(),
+                );
+            } else {
+                panic!("unexpected fake cloud request: {request_line}");
+            }
+        }
+    });
+    (base_url, push_reached_rx, release_push_tx, server)
+}
+
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 8_192];
+    loop {
+        let count = stream.read(&mut buffer).unwrap();
+        assert!(count > 0, "client closed before completing its request");
+        bytes.extend_from_slice(&buffer[..count]);
+        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let header_end = header_end + 4;
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+            })
+            .unwrap_or(0);
+        if bytes.len() >= header_end + content_length {
+            return String::from_utf8(bytes).unwrap();
+        }
+    }
+}
+
+fn request_body(request: &str) -> &str {
+    request.split_once("\r\n\r\n").unwrap().1
+}
+
+fn respond_json(stream: &mut TcpStream, body: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .unwrap();
 }
 
 async fn local_checkout(home: &Path, config: &Path, name: &str) -> PathBuf {

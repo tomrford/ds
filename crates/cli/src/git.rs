@@ -1,3 +1,4 @@
+mod projection_sidecar;
 mod push;
 
 use std::io::Write as _;
