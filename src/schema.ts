@@ -194,6 +194,7 @@ export function initializeSchema(sql: SqlStorage) {
     ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS projection_batch_results (
       batch_id BLOB PRIMARY KEY,
+      remote TEXT NOT NULL,
       request_hash BLOB NOT NULL,
       final_fence INTEGER NOT NULL,
       outcome TEXT NOT NULL CHECK (outcome IN ('accepted', 'aborted')),
@@ -201,6 +202,10 @@ export function initializeSchema(sql: SqlStorage) {
     ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS projection_recovery_claims (
       batch_id BLOB PRIMARY KEY
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS remotes (
+      name TEXT PRIMARY KEY,
+      url TEXT NOT NULL
     ) WITHOUT ROWID;
   `);
 }

@@ -39,6 +39,22 @@ pub struct ProjectionObservation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct RegisteredRemote {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Deserialize)]
+struct RemoteList {
+    remotes: Vec<RegisteredRemote>,
+}
+
+#[derive(Deserialize)]
+struct RemoteUpsert {
+    remote: RegisteredRemote,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionBatchResult {
     pub pending: bool,
@@ -174,6 +190,31 @@ impl ProjectionTransport {
             )))
             .await?;
         self.read_json(response).await
+    }
+
+    pub async fn set_remote(
+        &self,
+        name: &str,
+        url: &str,
+    ) -> Result<RegisteredRemote, TransportError> {
+        let body = serde_json::json!({
+            "incarnation": self.incarnation,
+            "url": url,
+        });
+        let response = self
+            .send(self.client.put(self.remote_url(name)?).json(&body))
+            .await?;
+        Ok(self.read_json::<RemoteUpsert>(response).await?.remote)
+    }
+
+    pub async fn list_remotes(&self) -> Result<Vec<RegisteredRemote>, TransportError> {
+        let response = self
+            .send(self.client.get(format!(
+                "{}/remotes?incarnation={}",
+                self.repository_url, self.incarnation,
+            )))
+            .await?;
+        Ok(self.read_json::<RemoteList>(response).await?.remotes)
     }
 
     pub async fn begin_push(
@@ -335,6 +376,14 @@ impl ProjectionTransport {
             |body| body.error,
         );
         Err(format!("cloud request failed with status {status}: {error}").into())
+    }
+
+    fn remote_url(&self, name: &str) -> Result<reqwest::Url, TransportError> {
+        let mut url = reqwest::Url::parse(&self.repository_url)?;
+        url.path_segments_mut()
+            .map_err(|()| "repository URL cannot contain path segments")?
+            .extend(["remotes", name]);
+        Ok(url)
     }
 
     async fn read_json<T: serde::de::DeserializeOwned>(

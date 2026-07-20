@@ -3,6 +3,7 @@ import { MAX_HEAD_REQUEST_BYTES } from "./head_protocol";
 import { MAX_OBJECT_INVENTORY_REQUEST_BYTES } from "./object_protocol";
 import { MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, readBoundedBody } from "./pack_protocol";
 import { MAX_PROJECTION_REQUEST_BYTES } from "./projection_protocol";
+import { MAX_REMOTE_REQUEST_BYTES } from "./remote_protocol";
 import type { Repository } from "./repository";
 
 const DIRECTORY_REQUEST_BYTES = 4 * 1024;
@@ -43,6 +44,8 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
     );
     const headMatch = /^\/repositories\/([^/]+)\/heads$/.exec(url.pathname);
     const projectionMatch = /^\/repositories\/([^/]+)\/projection$/.exec(url.pathname);
+    const remotesMatch = /^\/repositories\/([^/]+)\/remotes$/.exec(url.pathname);
+    const remoteMatch = /^\/repositories\/([^/]+)\/remotes\/([^/]+)$/.exec(url.pathname);
     const projectionPushMatch = /^\/repositories\/([^/]+)\/git\/pushes$/.exec(url.pathname);
     const projectionPushActionMatch =
       /^\/repositories\/([^/]+)\/git\/pushes\/([^/]+)\/(claim|confirm|recover|replay)$/.exec(
@@ -57,6 +60,8 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
       packMatch?.[1] ??
       headMatch?.[1] ??
       projectionMatch?.[1] ??
+      remotesMatch?.[1] ??
+      remoteMatch?.[1] ??
       projectionPushMatch?.[1] ??
       projectionPushActionMatch?.[1] ??
       packCatalogMatch?.[1] ??
@@ -199,6 +204,27 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
           ),
         );
       }
+      if (remotesMatch !== null && request.method === "GET") {
+        return rpcResponse(
+          await stub.listRemotes(authority, url.searchParams.get("incarnation")),
+        );
+      }
+      if (remoteMatch !== null && request.method === "PUT") {
+        let name: string;
+        try {
+          name = decodeURIComponent(remoteMatch[2]);
+        } catch {
+          return errorResponse(400, "remote name has invalid URL encoding", "invalid-remote-name");
+        }
+        const body = await readJsonBody(
+          request,
+          MAX_REMOTE_REQUEST_BYTES,
+          "remote request",
+          "invalid-remote-request",
+        );
+        if (body instanceof Response) return body;
+        return rpcResponse(await stub.setRemote(authority, name, body));
+      }
       if (projectionPushMatch !== null && request.method === "POST") {
         const body = await readJsonBody(request, MAX_PROJECTION_REQUEST_BYTES, "projection push request");
         if (body instanceof Response) return body;
@@ -246,17 +272,22 @@ function rpcResponse(result: { ok: boolean; error?: string; code?: string; statu
   return Response.json(body);
 }
 
-async function readJsonBody(request: Request, limit: number, label: string): Promise<unknown | Response> {
+async function readJsonBody(
+  request: Request,
+  limit: number,
+  label: string,
+  code?: string,
+): Promise<unknown | Response> {
   let bytes: Uint8Array;
   try {
     bytes = await readBoundedBody(request, limit, label);
   } catch (error) {
-    return errorResponse(400, error instanceof Error ? error.message : `invalid ${label}`);
+    return errorResponse(400, error instanceof Error ? error.message : `invalid ${label}`, code);
   }
   try {
     return JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
   } catch {
-    return errorResponse(400, `${label} must be valid JSON`);
+    return errorResponse(400, `${label} must be valid JSON`, code);
   }
 }
 

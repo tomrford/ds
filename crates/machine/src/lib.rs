@@ -1,6 +1,7 @@
 mod control_plane_client;
 mod creation_intent;
 mod git_projection;
+mod git_subprocess;
 mod http_client;
 mod http_transport;
 mod install;
@@ -45,6 +46,11 @@ pub use git_projection::{
     CommitMapping, ExportMappings, ExportResult, GitProjection, HiddenSet, HiddenSetIdentity,
     ImportMappings, ImportResult, ProjectionError,
 };
+pub use git_subprocess::{
+    CommandDiagnostic, GitOid, GitOidParseError, GitProcessEnvironment, GitProcessMode,
+    LeaseUpdate, PushError, PushErrorKind, PushRefReport, PushRefStatus, PushReport, QualifiedRef,
+    QualifiedRefError, RemoteUrl, push,
+};
 pub use http_transport::HttpTransport;
 pub use install::{InstalledPack, PackInstallError};
 pub use machine_config::{MachineConfig, MachineConfigError, MachineId, SharedSecret};
@@ -65,7 +71,7 @@ pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError
 pub use projection_transport::{
     PendingProjectionBatch, PendingProjectionRef, ProjectionBatchResult, ProjectionClaimResult,
     ProjectionCursor, ProjectionMapping, ProjectionObservation, ProjectionReplay,
-    ProjectionSnapshot, ProjectionState, ProjectionTransport, ProjectionUpdate,
+    ProjectionSnapshot, ProjectionState, ProjectionTransport, ProjectionUpdate, RegisteredRemote,
 };
 pub use sync_engine::{
     CloudHeads, DownloadedPack, HeadTransactionResult, MAX_OBJECT_INVENTORY_KEYS, PackCatalogEntry,

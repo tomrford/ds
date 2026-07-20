@@ -13,6 +13,12 @@ import {
   decodeProjectionFence,
   decodeRecoverProjectionBatch,
 } from "./projection_protocol";
+import {
+  RemoteProtocolError,
+  decodeRemoteIncarnation,
+  decodeRemoteName,
+  decodeSetRemote,
+} from "./remote_protocol";
 
 interface RepositoryStateRow extends Record<string, SqlStorageValue> {
   incarnation: ArrayBuffer;
@@ -88,6 +94,11 @@ interface ReceiptRow extends Record<string, SqlStorageValue> {
   public_commit_id: ArrayBuffer;
 }
 
+interface RemoteRow extends Record<string, SqlStorageValue> {
+  name: string;
+  url: string;
+}
+
 interface MissingObjectRow extends Record<string, SqlStorageValue> {
   kind: number;
   id: ArrayBuffer;
@@ -108,6 +119,59 @@ export class ProjectionStore {
     private readonly sql: SqlStorage,
     private readonly kernel: Kernel,
   ) {}
+
+  setRemote(nameValue: unknown, value: unknown) {
+    let name: string;
+    let request: ReturnType<typeof decodeSetRemote>;
+    try {
+      name = decodeRemoteName(nameValue);
+      request = decodeSetRemote(value);
+    } catch (error) {
+      return remoteRequestFailure(error);
+    }
+    try {
+      return this.ctx.storage.transactionSync(() => {
+        this.requireIncarnation(exactBuffer(request.incarnation));
+        const existing = this.sql
+          .exec<RemoteRow>("SELECT name, url FROM remotes WHERE name = ?", name)
+          .toArray()[0];
+        if (existing?.url === request.url) {
+          return { ok: true as const, remote: { name, url: request.url } };
+        }
+        if (existing !== undefined) this.clearRemoteJournal(name);
+        this.sql.exec(
+          `INSERT INTO remotes VALUES (?, ?)
+           ON CONFLICT (name) DO UPDATE SET url = excluded.url`,
+          name,
+          request.url,
+        );
+        return { ok: true as const, remote: { name, url: request.url } };
+      });
+    } catch (error) {
+      return this.handleExpected(error);
+    }
+  }
+
+  listRemotes(incarnationValue: unknown) {
+    let incarnation: Uint8Array;
+    try {
+      incarnation = decodeRemoteIncarnation(incarnationValue);
+    } catch (error) {
+      return remoteRequestFailure(error);
+    }
+    try {
+      this.requireIncarnation(exactBuffer(incarnation));
+      return {
+        ok: true as const,
+        remotes: this.sql
+          .exec<RemoteRow>("SELECT name, url FROM remotes ORDER BY name")
+          .toArray()
+          .map(({ name, url }) => ({ name, url })),
+      };
+    } catch (error) {
+      return this.handleExpected(error);
+    }
+  }
 
   get(incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
     let incarnation: ArrayBuffer;
@@ -600,14 +664,29 @@ export class ProjectionStore {
     this.sql.exec("DELETE FROM projection_recovery_claims WHERE batch_id = ?", batchId);
     this.sql.exec("DELETE FROM projection_batches WHERE batch_id = ?", batchId);
     this.sql.exec(
-      "INSERT INTO projection_batch_results VALUES (?, ?, ?, ?, ?)",
+      `INSERT INTO projection_batch_results
+       (batch_id, remote, request_hash, final_fence, outcome, finished_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?)`,
       batchId,
+      batch.remote,
       batch.request_hash,
       fence,
       outcome,
       Date.now(),
     );
     return { ok: true as const, pending: false, fence, outcome };
+  }
+
+  private clearRemoteJournal(remote: string) {
+    this.sql.exec(
+      "DELETE FROM projection_recovery_claims WHERE batch_id IN (SELECT batch_id FROM projection_batches WHERE remote = ?)",
+      remote,
+    );
+    this.sql.exec("DELETE FROM projection_batch_refs WHERE remote = ?", remote);
+    this.sql.exec("DELETE FROM projection_cursors WHERE remote = ?", remote);
+    this.sql.exec("DELETE FROM projection_states WHERE remote = ?", remote);
+    this.sql.exec("DELETE FROM projection_batches WHERE remote = ?", remote);
+    this.sql.exec("DELETE FROM projection_batch_results WHERE remote = ?", remote);
   }
 
   private replayFinished(batchId: ArrayBuffer, request: ProjectionFenceRequest) {
@@ -859,17 +938,26 @@ function decodeBatchId(value: unknown): Uint8Array {
   return decodeClaimProjectionBatch({ incarnation: value, machineId: "00".repeat(16) }).incarnation;
 }
 
-function failure(error: unknown, status: number) {
+function failure(error: unknown, status: number, code?: string) {
   return {
     ok: false as const,
     status,
     error: error instanceof Error ? error.message : "projection request failed",
-    ...(error instanceof ProjectionProtocolError ? { code: error.code } : {}),
+    ...(code !== undefined
+      ? { code }
+      : error instanceof ProjectionProtocolError
+        ? { code: error.code }
+        : {}),
   };
 }
 
 function requestFailure(error: unknown) {
   return failure(error, error instanceof ProjectionStoreError ? error.status : 400);
+}
+
+function remoteRequestFailure(error: unknown) {
+  if (error instanceof RemoteProtocolError) return failure(error, 400, error.code);
+  return failure(error, 400, "invalid-remote-request");
 }
 
 function requireAuthenticatedMachine(machineId: Uint8Array, authenticatedMachineId: string) {

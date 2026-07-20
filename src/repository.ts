@@ -130,6 +130,14 @@ export class Repository extends DurableObject<Env> {
     );
   }
 
+  setRemote(authority: RepositoryAuthority, name: unknown, value: unknown) {
+    return this.withAuthority(authority, () => this.projection.setRemote(name, value));
+  }
+
+  listRemotes(authority: RepositoryAuthority, incarnationValue: unknown) {
+    return this.withAuthority(authority, () => this.projection.listRemotes(incarnationValue));
+  }
+
   beginProjectionPush(authority: RepositoryAuthority, value: unknown) {
     return this.withAuthority(authority, () => this.projection.begin(value, authority.machineId));
   }

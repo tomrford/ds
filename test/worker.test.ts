@@ -9,6 +9,8 @@ import {
   MAX_OBJECT_INVENTORY_REQUEST_BYTES,
 } from "../src/object_protocol";
 import { MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, decodeManifest } from "../src/pack_protocol";
+import { MAX_PROJECTION_NAME_BYTES } from "../src/projection_protocol";
+import { MAX_REMOTE_URL_BYTES } from "../src/remote_protocol";
 
 const defaultMachine = "66".repeat(16);
 const recoveryMachine = "77".repeat(16);
@@ -1143,6 +1145,267 @@ describe("Git projection journal", () => {
   });
 });
 
+describe("remote registry", () => {
+  const incarnation = "56".repeat(16);
+  const machine = "66".repeat(16);
+
+  it("upserts and lists remotes in name order", async () => {
+    const repository = "remote-round-trip";
+    await initializeProjectionRepository(repository, incarnation);
+
+    expect(await putRemote(repository, incarnation, "upstream", "/tmp/upstream.git")).toEqual({
+      status: 200,
+      body: { remote: { name: "upstream", url: "/tmp/upstream.git" } },
+    });
+    expect(
+      await putRemote(repository, incarnation, "origin", "ssh://git@example.com/repository.git"),
+    ).toEqual({
+      status: 200,
+      body: { remote: { name: "origin", url: "ssh://git@example.com/repository.git" } },
+    });
+    expect(await listRemotes(repository, incarnation)).toEqual({
+      status: 200,
+      body: {
+        remotes: [
+          { name: "origin", url: "ssh://git@example.com/repository.git" },
+          { name: "upstream", url: "/tmp/upstream.git" },
+        ],
+      },
+    });
+  });
+
+  it("preserves the journal on an idempotent same-URL upsert", async () => {
+    const repository = "remote-idempotent";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "git@example.com:repo.git");
+    const [canonicalCommitId, publicCommitId] = await installProjectionCommits(repository);
+    const batchId = "c1".repeat(16);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/pushes",
+        projectionBatch(
+          incarnation,
+          batchId,
+          machine,
+          projectionUpdate(
+            "main",
+            null,
+            "c2".repeat(20),
+            canonicalCommitId,
+            publicCommitId,
+          ),
+        ),
+      ),
+    ).toEqual({ status: 200, body: { pending: true, fence: 1 } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+        incarnation,
+        machineId: machine,
+        fence: 1,
+      }),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+
+    await putRemote(repository, incarnation, "origin", "git@example.com:repo.git");
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      cursors: [{ remote: "origin", bookmark: "main" }],
+      mappings: [{ remote: "origin", bookmark: "main" }],
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+        incarnation,
+        machineId: machine,
+        fence: 1,
+      }),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+  });
+
+  it("clears only the repointed remote journal and preserves Git receipts", async () => {
+    const repository = "remote-repoint";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "/tmp/first.git");
+    await putRemote(repository, incarnation, "backup", "/tmp/backup.git");
+    const [canonicalCommitId, publicCommitId, otherPublicCommitId] =
+      await installProjectionCommits(repository, 3);
+    const originOid = "c3".repeat(20);
+    const originBatch = "c4".repeat(16);
+    const backupBatch = "c5".repeat(16);
+    for (const [remote, batchId, oid] of [
+      ["origin", originBatch, originOid],
+      ["backup", backupBatch, "c6".repeat(20)],
+    ] as const) {
+      expect(
+        await projectionRequest(repository, "git/pushes", {
+          ...projectionBatch(
+            incarnation,
+            batchId,
+            machine,
+            projectionUpdate("main", null, oid, canonicalCommitId, publicCommitId),
+          ),
+          remote,
+        }),
+      ).toMatchObject({ status: 200, body: { pending: true } });
+      const fence = remote === "origin" ? 1 : 2;
+      expect(
+        await projectionRequest(repository, `git/pushes/${batchId}/confirm`, {
+          incarnation,
+          machineId: machine,
+          fence,
+        }),
+      ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+    }
+
+    const pendingBatch = "c7".repeat(16);
+    const pendingRequest = {
+      ...projectionBatch(
+        incarnation,
+        pendingBatch,
+        machine,
+        projectionUpdate(
+          "pending",
+          null,
+          "c8".repeat(20),
+          canonicalCommitId,
+          publicCommitId,
+        ),
+      ),
+      remote: "origin",
+    };
+    expect(await projectionRequest(repository, "git/pushes", pendingRequest)).toMatchObject({
+      status: 200,
+      body: { pending: true, fence: 3 },
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${pendingBatch}/claim`, {
+        incarnation,
+        machineId: machine,
+      }),
+    ).toMatchObject({ status: 200, body: { fence: 4 } });
+
+    await putRemote(repository, incarnation, "origin", "/tmp/second.git");
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      cursors: [{ remote: "backup", bookmark: "main" }],
+      mappings: [{ remote: "backup", bookmark: "main" }],
+      pending: [],
+    });
+    expect(await getProjectionReplay(repository, pendingBatch, incarnation)).toEqual({
+      status: 404,
+      body: { error: "projection batch does not exist" },
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${originBatch}/confirm`, {
+        incarnation,
+        machineId: machine,
+        fence: 1,
+      }),
+    ).toEqual({ status: 404, body: { error: "projection batch does not exist" } });
+    expect(
+      await projectionRequest(repository, `git/pushes/${backupBatch}/confirm`, {
+        incarnation,
+        machineId: machine,
+        fence: 2,
+      }),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+
+    expect(await projectionRequest(repository, "git/pushes", pendingRequest)).toMatchObject({
+      status: 200,
+      body: { pending: true, fence: 5 },
+    });
+    expect(
+      await projectionRequest(repository, `git/pushes/${pendingBatch}/confirm`, {
+        incarnation,
+        machineId: machine,
+        fence: 5,
+      }),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+
+    expect(
+      await projectionRequest(repository, "git/pushes", {
+        ...projectionBatch(
+          incarnation,
+          "c9".repeat(16),
+          machine,
+          projectionUpdate(
+            "receipt-check",
+            null,
+            originOid,
+            canonicalCommitId,
+            otherPublicCommitId,
+          ),
+        ),
+        remote: "backup",
+      }),
+    ).toEqual({
+      status: 409,
+      body: { error: `Git object ${originOid} already has a different immutable receipt` },
+    });
+  });
+
+  it("rejects credential URLs and enforces name and URL bounds", async () => {
+    const repository = "remote-validation";
+    await initializeProjectionRepository(repository, incarnation);
+    for (const url of ["https://user:password@example.com/repo", "ssh://git:secret@host/repo"] ) {
+      expect(await putRemote(repository, incarnation, "origin", url)).toEqual({
+        status: 400,
+        body: {
+          error: "remote URL must not contain userinfo credentials",
+          code: "credentials-in-remote-url",
+        },
+      });
+    }
+    for (const url of ["ssh://git@host/repo", "git@host:repo", "https://host/repo", "/tmp/repo.git"]) {
+      expect((await putRemote(repository, incarnation, `ok-${url.length}`, url)).status).toBe(200);
+    }
+
+    const maxName = "n".repeat(MAX_PROJECTION_NAME_BYTES);
+    expect((await putRemote(repository, incarnation, maxName, "/tmp/name.git")).status).toBe(200);
+    expect(await putRemote(repository, incarnation, `${maxName}n`, "/tmp/name.git")).toMatchObject({
+      status: 400,
+      body: { code: "invalid-remote-name" },
+    });
+    expect(
+      (await putRemote(repository, incarnation, "é".repeat(MAX_PROJECTION_NAME_BYTES / 2), "/tmp/unicode.git")).status,
+    ).toBe(200);
+    expect(
+      await putRemote(
+        repository,
+        incarnation,
+        `${"é".repeat(MAX_PROJECTION_NAME_BYTES / 2)}x`,
+        "/tmp/unicode.git",
+      ),
+    ).toMatchObject({ status: 400, body: { code: "invalid-remote-name" } });
+    expect(
+      (await putRemote(repository, incarnation, "max-url", "u".repeat(MAX_REMOTE_URL_BYTES))).status,
+    ).toBe(200);
+    expect(
+      await putRemote(repository, incarnation, "long-url", "u".repeat(MAX_REMOTE_URL_BYTES + 1)),
+    ).toMatchObject({ status: 400, body: { code: "invalid-remote-url" } });
+    expect(await putRemote(repository, incarnation, "line", "first\nsecond")).toMatchObject({
+      status: 400,
+      body: { code: "invalid-remote-url" },
+    });
+  });
+
+  it("requires authentication on both routes", async () => {
+    const repository = "remote-auth";
+    await initializeProjectionRepository(repository, incarnation);
+    const target = await ensureRepository(repository, incarnation);
+    const base = `https://example.com/repositories/${target.repositoryId}/remotes`;
+    expect((await exports.default.fetch(new Request(`${base}?incarnation=${target.incarnation}`))).status).toBe(401);
+    expect(
+      (
+        await exports.default.fetch(
+          new Request(`${base}/origin`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ incarnation: target.incarnation, url: "/tmp/repo.git" }),
+          }),
+        )
+      ).status,
+    ).toBe(401);
+  });
+});
+
 function authorizationFor(machineId: string): Record<string, string> {
   return {
     authorization: `Bearer ${env.DEVSPACE_SHARED_SECRET}`,
@@ -1309,6 +1572,29 @@ async function projectionRequest(repository: string, path: string, body: unknown
     new TextEncoder().encode(JSON.stringify(translated)),
     machineId,
   );
+}
+
+async function putRemote(repository: string, incarnation: string, name: string, url: string) {
+  const target = await ensureRepository(repository, incarnation);
+  const response = await repositoryRequest(repository, `remotes/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      incarnation: translatedIncarnation(target, incarnation),
+      url,
+    }),
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+async function listRemotes(repository: string, incarnation: string) {
+  const target = await ensureRepository(repository, incarnation);
+  const response = await repositoryRequest(
+    repository,
+    `remotes?incarnation=${translatedIncarnation(target, incarnation)}`,
+    {},
+  );
+  return { status: response.status, body: await response.json() };
 }
 
 async function projectionRawRequest(

@@ -4,8 +4,8 @@ Devspace pushes projected public commits from the rebuildable bare sidecar to
 real Git remotes, journaled by the repository Durable Object with exact
 expected-old-OID leases (see `git-projection.md`). This document specifies the
 product push mechanism. The recoverable-push invariant and journal protocol
-are already implemented and tested; the mechanism below replaces the
-test-harness shell-out used by the live proof.
+are implemented and tested. The machine crate also provides the structured
+Git subprocess and remote-registry transport used by the next CLI slice.
 
 ## Mechanism
 
@@ -28,7 +28,7 @@ Rules:
   advertise atomic push fails the whole command; Devspace does not silently
   retry without it
 - each ref carries an exact lease: `--force-with-lease=<ref>:<expected-oid>`,
-  with the zero OID for creation and a deletion refspec for removal
+  with an empty expectation for creation and a deletion refspec for removal
 - refspecs are never force-prefixed; the leading `+` would bypass the lease
 - output is parsed from `--porcelain` with `LC_ALL=C`; the lease rejection
   (`stale info`) is distinguished from remote policy rejections such as
@@ -53,7 +53,7 @@ struct LeaseUpdate {
 
 fn push(
     sidecar_git_dir: &Path,
-    remote: &ResolvedRemote,
+    remote: &RemoteUrl,
     updates: &BTreeMap<QualifiedRef, LeaseUpdate>,
     environment: &GitProcessEnvironment,
 ) -> Result<PushReport, PushError>;
@@ -63,6 +63,10 @@ fn push(
 up-to-date, lease-rejected, remote-rejected, other-rejected, not-reported)
 plus the observed OID — and a redacted command diagnostic. Every input ref
 appears in the report even when Git emits no line for it.
+
+`QualifiedRef::from_bookmark` is the single bookmark-name validation and
+qualification boundary. It accepts Git branch names and produces only
+`refs/heads/<bookmark>` refs; the journal remains branch-only.
 
 The adapter from the journal is direct: resolve the batch's remote identity
 to a push URL, qualify each bookmark as `refs/heads/<bookmark>`, copy the
@@ -75,9 +79,25 @@ the recovery route.
 The journal stores a remote identity, not a URL. The repository Durable
 Object owns a remote registry mapping that identity to a fetch/push URL, so a
 fresh machine running recovery can resolve `origin` without inheriting
-another machine's git configuration. Changing a remote's URL clears that
-remote's private projection states, cursors and pending journal before new
-history is fetched. Credentials never live in the registry.
+another machine's git configuration. The projection schema stores this as
+`remotes (name TEXT PRIMARY KEY, url TEXT NOT NULL)`.
+
+Authenticated repository routes expose the registry:
+
+- `PUT /repositories/<repo>/remotes/<name>` accepts `{incarnation, url}` and
+  upserts the mapping
+- `GET /repositories/<repo>/remotes?incarnation=...` lists mappings by name
+
+A same-URL upsert is an idempotent no-op. Changing the URL clears only that
+remote's projection states, cursors, pending batches, batch refs, batch
+results and recovery claims. Git receipts are repository-wide immutable
+records and survive the change.
+
+Remote names use the projection-name rules and 256-byte UTF-8 limit. URLs are
+non-empty single-line strings of at most 1024 UTF-8 bytes. Schemes are not
+allowlisted: username-only SSH URLs, scp syntax, HTTPS URLs and absolute local
+paths are valid. A password in URL userinfo is rejected with
+`credentials-in-remote-url`; credentials never live in the registry.
 
 ## Credentials
 
@@ -94,18 +114,18 @@ appear in URLs, arguments or logs.
 
 The subprocess wrapper accepts an explicit git executable path and a
 per-command environment map, mirroring jj-lib's subprocess options. Remote
-URLs, sideband progress and stderr are redacted before logging; servers and
-credential helpers can emit sensitive text.
+URLs and environment values are absent from report and error formatting.
+Diagnostics replace the URL argument with `<remote>`, bound stderr, and drop
+lines containing the URL authority or an injected environment value; servers
+and credential helpers can emit sensitive text.
 
 ## Object format
 
-The journal and wire protocol carry 20-byte SHA-1 OIDs. A SHA-256 remote is
-rejected explicitly at remote registration; supporting it requires an
-object-format field and variable-length OIDs in the journal protocol first.
+The journal and wire protocol carry 20-byte SHA-1 OIDs. Registration stores a
+location without contacting the remote, so it does not probe object format.
+SHA-256 remotes remain unsupported; supporting them requires an object-format
+field and variable-length OIDs in the journal protocol first.
 
 ## Open items
 
-- The remote registry routes and schema in the repository Durable Object.
-- Bookmark-name validation is centralized where bookmarks are qualified into
-  `refs/heads/` refs; the journal stays branch-only.
 - Push options, tags and signing are not part of the native Git surface.
