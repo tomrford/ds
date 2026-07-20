@@ -1,5 +1,29 @@
 # Open items
 
+- Colliding-alias handling: a user jj alias named like a ds-added command
+  (e.g. `aliases.init`) is shadowed and makes every `ds` invocation print
+  jj-cli's "Cannot define an alias that overrides the built-in command"
+  warning. Config layering cannot delete keys and we will NOT carry a
+  jj-cli patch (V2 lesson). Two-part fix: (1) `ds doctor`-style overlap
+  detection with an actionable ds-branded message (works now); (2) silence
+  jj's own warning via an upstreamed resolved-config transform hook on
+  CliRunner, consumed at the next jj bump. Non-colliding user aliases
+  (`ds bump` etc.) already work through inherited jj config.
+- `ds init` overload: bare `ds init` in a directory should create a blank
+  cloud repo named after it plus the first checkout in place (repo new +
+  add composed) — the "start working here" verb. `ds init <git-url>` keeps
+  its bring-in-from-remote meaning.
+- Signed public history: canonical commits can carry jj signatures today
+  (byte-exact sync), but projected public Git commits go out unsigned.
+  Projection happens locally at export, so running the configured jj
+  signing backend over freshly built public commits is feasible — design
+  how signing config maps across the boundary and sign at projection time.
+- v3 checkouts have no `.git` shim, so agent tools that sniff for a git repo
+  refuse to run in them (codex needs `--skip-git-repo-check`; other tools may
+  hard-fail). v1 shipped a read-only `.git` shim partly for this. Decide
+  whether v3 checkouts should materialize a minimal read-only shim (and what
+  it must refuse) — first dogfood friction, found day one.
+
 - No `ds setup`/`ds login` verb: machine `config.json` (platform data dir,
   0600, `{version, base_url, machine_id, shared_secret}`) is written by hand.
   Needs a verb that generates the machine id, validates the URL/secret against

@@ -285,6 +285,59 @@ fn add_bare_marker_collision(path: &Path) {
     }
 }
 
+#[test]
+fn root_help_is_devspace_first() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+
+    let output = ds(temp.path(), &config, &["--help"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let help = stdout(&output);
+    assert!(
+        help.starts_with("Cloudflare-native development workspaces"),
+        "{help}"
+    );
+    for command in ["add", "init", "remove", "repo", "sync", "git", "status"] {
+        assert!(
+            help.lines()
+                .any(|line| line.trim_start().starts_with(&format!("{command} "))),
+            "missing `{command}` from root help:\n{help}"
+        );
+    }
+    assert!(help.contains("ds help jj"), "{help}");
+    assert!(!help.contains("  abandon "), "{help}");
+}
+
+#[test]
+fn jj_help_lists_the_embedded_command_surface() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+
+    let output = ds(temp.path(), &config, &["help", "jj"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let help = stdout(&output);
+    for command in ["abandon", "describe", "log", "new"] {
+        assert!(
+            help.lines()
+                .any(|line| line.trim_start().starts_with(&format!("{command} "))),
+            "missing `{command}` from jj help:\n{help}"
+        );
+    }
+}
+
+#[test]
+fn embedded_jj_command_help_still_works() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+
+    let output = ds(temp.path(), &config, &["log", "--help"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("Show revision history"));
+}
+
 #[tokio::test]
 async fn bare_log_uses_stock_alias_revset_template_and_graph_without_workspace_state() {
     let temp = tempfile::tempdir().unwrap();

@@ -12,6 +12,10 @@ mod sync_status;
 mod tx;
 mod working_copy;
 
+use std::env;
+use std::ffi::OsStr;
+use std::io::{self, Write as _};
+use std::mem;
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 
@@ -19,20 +23,28 @@ use bare_workspace::{
     DevspaceWorkspaceLoaderFactory, MultipleOperationHeads, ParsedRepositoryArgs,
     RepositorySelector, is_stock_bare_repository,
 };
+use clap::Subcommand as _;
 use jj_cli::cli_util::{CliRunner, CommandHelper};
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
 use jj_lib::op_heads_store::OpHeadsStoreError;
 
 static REPOSITORY_SELECTOR: OnceLock<Arc<RepositorySelector>> = OnceLock::new();
+const APP_ABOUT: &str = "Cloudflare-native development workspaces backed by Jujutsu";
+const JJ_HELP_HINT: &str =
+    "ds embeds Jujutsu. Run `ds help jj` for the full Jujutsu command reference.";
 
 pub fn run() -> ExitCode {
+    if let Some(exit_code) = intercept_help(env::args_os().skip(1)) {
+        return exit_code;
+    }
     let repository_selector = REPOSITORY_SELECTOR
         .get_or_init(|| Arc::new(RepositorySelector::from_process_cwd()))
         .clone();
     let selector_for_args = repository_selector.clone();
     let exit_code = CliRunner::init()
         .name("ds")
+        .about(APP_ABOUT)
         .version(env!("CARGO_PKG_VERSION"))
         .set_workspace_loader_factory(Box::new(DevspaceWorkspaceLoaderFactory::new(
             repository_selector,
@@ -49,6 +61,55 @@ pub fn run() -> ExitCode {
         boundary_sync::spawn_recorded();
     }
     exit_code
+}
+
+fn intercept_help(args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Option<ExitCode> {
+    let args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    let mut app = match args.as_slice() {
+        [arg] if arg == "--help" || arg == "-h" || arg == "help" => root_help_app(),
+        [help, jj] if help == "help" && jj == "jj" => devspace_app(),
+        _ => return None,
+    };
+    let help = app.render_long_help();
+    let result = write!(io::stdout().lock(), "{help}");
+    Some(if result.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+fn devspace_app() -> clap::Command {
+    repo::DevspaceCommand::augment_subcommands(jj_cli::commands::default_app())
+        .name("ds")
+        .about(APP_ABOUT)
+        .long_about(APP_ABOUT)
+        .version(env!("CARGO_PKG_VERSION"))
+}
+
+fn root_help_app() -> clap::Command {
+    let mut app = jj_cli::commands::default_app();
+    for slot in app.get_subcommands_mut() {
+        let command = mem::take(slot).hide(true);
+        *slot = match command.get_name() {
+            "git" => command
+                .hide(false)
+                .about("Manage Devspace's Git remote boundary"),
+            "status" => command
+                .hide(false)
+                .about("Show Jujutsu status with Devspace synchronization state"),
+            _ => command,
+        };
+    }
+    repo::DevspaceCommand::augment_subcommands(app)
+        .name("ds")
+        .about(APP_ABOUT)
+        .long_about(APP_ABOUT)
+        .version(env!("CARGO_PKG_VERSION"))
+        .after_long_help(JJ_HELP_HINT)
 }
 
 async fn restrict_bare_repository_commands(
