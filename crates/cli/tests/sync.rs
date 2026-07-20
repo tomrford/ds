@@ -1,3 +1,9 @@
+#[cfg(unix)]
+#[path = "support/stalling_server.rs"]
+mod stalling_server;
+#[cfg(unix)]
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,10 +19,36 @@ use devspace_machine::{
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::settings::UserSettings;
+#[cfg(unix)]
+use stalling_server::StallingServer;
+#[cfg(unix)]
+use support::daemon_socket_path;
 
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
 const FIRST_MACHINE_ID: &str = "12121212121212121212121212121212";
 const SECOND_MACHINE_ID: &str = "34343434343434343434343434343434";
+
+#[test]
+fn sync_help_lists_status_but_hides_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+
+    let output = ds(temp.path(), temp.path(), &config, &["sync", "--help"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let help = stdout(&output);
+    assert!(
+        help.lines()
+            .any(|line| line.trim_start().starts_with("status")),
+        "{help}"
+    );
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with("run")),
+        "{help}"
+    );
+}
 
 fn settings() -> UserSettings {
     let mut config = StackedConfig::with_defaults();
@@ -140,6 +172,35 @@ async fn local_repository(root: &Path, name: &str, base_url: &str) -> CatalogEnt
         .await
         .unwrap();
     entry
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sync_run_times_out_when_the_worker_accepts_but_never_responds() {
+    let server = StallingServer::start();
+    let temp = tempfile::tempdir().unwrap();
+    local_repository(temp.path(), "stalled", server.base_url()).await;
+    let config = write_cli_config(temp.path());
+
+    let started = Instant::now();
+    let output = ds_command(temp.path(), temp.path(), &config)
+        .env("DEVSPACE_HTTP_TEST_HOOKS", "1")
+        .env("DEVSPACE_HTTP_TEST_REQUEST_TIMEOUT_MS", "100")
+        .args(["sync", "run", "--repository", "stalled"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "sync took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        stderr(&output).contains("operation timed out"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 async fn catalog_repository(
@@ -465,7 +526,8 @@ async fn sync_status_snapshots_catalog_rows_and_daemon_liveness_from_local_state
     let _locks = [in_sync, never, pending]
         .map(|entry| store.try_lock_repository_sync(&entry.identity).unwrap());
     let mut daemon = spawn_test_daemon(temp.path(), &config, 10_000, 60_000);
-    wait_for_path(&store.root().join("daemon.sock"));
+    let socket = daemon_socket_path(store.root());
+    wait_for_path(&socket);
     let running = ds(temp.path(), temp.path(), &config, &["sync", "status"]);
     assert!(running.status.success(), "{}", stderr(&running));
     assert_eq!(
@@ -473,6 +535,7 @@ async fn sync_status_snapshots_catalog_rows_and_daemon_liveness_from_local_state
         stderr(&stopped).replacen("daemon: not running", "daemon: running", 1)
     );
     stop_process(&mut daemon);
+    fs::remove_file(socket).unwrap();
 }
 
 #[tokio::test]
@@ -579,7 +642,7 @@ async fn ordinary_read_auto_starts_the_daemon_without_waiting_for_sync() {
         "auto-started daemon did not exit after its test idle timeout: {}",
         fs::read_to_string(&daemon_log).unwrap_or_default()
     );
-    assert!(!store.root().join("daemon.sock").exists());
+    assert!(!daemon_socket_path(store.root()).exists());
 }
 
 #[cfg(unix)]
@@ -602,7 +665,8 @@ async fn failed_daemon_start_falls_back_to_the_detached_one_shot() {
         ],
     );
     assert!(added.status.success(), "{}", stderr(&added));
-    fs::create_dir(machine_store(temp.path()).root().join("daemon.sock")).unwrap();
+    let socket = daemon_socket_path(machine_store(temp.path()).root());
+    fs::create_dir_all(&socket).unwrap();
 
     let output = ds_auto_start_boundary(
         &checkout,
@@ -623,6 +687,7 @@ async fn failed_daemon_start_falls_back_to_the_detached_one_shot() {
         "lost boundary did not fall back to a one-shot: {}",
         fs::read_to_string(&sync_log).unwrap_or_default()
     );
+    fs::remove_dir(socket).unwrap();
 }
 
 #[cfg(unix)]
@@ -646,7 +711,7 @@ async fn sigkill_and_restart_preserve_pending_local_work_and_recover_the_socket(
     );
     assert!(added.status.success(), "{}", stderr(&added));
     let store = machine_store(temp.path());
-    let socket = store.root().join("daemon.sock");
+    let socket = daemon_socket_path(store.root());
     let daemon_log = store.root().join("daemon.log");
     let mut daemon = spawn_test_daemon(temp.path(), &config, 10_000, 60_000);
     wait_for_path(&socket);
@@ -706,6 +771,7 @@ async fn sigkill_and_restart_preserve_pending_local_work_and_recover_the_socket(
         stderr(&pending_after)
     );
     stop_process(&mut restarted);
+    fs::remove_file(socket).unwrap();
 }
 
 #[tokio::test]

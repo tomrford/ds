@@ -1,10 +1,13 @@
 #[cfg(unix)]
 mod platform {
     use std::collections::{BTreeSet, VecDeque};
-    use std::fs::{self, File, OpenOptions};
+    use std::env;
+    use std::fs::{self, File, Metadata, OpenOptions};
     use std::io::{self, BufRead as _, Read as _, Write as _};
     use std::os::fd::OwnedFd;
-    use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{
+        FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -20,13 +23,14 @@ mod platform {
     use rustix::io::Errno;
     use rustix::net::sockopt::socket_error;
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, connect, socket};
+    use rustix::process::getuid;
 
-    use crate::checkout::reject_unsupported_global_options;
+    use crate::checkout::{destination_hash, reject_unsupported_global_options};
     use crate::sync::{SyncRun, run_sync_entry};
 
     const DAEMON_LOCK_FILE: &str = "daemon.lock";
     const DAEMON_LOG_FILE: &str = "daemon.log";
-    const DAEMON_SOCKET_FILE: &str = "daemon.sock";
+    const DAEMON_SOCKET_DIR: &str = "devspace-daemon";
     const POLL_INTERVAL: Duration = Duration::from_secs(15);
     const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
     const LOOP_INTERVAL: Duration = Duration::from_millis(25);
@@ -56,10 +60,12 @@ mod platform {
     }
 
     fn connect_to_daemon(store: &MachineStore) -> Option<UnixStream> {
+        let socket_path = daemon_socket_path(store.root()).ok()?;
+        verify_socket_owner(&socket_path).ok()?;
         let fd = socket(AddressFamily::UNIX, SocketType::STREAM, None).ok()?;
         let flags = fcntl_getfl(&fd).ok()?;
         fcntl_setfl(&fd, flags | OFlags::NONBLOCK).ok()?;
-        let address = SocketAddrUnix::new(store.root().join(DAEMON_SOCKET_FILE)).ok()?;
+        let address = SocketAddrUnix::new(&socket_path).ok()?;
         match connect(&fd, &address) {
             Ok(()) => {}
             Err(Errno::INPROGRESS) => {
@@ -128,27 +134,39 @@ mod platform {
         };
 
         let mut log = open_log(store.root()).map_err(user_error)?;
-        let socket_path = store.root().join(DAEMON_SOCKET_FILE);
-        remove_stale_socket(&socket_path).map_err(user_error)?;
+        let socket_path =
+            daemon_socket_path(store.root()).map_err(|error| log_startup_error(&mut log, error))?;
+        prepare_socket_directory(&socket_path)
+            .map_err(|error| log_startup_error(&mut log, error))?;
+        remove_stale_socket(&socket_path).map_err(|error| log_startup_error(&mut log, error))?;
         let listener = UnixListener::bind(&socket_path).map_err(|error| {
-            user_error(format!(
-                "failed to bind daemon socket at {}: {error}",
-                socket_path.display()
-            ))
+            log_startup_error(
+                &mut log,
+                format!(
+                    "failed to bind daemon socket at {}: {error}",
+                    socket_path.display()
+                ),
+            )
         })?;
         let _socket = SocketCleanup::new(socket_path.clone());
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-            user_error(format!(
-                "failed to protect daemon socket at {}: {error}",
-                socket_path.display()
-            ))
+            log_startup_error(
+                &mut log,
+                format!(
+                    "failed to protect daemon socket at {}: {error}",
+                    socket_path.display()
+                ),
+            )
         })?;
-        let events = spawn_socket_listener(listener).map_err(user_error)?;
+        verify_socket_owner(&socket_path).map_err(|error| log_startup_error(&mut log, error))?;
+        let events =
+            spawn_socket_listener(listener).map_err(|error| log_startup_error(&mut log, error))?;
 
         let (poll_interval, idle_timeout) = daemon_intervals();
         let mut queue = VecDeque::new();
         let mut queued = BTreeSet::new();
-        enqueue_complete_catalog(&store, &mut queue, &mut queued).map_err(user_error)?;
+        enqueue_complete_catalog(&store, &mut queue, &mut queued)
+            .map_err(|error| log_startup_error(&mut log, error))?;
         let mut last_notification = Instant::now();
         let mut next_poll = Instant::now() + poll_interval;
         writeln!(log, "daemon started")?;
@@ -171,7 +189,7 @@ mod platform {
                 }
                 next_poll = now + poll_interval;
             }
-            if now.duration_since(last_notification) >= idle_timeout {
+            if queue.is_empty() && now.duration_since(last_notification) >= idle_timeout {
                 writeln!(log, "daemon exiting after idle timeout")?;
                 return Ok(());
             }
@@ -458,6 +476,121 @@ mod platform {
             )
         })?;
         Ok(file)
+    }
+
+    fn log_startup_error(log: &mut File, error: String) -> CommandError {
+        let _ = writeln!(log, "daemon startup failed: {error}");
+        let _ = log.flush();
+        user_error(error)
+    }
+
+    fn daemon_socket_path(store_root: &Path) -> Result<PathBuf, String> {
+        let canonical_root = dunce::canonicalize(store_root).map_err(|error| {
+            format!(
+                "failed to canonicalize machine store at {} for daemon socket identity: {error}",
+                store_root.display()
+            )
+        })?;
+        let socket_name = format!("{}.sock", destination_hash(&canonical_root));
+
+        if let Some(temp_root) = env::var_os("TMPDIR").map(PathBuf::from)
+            && temp_root.is_absolute()
+        {
+            let candidate = temp_root.join(DAEMON_SOCKET_DIR).join(&socket_name);
+            if socket_path_is_supported(&candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        let fallback =
+            PathBuf::from(format!("/tmp/devspace-daemon-{}", getuid().as_raw())).join(socket_name);
+        if !socket_path_is_supported(&fallback) {
+            return Err(format!(
+                "daemon socket path {} exceeds the platform Unix socket path limit",
+                fallback.display()
+            ));
+        }
+        Ok(fallback)
+    }
+
+    fn socket_path_is_supported(path: &Path) -> bool {
+        SocketAddrUnix::new(path).is_ok()
+    }
+
+    fn prepare_socket_directory(socket_path: &Path) -> Result<(), String> {
+        let directory = socket_path
+            .parent()
+            .ok_or_else(|| "daemon socket path has no parent directory".to_owned())?;
+        fs::create_dir_all(directory).map_err(|error| {
+            format!(
+                "failed to create daemon socket directory at {}: {error}",
+                directory.display()
+            )
+        })?;
+        verify_owned_directory(directory)?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "failed to protect daemon socket directory at {}: {error}",
+                directory.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn verify_socket_owner(socket_path: &Path) -> Result<(), String> {
+        let directory = socket_path
+            .parent()
+            .ok_or_else(|| "daemon socket path has no parent directory".to_owned())?;
+        verify_owned_directory(directory)?;
+        let metadata = fs::symlink_metadata(socket_path).map_err(|error| {
+            format!(
+                "failed to inspect daemon socket at {}: {error}",
+                socket_path.display()
+            )
+        })?;
+        verify_owner(socket_path, &metadata)?;
+        if !metadata.file_type().is_socket() {
+            return Err(format!(
+                "daemon socket path {} is not a socket",
+                socket_path.display()
+            ));
+        }
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(format!(
+                "daemon socket at {} does not have mode 0600",
+                socket_path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_owned_directory(directory: &Path) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(directory).map_err(|error| {
+            format!(
+                "failed to inspect daemon socket directory at {}: {error}",
+                directory.display()
+            )
+        })?;
+        verify_owner(directory, &metadata)?;
+        if !metadata.file_type().is_dir() {
+            return Err(format!(
+                "daemon socket directory path {} is not a directory",
+                directory.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_owner(path: &Path, metadata: &Metadata) -> Result<(), String> {
+        let expected = getuid().as_raw();
+        if metadata.uid() != expected {
+            return Err(format!(
+                "daemon socket path {} is owned by uid {}, expected uid {expected}",
+                path.display(),
+                metadata.uid()
+            ));
+        }
+        Ok(())
     }
 
     fn remove_stale_socket(path: &Path) -> Result<(), String> {

@@ -1,6 +1,7 @@
 //! `SyncTransport` over the devspace Worker's HTTP protocol.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -14,6 +15,13 @@ use crate::{MAX_CHUNK_BYTES, MachineConfig, ObjectKind, PackManifest, PendingHea
 
 const MAX_JSON_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
+// Prevent an unreachable cloud from wedging the singleton daemon during connect.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+// Prevent a stalled Worker from wedging the singleton daemon during a request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+const TEST_HOOKS_ENV: &str = "DEVSPACE_HTTP_TEST_HOOKS";
+const TEST_REQUEST_TIMEOUT_MS_ENV: &str = "DEVSPACE_HTTP_TEST_REQUEST_TIMEOUT_MS";
 
 pub struct HttpTransport {
     client: reqwest::Client,
@@ -79,7 +87,10 @@ impl HttpTransport {
         ))?;
         authorization.set_sensitive(true);
         Ok(Self {
-            client: reqwest::Client::builder().build()?,
+            client: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(request_timeout())
+                .build()?,
             repository_url: format!(
                 "{}/repositories/{repository}",
                 config.base_url().trim_end_matches('/')
@@ -130,6 +141,18 @@ impl HttpTransport {
         let response = self.send(self.client.get(url)).await?;
         read_bounded(response, limit).await
     }
+}
+
+fn request_timeout() -> Duration {
+    if std::env::var_os(TEST_HOOKS_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+        && let Some(milliseconds) = std::env::var(TEST_REQUEST_TIMEOUT_MS_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        && milliseconds > 0
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    REQUEST_TIMEOUT
 }
 
 async fn read_bounded(

@@ -1,3 +1,6 @@
+#[cfg(unix)]
+mod support;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,6 +15,8 @@ use devspace_machine::{
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::settings::UserSettings;
+#[cfg(unix)]
+use support::daemon_socket_path;
 
 const FIRST_MACHINE_ID: &str = "12121212121212121212121212121212";
 const SECOND_MACHINE_ID: &str = "34343434343434343434343434343434";
@@ -259,6 +264,11 @@ async fn daemon_polling_converges_without_a_machine_b_command() {
         );
         thread::sleep(Duration::from_millis(25));
     }
+    let socket_a = daemon_socket_path(store_a.root());
+    assert!(
+        poll_until(Duration::from_secs(3), || !socket_a.exists()),
+        "machine A boundary daemon did not exit after its test idle timeout"
+    );
 }
 
 #[cfg(unix)]
@@ -414,6 +424,9 @@ fn ds(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
         .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
         .env("JJ_CONFIG", config)
         .env("DEVSPACE_BOUNDARY_SYNC", "1")
+        .env("DEVSPACE_DAEMON_TEST_HOOKS", "1")
+        .env("DEVSPACE_DAEMON_TEST_POLL_MS", "10000")
+        .env("DEVSPACE_DAEMON_TEST_IDLE_MS", "250")
         .env("NO_COLOR", "1")
         .env("PAGER", "cat")
         .args(args)
@@ -450,7 +463,7 @@ fn ds_without_boundary(cwd: &Path, home: &Path, config: &Path, args: &[&str]) ->
 
 #[cfg(unix)]
 fn start_daemon(home: &Path, config: &Path) -> DaemonProcess {
-    let socket = machine_store(home).root().join("daemon.sock");
+    let socket = daemon_socket_path(machine_store(home).root());
     let child = Command::new(env!("CARGO_BIN_EXE_ds"))
         .current_dir(home)
         .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
@@ -472,19 +485,25 @@ fn start_daemon(home: &Path, config: &Path) -> DaemonProcess {
         "daemon socket did not appear at {}",
         socket.display()
     );
-    DaemonProcess(child)
+    DaemonProcess { child, socket }
 }
 
 #[cfg(unix)]
-struct DaemonProcess(Child);
+struct DaemonProcess {
+    child: Child,
+    socket: PathBuf,
+}
 
 #[cfg(unix)]
 impl Drop for DaemonProcess {
     fn drop(&mut self) {
-        if self.0.try_wait().unwrap().is_none() {
-            self.0.kill().unwrap();
+        if self.child.try_wait().unwrap().is_none() {
+            self.child.kill().unwrap();
         }
-        self.0.wait().unwrap();
+        self.child.wait().unwrap();
+        if self.socket.exists() {
+            fs::remove_file(&self.socket).unwrap();
+        }
     }
 }
 

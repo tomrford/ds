@@ -22,6 +22,7 @@ pub(crate) struct SyncArgs {
 #[derive(clap::Subcommand)]
 enum SyncCommand {
     /// Synchronize one machine repository with its cloud authority.
+    #[command(hide = true)]
     Run {
         /// Repository name in the local machine catalog.
         #[arg(long)]
