@@ -69,9 +69,10 @@ pub use pack::{
 };
 pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
 pub use projection_transport::{
-    PendingProjectionBatch, PendingProjectionRef, ProjectionBatchResult, ProjectionClaimResult,
-    ProjectionCursor, ProjectionMapping, ProjectionObservation, ProjectionReplay,
-    ProjectionSnapshot, ProjectionState, ProjectionTransport, ProjectionUpdate, RegisteredRemote,
+    FetchReceipt, FetchRef, FetchResult, PendingProjectionBatch, PendingProjectionRef,
+    ProjectionBatchResult, ProjectionClaimResult, ProjectionCursor, ProjectionMapping,
+    ProjectionObservation, ProjectionReplay, ProjectionSnapshot, ProjectionState,
+    ProjectionTransport, ProjectionUpdate, RegisteredRemote,
 };
 pub use sync_engine::{
     CloudHeads, DownloadedPack, HeadTransactionResult, MAX_OBJECT_INVENTORY_KEYS, PackCatalogEntry,

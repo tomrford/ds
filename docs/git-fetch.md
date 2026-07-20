@@ -63,24 +63,38 @@ hidden-set identities produce identical canonical objects on any machine.
 
 ## Journal transaction
 
-Fetch needs one new idempotent mutation on the repository Durable Object:
+Fetch records observed remote history with this idempotent repository Durable
+Object mutation:
 
 ```text
 POST /repositories/:repository/git/fetches
 ```
 
-The request carries a stable fetch ID and machine ID, the remote identity,
-the fetched refs with their exact observed Git heads, the expected prior
-cursor per ref, the hidden-set identity used for lifting, every new immutable
-Git-to-public receipt, parent-first per-ref states binding Git, public and
-lifted private IDs, and the proposed final state per ref.
+The strict request contains `incarnation`, a stable 16-byte `fetchId`, the
+authenticated 16-byte `machineId`, a registered `remote`, non-empty `refs` and
+`receipts`. Each ref contains `bookmark`, its exact `observedGitOid`, the
+nullable `expectedCursorOid`, parent-first projection `states`, and a nullable
+`proposedState` index. A null index selects an already-active state for the
+same remote, bookmark and observed Git object. Receipts contain `gitOid` and
+`publicCommitId`; the array can be empty when every mapping is known. The
+route uses the projection body, ref and state limits, and caps receipts at the
+same 8,192-entry limit as states.
 
-In one transaction the Durable Object validates authentication, incarnation
-and the idempotent request hash; exact expected cursors; the absence of an
-unresolved overlapping push batch; object closure for every new raw public
-and private commit; immutable receipt consistency; and one unambiguous
-lineage per reached Git object. It then inserts receipts, appends active
-projection states and advances the per-ref cursors atomically. No separate
+One synchronous storage transaction validates, in order: the fetch request
+hash under `fetchId` (`fetch-request-mismatch`); exact expected cursors
+(`fetch-cursor-stale`); absence of an overlapping pending push
+(`fetch-overlaps-pending-push`); complete raw-public and lifted-private commit
+closures (`fetch-commit-not-durable`); immutable receipts
+(`git-receipt-conflict`); receipt coverage for every state
+(`fetch-state-receipt-mismatch`); and one lineage per Git object across the
+request and the newest active state per bookmark
+(`fetch-lineage-ambiguous`). An unregistered remote fails with
+`remote-not-found`.
+
+The transaction inserts receipts, appends every new state as active with an
+activation sequence, advances each ref cursor and records the response under
+`fetchId`. The response is `{fetchId, activationCursor}`. An identical retry
+returns that recorded response without inserting states again. No separate
 fetch cursor exists: the projection activation cursor pages journal changes
 and the per-ref cursor identifies the last accepted state.
 
@@ -106,10 +120,9 @@ traversal plus labeled rejection, not conflict-term filtering.
 
 ## Open items
 
-- The journal route, its Worker schema and the fault-matrix coverage: lost
-  responses at fetch-mutation, cursor races, policy-bearing (`.dsprivate`)
-  commits, rewritten refs, ambiguous multi-bookmark seeds, octopus merges and
-  hidden parent disagreement.
+- Fetch lifting coverage for policy-bearing (`.dsprivate`) commits, rewritten
+  refs, ambiguous multi-bookmark seeds, octopus merges and hidden parent
+  disagreement.
 - Adversarial depth testing for recursive tree translation.
 - Non-UTF-8 names, case collisions and paths that cannot materialize on a
   client platform have no defined handling.

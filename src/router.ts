@@ -47,6 +47,7 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
     const remotesMatch = /^\/repositories\/([^/]+)\/remotes$/.exec(url.pathname);
     const remoteMatch = /^\/repositories\/([^/]+)\/remotes\/([^/]+)$/.exec(url.pathname);
     const projectionPushMatch = /^\/repositories\/([^/]+)\/git\/pushes$/.exec(url.pathname);
+    const projectionFetchMatch = /^\/repositories\/([^/]+)\/git\/fetches$/.exec(url.pathname);
     const projectionPushActionMatch =
       /^\/repositories\/([^/]+)\/git\/pushes\/([^/]+)\/(claim|confirm|recover|replay)$/.exec(
         url.pathname,
@@ -63,6 +64,7 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
       remotesMatch?.[1] ??
       remoteMatch?.[1] ??
       projectionPushMatch?.[1] ??
+      projectionFetchMatch?.[1] ??
       projectionPushActionMatch?.[1] ??
       packCatalogMatch?.[1] ??
       objectInventoryMatch?.[1];
@@ -229,6 +231,16 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
         const body = await readJsonBody(request, MAX_PROJECTION_REQUEST_BYTES, "projection push request");
         if (body instanceof Response) return body;
         return rpcResponse(await stub.beginProjectionPush(authority, body));
+      }
+      if (projectionFetchMatch !== null && request.method === "POST") {
+        const body = await readJsonBody(
+          request,
+          MAX_PROJECTION_REQUEST_BYTES,
+          "projection fetch request",
+          "invalid-fetch-request",
+        );
+        if (body instanceof Response) return body;
+        return rpcResponse(await stub.recordProjectionFetch(authority, body));
       }
       if (projectionPushActionMatch?.[3] === "replay" && request.method === "GET") {
         return rpcResponse(

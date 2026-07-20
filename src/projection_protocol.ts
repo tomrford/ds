@@ -3,6 +3,7 @@ import { compareBytes, toHex } from "./kernel";
 export const MAX_PROJECTION_REQUEST_BYTES = 4 * 1024 * 1024;
 export const MAX_PROJECTION_REFS = 256;
 export const MAX_PROJECTION_STATES = 8_192;
+export const MAX_FETCH_RECEIPTS = MAX_PROJECTION_STATES;
 export const MAX_REPOSITORY_PROJECTION_REFS = 512;
 export const MAX_PROJECTION_NAME_BYTES = 256;
 
@@ -31,6 +32,28 @@ export interface BeginProjectionBatchRequest {
   machineId: Uint8Array;
   remote: string;
   updates: ProjectionUpdate[];
+}
+
+export interface FetchReceipt {
+  gitOid: Uint8Array;
+  publicCommitId: Uint8Array;
+}
+
+export interface FetchRef {
+  bookmark: string;
+  observedGitOid: Uint8Array;
+  expectedCursorOid: Uint8Array | null;
+  states: ProjectionState[];
+  proposedState: number | null;
+}
+
+export interface RecordFetchRequest {
+  incarnation: Uint8Array;
+  fetchId: Uint8Array;
+  machineId: Uint8Array;
+  remote: string;
+  refs: FetchRef[];
+  receipts: FetchReceipt[];
 }
 
 export interface ProjectionFenceRequest {
@@ -85,6 +108,107 @@ export function decodeBeginProjectionBatch(value: unknown): BeginProjectionBatch
     machineId: decodeHex(record.machineId, SHORT_ID_PATTERN, "machineId", 16),
     remote: decodeName(record.remote, "remote"),
     updates,
+  };
+}
+
+export function decodeRecordFetch(value: unknown): RecordFetchRequest {
+  const record = requireRecord(value, "fetch request");
+  requireExactKeys(record, [
+    "incarnation",
+    "fetchId",
+    "machineId",
+    "remote",
+    "refs",
+    "receipts",
+  ]);
+  if (!Array.isArray(record.refs) || record.refs.length === 0) {
+    throw new Error("refs must be a non-empty array");
+  }
+  if (record.refs.length > MAX_PROJECTION_REFS) {
+    throw new Error(`refs exceeds the ${MAX_PROJECTION_REFS}-ref limit`);
+  }
+  const refs = record.refs.map((value, index): FetchRef => {
+    const item = requireRecord(value, `refs[${index}]`);
+    requireExactKeys(item, [
+      "bookmark",
+      "observedGitOid",
+      "expectedCursorOid",
+      "states",
+      "proposedState",
+    ]);
+    if (!Array.isArray(item.states)) {
+      throw new Error(`refs[${index}].states must be an array`);
+    }
+    const states = item.states.map((state, stateIndex) =>
+      decodeProjectionState(state, `refs[${index}].states[${stateIndex}]`),
+    );
+    const observedGitOid = decodeNullableGitOid(
+      item.observedGitOid,
+      `refs[${index}].observedGitOid`,
+    );
+    if (observedGitOid === null) {
+      throw new Error(`refs[${index}].observedGitOid must not be null`);
+    }
+    const proposedState =
+      item.proposedState === null
+        ? null
+        : decodeSafeInteger(item.proposedState, `refs[${index}].proposedState`);
+    if (proposedState !== null && proposedState >= states.length) {
+      throw new Error(`refs[${index}].proposedState is outside states`);
+    }
+    if (
+      proposedState !== null &&
+      compareBytes(states[proposedState].gitOid, observedGitOid) !== 0
+    ) {
+      throw new Error(`refs[${index}].proposedState must map the observed Git ID`);
+    }
+    return {
+      bookmark: decodeName(item.bookmark, `refs[${index}].bookmark`),
+      observedGitOid,
+      expectedCursorOid: decodeNullableGitOid(
+        item.expectedCursorOid,
+        `refs[${index}].expectedCursorOid`,
+      ),
+      states,
+      proposedState,
+    };
+  });
+  const stateCount = refs.reduce((count, ref) => count + ref.states.length, 0);
+  if (stateCount > MAX_PROJECTION_STATES) {
+    throw new Error(`refs exceeds the ${MAX_PROJECTION_STATES}-state limit`);
+  }
+  refs.sort((left, right) => compareNames(left.bookmark, right.bookmark));
+  requireUniqueNames(refs, "refs");
+
+  if (!Array.isArray(record.receipts)) throw new Error("receipts must be an array");
+  if (record.receipts.length > MAX_FETCH_RECEIPTS) {
+    throw new Error(`receipts exceeds the ${MAX_FETCH_RECEIPTS}-receipt limit`);
+  }
+  const receipts = record.receipts.map((value, index): FetchReceipt => {
+    const receipt = requireRecord(value, `receipts[${index}]`);
+    requireExactKeys(receipt, ["gitOid", "publicCommitId"]);
+    const decoded = {
+      gitOid: decodeHex(receipt.gitOid, GIT_OID_PATTERN, `receipts[${index}].gitOid`, 20),
+      publicCommitId: decodeHex(
+        receipt.publicCommitId,
+        OBJECT_ID_PATTERN,
+        `receipts[${index}].publicCommitId`,
+        64,
+      ),
+    };
+    requireNonZero(decoded.gitOid, `receipts[${index}].gitOid`);
+    requireNonZero(decoded.publicCommitId, `receipts[${index}].publicCommitId`);
+    return decoded;
+  });
+  receipts.sort((left, right) => compareBytes(left.gitOid, right.gitOid));
+
+  return {
+    incarnation: decodeHex(record.incarnation, SHORT_ID_PATTERN, "incarnation", 16),
+    fetchId: decodeHex(record.fetchId, SHORT_ID_PATTERN, "fetchId", 16),
+    machineId: decodeHex(record.machineId, SHORT_ID_PATTERN, "machineId", 16),
+    remote: decodeName(record.remote, "remote"),
+    refs,
+    receipts,
   };
 }
 
@@ -154,6 +278,29 @@ export function canonicalProjectionBatchBytes(request: BeginProjectionBatchReque
   );
 }
 
+export function canonicalFetchBytes(request: RecordFetchRequest): Uint8Array {
+  return encoder.encode(
+    JSON.stringify({
+      incarnation: toHex(request.incarnation),
+      fetchId: toHex(request.fetchId),
+      machineId: toHex(request.machineId),
+      remote: request.remote,
+      refs: request.refs.map((ref) => ({
+        bookmark: ref.bookmark,
+        observedGitOid: toHex(ref.observedGitOid),
+        expectedCursorOid:
+          ref.expectedCursorOid === null ? null : toHex(ref.expectedCursorOid),
+        states: ref.states.map(encodeProjectionState),
+        proposedState: ref.proposedState,
+      })),
+      receipts: request.receipts.map((receipt) => ({
+        gitOid: toHex(receipt.gitOid),
+        publicCommitId: toHex(receipt.publicCommitId),
+      })),
+    }),
+  );
+}
+
 export function compareNullableBytes(
   left: Uint8Array | null,
   right: Uint8Array | null,
@@ -167,25 +314,9 @@ function decodeUpdate(value: unknown, index: number): ProjectionUpdate {
   const record = requireRecord(value, `updates[${index}]`);
   requireExactKeys(record, ["bookmark", "expectedOldOid", "states", "proposedState"]);
   if (!Array.isArray(record.states)) throw new Error(`updates[${index}].states must be an array`);
-  const states = record.states.map((value, stateIndex): ProjectionState => {
-    const state = requireRecord(value, `updates[${index}].states[${stateIndex}]`);
-    requireExactKeys(state, ["gitOid", "canonicalCommitId", "publicCommitId", "hiddenSetId"]);
-    const decoded = {
-      gitOid: decodeHex(state.gitOid, GIT_OID_PATTERN, "gitOid", 20),
-      canonicalCommitId: decodeHex(
-        state.canonicalCommitId,
-        OBJECT_ID_PATTERN,
-        "canonicalCommitId",
-        64,
-      ),
-      publicCommitId: decodeHex(state.publicCommitId, OBJECT_ID_PATTERN, "publicCommitId", 64),
-      hiddenSetId: decodeHiddenSetId(state.hiddenSetId),
-    };
-    requireNonZero(decoded.gitOid, "gitOid");
-    requireNonZero(decoded.canonicalCommitId, "canonicalCommitId");
-    requireNonZero(decoded.publicCommitId, "publicCommitId");
-    return decoded;
-  });
+  const states = record.states.map((value, stateIndex): ProjectionState =>
+    decodeProjectionState(value, `updates[${index}].states[${stateIndex}]`),
+  );
   const proposedState =
     record.proposedState === null
       ? null
@@ -210,6 +341,35 @@ function decodeUpdate(value: unknown, index: number): ProjectionUpdate {
     ),
     states,
     proposedState,
+  };
+}
+
+function decodeProjectionState(value: unknown, field: string): ProjectionState {
+  const state = requireRecord(value, field);
+  requireExactKeys(state, ["gitOid", "canonicalCommitId", "publicCommitId", "hiddenSetId"]);
+  const decoded = {
+    gitOid: decodeHex(state.gitOid, GIT_OID_PATTERN, "gitOid", 20),
+    canonicalCommitId: decodeHex(
+      state.canonicalCommitId,
+      OBJECT_ID_PATTERN,
+      "canonicalCommitId",
+      64,
+    ),
+    publicCommitId: decodeHex(state.publicCommitId, OBJECT_ID_PATTERN, "publicCommitId", 64),
+    hiddenSetId: decodeHiddenSetId(state.hiddenSetId),
+  };
+  requireNonZero(decoded.gitOid, "gitOid");
+  requireNonZero(decoded.canonicalCommitId, "canonicalCommitId");
+  requireNonZero(decoded.publicCommitId, "publicCommitId");
+  return decoded;
+}
+
+function encodeProjectionState(state: ProjectionState) {
+  return {
+    gitOid: toHex(state.gitOid),
+    canonicalCommitId: toHex(state.canonicalCommitId),
+    publicCommitId: toHex(state.publicCommitId),
+    hiddenSetId: state.hiddenSetId === null ? null : toHex(state.hiddenSetId),
   };
 }
 

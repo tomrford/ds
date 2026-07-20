@@ -6,11 +6,14 @@ import {
   ProjectionProtocolError,
   ProjectionFenceRequest,
   ProjectionObservation,
+  RecordFetchRequest,
+  canonicalFetchBytes,
   canonicalProjectionBatchBytes,
   compareNullableBytes,
   decodeBeginProjectionBatch,
   decodeClaimProjectionBatch,
   decodeProjectionFence,
+  decodeRecordFetch,
   decodeRecoverProjectionBatch,
 } from "./projection_protocol";
 import {
@@ -99,6 +102,17 @@ interface RemoteRow extends Record<string, SqlStorageValue> {
   url: string;
 }
 
+interface FetchResultRow extends Record<string, SqlStorageValue> {
+  request_hash: ArrayBuffer;
+  activation_cursor: number;
+}
+
+interface ActiveStateRow extends Record<string, SqlStorageValue> {
+  state_id: number;
+  canonical_commit_id: ArrayBuffer;
+  hidden_set_id: ArrayBuffer | null;
+}
+
 interface MissingObjectRow extends Record<string, SqlStorageValue> {
   kind: number;
   id: ArrayBuffer;
@@ -108,6 +122,7 @@ class ProjectionStoreError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly code?: string,
   ) {
     super(message);
   }
@@ -494,6 +509,182 @@ export class ProjectionStore {
     }
   }
 
+  recordFetch(value: unknown, authenticatedMachineId: string) {
+    let request: RecordFetchRequest;
+    try {
+      request = decodeRecordFetch(value);
+      requireAuthenticatedMachine(
+        request.machineId,
+        authenticatedMachineId,
+        "fetch-machine-mismatch",
+      );
+    } catch (error) {
+      return requestFailure(error, "invalid-fetch-request");
+    }
+    const incarnation = exactBuffer(request.incarnation);
+    const fetchId = exactBuffer(request.fetchId);
+    const requestHash = exactBuffer(this.kernel.hash([canonicalFetchBytes(request)]));
+    try {
+      return this.ctx.storage.transactionSync(() => {
+        // 1. A completed fetch is the idempotency record and response payload.
+        const recorded = this.fetchResult(fetchId);
+        if (recorded !== undefined) {
+          if (!equalBytes(new Uint8Array(recorded.request_hash), new Uint8Array(requestHash))) {
+            throw new ProjectionStoreError(
+              "fetch ID was already used for a different request",
+              409,
+              "fetch-request-mismatch",
+            );
+          }
+          return {
+            ok: true as const,
+            fetchId: toHex(request.fetchId),
+            activationCursor: recorded.activation_cursor,
+          };
+        }
+
+        this.requireIncarnation(incarnation, "repository-incarnation-mismatch");
+        if (!this.remoteExists(request.remote)) {
+          throw new ProjectionStoreError(
+            `remote ${request.remote} is not registered`,
+            404,
+            "remote-not-found",
+          );
+        }
+        // 2. Fetch observes the exact last accepted state for every ref.
+        for (const ref of request.refs) {
+          this.requireExpectedCursor(
+            request.remote,
+            ref.bookmark,
+            ref.expectedCursorOid,
+            "fetch-cursor-stale",
+          );
+        }
+
+        // 3. Push recovery owns any ref it has quarantined.
+        for (const ref of request.refs) {
+          if (this.hasPendingPush(request.remote, ref.bookmark)) {
+            throw new ProjectionStoreError(
+              `fetch overlaps a pending push for ${request.remote}/${ref.bookmark}`,
+              409,
+              "fetch-overlaps-pending-push",
+            );
+          }
+        }
+
+        // 4. Both the raw public and lifted private histories must be durable.
+        for (const ref of request.refs) {
+          for (const state of ref.states) {
+            this.requireDurableState(state, "fetch-commit-not-durable");
+          }
+        }
+
+        // 5. Receipts are immutable, including duplicate entries in this request.
+        const receipts = this.requireFetchReceiptConsistency(request);
+
+        // 6. Every state must agree with its immutable Git-to-public receipt.
+        for (const ref of request.refs) {
+          for (const state of ref.states) {
+            const publicCommitId = receipts.get(toHex(state.gitOid));
+            if (
+              publicCommitId === undefined ||
+              !equalBytes(publicCommitId, state.publicCommitId)
+            ) {
+              throw new ProjectionStoreError(
+                `fetch state for Git object ${toHex(state.gitOid)} does not match an immutable receipt`,
+                409,
+                "fetch-state-receipt-mismatch",
+              );
+            }
+          }
+        }
+
+        // 7. One Git object has one private lineage across current bookmark tips.
+        this.requireUnambiguousFetchLineage(request);
+        this.requireFetchCursorCapacity(request);
+
+        const existingStateIds = new Map<string, number>();
+        for (const ref of request.refs) {
+          if (ref.proposedState !== null) continue;
+          const existing = this.activeStateForObserved(
+            request.remote,
+            ref.bookmark,
+            ref.observedGitOid,
+          );
+          if (existing === undefined) {
+            throw new ProjectionStoreError(
+              `observed Git object ${toHex(ref.observedGitOid)} has no active state for ${request.remote}/${ref.bookmark}`,
+              409,
+              "fetch-observed-state-not-found",
+            );
+          }
+          existingStateIds.set(ref.bookmark, existing.state_id);
+        }
+
+        for (const receipt of request.receipts) {
+          this.storeReceipt(receipt.gitOid, receipt.publicCommitId);
+        }
+
+        let activation = this.meta().activation_cursor;
+        for (const ref of request.refs) {
+          const stateIds: number[] = [];
+          for (const state of ref.states) {
+            if (activation >= Number.MAX_SAFE_INTEGER) {
+              throw new Error("projection activation cursor exceeds the safe integer range");
+            }
+            activation += 1;
+            this.sql.exec(
+              `INSERT INTO projection_states
+               (remote, bookmark, git_oid, canonical_commit_id, public_commit_id,
+                hidden_set_id, pending_batch_id, activation_seq)
+               VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+              request.remote,
+              ref.bookmark,
+              exactBuffer(state.gitOid),
+              exactBuffer(state.canonicalCommitId),
+              exactBuffer(state.publicCommitId),
+              state.hiddenSetId === null ? null : exactBuffer(state.hiddenSetId),
+              activation,
+            );
+            stateIds.push(
+              this.sql.exec<{ id: number }>("SELECT last_insert_rowid() AS id").one().id,
+            );
+          }
+          const proposedStateId =
+            ref.proposedState === null
+              ? existingStateIds.get(ref.bookmark)
+              : stateIds[ref.proposedState];
+          if (proposedStateId === undefined) throw new Error("fetch cursor state is missing");
+          this.sql.exec(
+            `INSERT INTO projection_cursors VALUES (?, ?, ?)
+             ON CONFLICT (remote, bookmark) DO UPDATE SET state_id = excluded.state_id`,
+            request.remote,
+            ref.bookmark,
+            proposedStateId,
+          );
+        }
+        this.sql.exec(
+          "UPDATE projection_meta SET activation_cursor = ? WHERE singleton = 1",
+          activation,
+        );
+        this.sql.exec(
+          "INSERT INTO projection_fetch_results VALUES (?, ?, ?, ?)",
+          fetchId,
+          request.remote,
+          requestHash,
+          activation,
+        );
+        return {
+          ok: true as const,
+          fetchId: toHex(request.fetchId),
+          activationCursor: activation,
+        };
+      });
+    } catch (error) {
+      return this.handleExpected(error);
+    }
+  }
+
   claim(batchIdValue: unknown, value: unknown, authenticatedMachineId: string) {
     let batchId: ArrayBuffer;
     let request: ReturnType<typeof decodeClaimProjectionBatch>;
@@ -687,6 +878,7 @@ export class ProjectionStore {
     this.sql.exec("DELETE FROM projection_states WHERE remote = ?", remote);
     this.sql.exec("DELETE FROM projection_batches WHERE remote = ?", remote);
     this.sql.exec("DELETE FROM projection_batch_results WHERE remote = ?", remote);
+    this.sql.exec("DELETE FROM projection_fetch_results WHERE remote = ?", remote);
   }
 
   private replayFinished(batchId: ArrayBuffer, request: ProjectionFenceRequest) {
@@ -725,13 +917,17 @@ export class ProjectionStore {
   private requireDurableState(state: {
     canonicalCommitId: Uint8Array;
     publicCommitId: Uint8Array;
-  }) {
+  }, code?: string) {
     for (const [label, id] of [
       ["canonical", state.canonicalCommitId],
       ["public", state.publicCommitId],
     ] as const) {
       if (id.every((byte) => byte === 0)) {
-        throw new ProjectionStoreError(`${label} commit ${toHex(id)} is not cloud durable`, 409);
+        throw new ProjectionStoreError(
+          `${label} commit ${toHex(id)} is not cloud durable`,
+          409,
+          code,
+        );
       }
       const commitId = exactBuffer(id);
       const missing = this.findMissingReachableObject(commitId);
@@ -741,11 +937,13 @@ export class ProjectionStore {
           throw new ProjectionStoreError(
             `${label} commit ${toHex(id)} is not cloud durable`,
             409,
+            code,
           );
         }
         throw new ProjectionStoreError(
           `${label} commit ${toHex(id)} closure is missing ${KIND_BY_NUMBER[missing.kind] ?? `kind ${missing.kind}`} ${missingId}`,
           409,
+          code,
         );
       }
       this.markClosureComplete(commitId);
@@ -825,6 +1023,7 @@ export class ProjectionStore {
     remote: string,
     bookmark: string,
     expected: Uint8Array | null,
+    code?: string,
   ) {
     const row = this.sql
       .exec<{ git_oid: ArrayBuffer }>(
@@ -840,6 +1039,7 @@ export class ProjectionStore {
       throw new ProjectionStoreError(
         `projection cursor for ${remote}/${bookmark} does not match expected old Git ID`,
         409,
+        code,
       );
     }
   }
@@ -892,14 +1092,175 @@ export class ProjectionStore {
     }
   }
 
-  private requireIncarnation(incarnation: ArrayBuffer) {
+  private requireIncarnation(incarnation: ArrayBuffer, code?: string) {
     const state = this.sql
       .exec<RepositoryStateRow>("SELECT incarnation FROM repository_state WHERE singleton = 1")
       .toArray()[0];
-    if (state === undefined) throw new ProjectionStoreError("repository is not initialized", 409);
-    if (!equalBytes(new Uint8Array(state.incarnation), new Uint8Array(incarnation))) {
-      throw new ProjectionStoreError("repository incarnation does not match", 409);
+    if (state === undefined) {
+      throw new ProjectionStoreError("repository is not initialized", 409, code);
     }
+    if (!equalBytes(new Uint8Array(state.incarnation), new Uint8Array(incarnation))) {
+      throw new ProjectionStoreError("repository incarnation does not match", 409, code);
+    }
+  }
+
+  private remoteExists(remote: string) {
+    return (
+      this.sql.exec<{ count: number }>("SELECT count(*) AS count FROM remotes WHERE name = ?", remote)
+        .one().count !== 0
+    );
+  }
+
+  private requireFetchCursorCapacity(request: RecordFetchRequest) {
+    const cursorCount = this.sql
+      .exec<{ count: number }>("SELECT count(*) AS count FROM projection_cursors")
+      .one().count;
+    const additions = request.refs.filter((ref) => ref.expectedCursorOid === null).length;
+    if (cursorCount + additions > MAX_REPOSITORY_PROJECTION_REFS) {
+      throw new ProjectionStoreError(
+        `projection cursors exceed the ${MAX_REPOSITORY_PROJECTION_REFS}-ref repository limit`,
+        429,
+        "fetch-repository-ref-limit",
+      );
+    }
+  }
+
+  private hasPendingPush(remote: string, bookmark: string) {
+    return (
+      this.sql
+        .exec<{ count: number }>(
+          `SELECT count(*) AS count FROM projection_batch_refs
+           WHERE remote = ? AND bookmark = ?`,
+          remote,
+          bookmark,
+        )
+        .one().count !== 0
+    );
+  }
+
+  private requireFetchReceiptConsistency(request: RecordFetchRequest) {
+    const receipts = new Map<string, Uint8Array>();
+    for (const receipt of request.receipts) {
+      const key = toHex(receipt.gitOid);
+      const requested = receipts.get(key);
+      if (requested !== undefined && !equalBytes(requested, receipt.publicCommitId)) {
+        throw new ProjectionStoreError(
+          `Git object ${key} has conflicting receipts in the fetch request`,
+          409,
+          "git-receipt-conflict",
+        );
+      }
+      const existing = this.sql
+        .exec<ReceiptRow>(
+          "SELECT public_commit_id FROM git_receipts WHERE git_oid = ?",
+          exactBuffer(receipt.gitOid),
+        )
+        .toArray()[0];
+      if (
+        existing !== undefined &&
+        !equalBytes(new Uint8Array(existing.public_commit_id), receipt.publicCommitId)
+      ) {
+        throw new ProjectionStoreError(
+          `Git object ${key} already has a different immutable receipt`,
+          409,
+          "git-receipt-conflict",
+        );
+      }
+      receipts.set(key, receipt.publicCommitId);
+    }
+    for (const ref of request.refs) {
+      for (const state of ref.states) {
+        const key = toHex(state.gitOid);
+        if (receipts.has(key)) continue;
+        const existing = this.sql
+          .exec<ReceiptRow>(
+            "SELECT public_commit_id FROM git_receipts WHERE git_oid = ?",
+            exactBuffer(state.gitOid),
+          )
+          .toArray()[0];
+        if (existing !== undefined) {
+          receipts.set(key, new Uint8Array(existing.public_commit_id));
+        }
+      }
+    }
+    return receipts;
+  }
+
+  private requireUnambiguousFetchLineage(request: RecordFetchRequest) {
+    const requested = new Map<
+      string,
+      { canonicalCommitId: Uint8Array; hiddenSetId: Uint8Array | null }
+    >();
+    for (const ref of request.refs) {
+      for (const state of ref.states) {
+        const key = toHex(state.gitOid);
+        const lineage = requested.get(key);
+        if (lineage !== undefined && !sameLineage(lineage, state)) {
+          throw new ProjectionStoreError(
+            `Git object ${key} has ambiguous lineage in the fetch request`,
+            409,
+            "fetch-lineage-ambiguous",
+          );
+        }
+        requested.set(key, state);
+      }
+    }
+    for (const [gitOid, lineage] of requested) {
+      const active = this.sql
+        .exec<ActiveStateRow>(
+          `WITH newest AS (
+             SELECT remote, bookmark, max(activation_seq) AS activation_seq
+             FROM projection_states
+             WHERE pending_batch_id IS NULL
+             GROUP BY remote, bookmark
+           )
+           SELECT states.state_id, states.canonical_commit_id, states.hidden_set_id
+           FROM projection_states AS states
+           JOIN newest USING (remote, bookmark, activation_seq)
+           WHERE states.git_oid = ?`,
+          exactBuffer(hexBytes(gitOid)),
+        )
+        .toArray();
+      for (const state of active) {
+        if (
+          !sameLineage(lineage, {
+            canonicalCommitId: new Uint8Array(state.canonical_commit_id),
+            hiddenSetId:
+              state.hidden_set_id === null ? null : new Uint8Array(state.hidden_set_id),
+          })
+        ) {
+          throw new ProjectionStoreError(
+            `Git object ${gitOid} conflicts with active projection lineage`,
+            409,
+            "fetch-lineage-ambiguous",
+          );
+        }
+      }
+    }
+  }
+
+  private activeStateForObserved(remote: string, bookmark: string, gitOid: Uint8Array) {
+    return this.sql
+      .exec<ActiveStateRow>(
+        `SELECT state_id, canonical_commit_id, hidden_set_id
+         FROM projection_states
+         WHERE pending_batch_id IS NULL AND remote = ? AND bookmark = ? AND git_oid = ?
+         ORDER BY activation_seq DESC LIMIT 1`,
+        remote,
+        bookmark,
+        exactBuffer(gitOid),
+      )
+      .toArray()[0];
+  }
+
+  private fetchResult(fetchId: ArrayBuffer) {
+    return this.sql
+      .exec<FetchResultRow>(
+        `SELECT request_hash, activation_cursor
+         FROM projection_fetch_results WHERE fetch_id = ?`,
+        fetchId,
+      )
+      .toArray()[0];
   }
 
   private nextFence(meta: ProjectionMetaRow): number {
@@ -930,6 +1291,22 @@ export class ProjectionStore {
   }
 }
 
+function sameLineage(
+  left: { canonicalCommitId: Uint8Array; hiddenSetId: Uint8Array | null },
+  right: { canonicalCommitId: Uint8Array; hiddenSetId: Uint8Array | null },
+) {
+  return (
+    equalBytes(left.canonicalCommitId, right.canonicalCommitId) &&
+    compareNullableBytes(left.hiddenSetId, right.hiddenSetId) === 0
+  );
+}
+
+function hexBytes(value: string) {
+  return Uint8Array.from({ length: value.length / 2 }, (_, index) =>
+    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
+  );
+}
+
 function decodeIncarnationOnly(value: unknown): Uint8Array {
   return decodeClaimProjectionBatch({ incarnation: value, machineId: "00".repeat(16) }).incarnation;
 }
@@ -945,14 +1322,20 @@ function failure(error: unknown, status: number, code?: string) {
     error: error instanceof Error ? error.message : "projection request failed",
     ...(code !== undefined
       ? { code }
-      : error instanceof ProjectionProtocolError
+      : error instanceof ProjectionStoreError && error.code !== undefined
+        ? { code: error.code }
+        : error instanceof ProjectionProtocolError
         ? { code: error.code }
         : {}),
   };
 }
 
-function requestFailure(error: unknown) {
-  return failure(error, error instanceof ProjectionStoreError ? error.status : 400);
+function requestFailure(error: unknown, code?: string) {
+  return failure(
+    error,
+    error instanceof ProjectionStoreError ? error.status : 400,
+    error instanceof ProjectionStoreError ? error.code : code,
+  );
 }
 
 function remoteRequestFailure(error: unknown) {
@@ -960,8 +1343,16 @@ function remoteRequestFailure(error: unknown) {
   return failure(error, 400, "invalid-remote-request");
 }
 
-function requireAuthenticatedMachine(machineId: Uint8Array, authenticatedMachineId: string) {
+function requireAuthenticatedMachine(
+  machineId: Uint8Array,
+  authenticatedMachineId: string,
+  code?: string,
+) {
   if (toHex(machineId) !== authenticatedMachineId) {
-    throw new ProjectionStoreError("projection machine does not match authenticated machine", 403);
+    throw new ProjectionStoreError(
+      "projection machine does not match authenticated machine",
+      403,
+      code,
+    );
   }
 }

@@ -9,7 +9,11 @@ import {
   MAX_OBJECT_INVENTORY_REQUEST_BYTES,
 } from "../src/object_protocol";
 import { MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, decodeManifest } from "../src/pack_protocol";
-import { MAX_PROJECTION_NAME_BYTES } from "../src/projection_protocol";
+import {
+  MAX_PROJECTION_NAME_BYTES,
+  MAX_PROJECTION_REFS,
+  MAX_PROJECTION_REQUEST_BYTES,
+} from "../src/projection_protocol";
 import { MAX_REMOTE_URL_BYTES } from "../src/remote_protocol";
 
 const defaultMachine = "66".repeat(16);
@@ -1145,6 +1149,571 @@ describe("Git projection journal", () => {
   });
 });
 
+describe("Git fetch journal", () => {
+  const incarnation = "d1".repeat(16);
+  const machine = "66".repeat(16);
+
+  it("records parent-first active states, advances cursors, and replays without duplication", async () => {
+    const repository = "fetch-happy";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
+    const [canonicalParent, publicParent, canonicalHead, publicHead] =
+      await installProjectionCommits(repository, 4);
+    const parentOid = "d2".repeat(20);
+    const headOid = "d3".repeat(20);
+    const fetchId = "d4".repeat(16);
+    const request = fetchRequest(
+      incarnation,
+      fetchId,
+      machine,
+      [
+        fetchRef(
+          "main",
+          headOid,
+          null,
+          [
+            fetchState(parentOid, canonicalParent, publicParent),
+            fetchState(headOid, canonicalHead, publicHead, "d5".repeat(64)),
+          ],
+          1,
+        ),
+      ],
+      [
+        { gitOid: parentOid, publicCommitId: publicParent },
+        { gitOid: headOid, publicCommitId: publicHead },
+      ],
+    );
+
+    const result = { status: 200, body: { fetchId, activationCursor: 2 } };
+    expect(await projectionRequest(repository, "git/fetches", request)).toEqual(result);
+    expect(await getProjection(repository, incarnation)).toEqual({
+      status: 200,
+      body: {
+        activationCursor: 2,
+        cursors: [
+          {
+            remote: "origin",
+            bookmark: "main",
+            gitOid: headOid,
+            canonicalCommitId: canonicalHead,
+            publicCommitId: publicHead,
+            hiddenSetId: "d5".repeat(64),
+            activationSequence: 2,
+          },
+        ],
+        mappings: [
+          {
+            remote: "origin",
+            bookmark: "main",
+            gitOid: parentOid,
+            canonicalCommitId: canonicalParent,
+            publicCommitId: publicParent,
+            hiddenSetId: null,
+          },
+          {
+            remote: "origin",
+            bookmark: "main",
+            gitOid: headOid,
+            canonicalCommitId: canonicalHead,
+            publicCommitId: publicHead,
+            hiddenSetId: "d5".repeat(64),
+          },
+        ],
+        nextAfter: 2,
+        through: 2,
+        hasMore: false,
+        pending: [],
+      },
+    });
+
+    expect(await projectionRequest(repository, "git/fetches", request)).toEqual(result);
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 2,
+      nextAfter: 2,
+    });
+    expect(
+      await projectionRequest(repository, "git/fetches", {
+        ...request,
+        remote: "upstream",
+      }),
+    ).toEqual({
+      status: 409,
+      body: {
+        error: "fetch ID was already used for a different request",
+        code: "fetch-request-mismatch",
+      },
+    });
+
+    const knownResult = await projectionRequest(
+      repository,
+      "git/fetches",
+      fetchRequest(
+        incarnation,
+        "d6".repeat(16),
+        machine,
+        [fetchRef("main", headOid, headOid, [], null)],
+        [],
+      ),
+    );
+    expect(knownResult).toEqual({
+      status: 200,
+      body: { fetchId: "d6".repeat(16), activationCursor: 2 },
+    });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 2,
+      cursors: [{ gitOid: headOid }],
+    });
+  });
+
+  it("rejects stale cursors in both directions without mutating the journal", async () => {
+    const repository = "fetch-stale";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
+    const [canonicalOne, publicOne, canonicalTwo, publicTwo, canonicalThree, publicThree] =
+      await installProjectionCommits(repository, 6);
+    const firstOid = "d7".repeat(20);
+    const secondOid = "d8".repeat(20);
+    const thirdOid = "d9".repeat(20);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "da".repeat(16),
+          machine,
+          [fetchRef("main", firstOid, null, [fetchState(firstOid, canonicalOne, publicOne)], 0)],
+          [{ gitOid: firstOid, publicCommitId: publicOne }],
+        ),
+      ),
+    ).toMatchObject({ status: 200, body: { activationCursor: 1 } });
+
+    const nullButSet = fetchRequest(
+      incarnation,
+      "db".repeat(16),
+      machine,
+      [fetchRef("main", secondOid, null, [fetchState(secondOid, canonicalTwo, publicTwo)], 0)],
+      [{ gitOid: secondOid, publicCommitId: publicTwo }],
+    );
+    expect(await projectionRequest(repository, "git/fetches", nullButSet)).toMatchObject({
+      status: 409,
+      body: { code: "fetch-cursor-stale" },
+    });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 1,
+      cursors: [{ gitOid: firstOid }],
+    });
+
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "dc".repeat(16),
+          machine,
+          [
+            fetchRef(
+              "main",
+              secondOid,
+              firstOid,
+              [fetchState(secondOid, canonicalTwo, publicTwo)],
+              0,
+            ),
+          ],
+          [{ gitOid: secondOid, publicCommitId: publicTwo }],
+        ),
+      ),
+    ).toMatchObject({ status: 200, body: { activationCursor: 2 } });
+
+    const moved = fetchRequest(
+      incarnation,
+      "dd".repeat(16),
+      machine,
+      [
+        fetchRef(
+          "main",
+          thirdOid,
+          firstOid,
+          [fetchState(thirdOid, canonicalThree, publicThree)],
+          0,
+        ),
+      ],
+      [{ gitOid: thirdOid, publicCommitId: publicThree }],
+    );
+    expect(await projectionRequest(repository, "git/fetches", moved)).toMatchObject({
+      status: 409,
+      body: { code: "fetch-cursor-stale" },
+    });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 2,
+      cursors: [{ gitOid: secondOid }],
+    });
+  });
+
+  it("waits for overlapping push recovery before accepting the same fetch", async () => {
+    const repository = "fetch-pending-push";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
+    const [canonicalCommitId, publicCommitId] = await installProjectionCommits(repository);
+    const gitOid = "de".repeat(20);
+    const batchId = "df".repeat(16);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/pushes",
+        projectionBatch(
+          incarnation,
+          batchId,
+          machine,
+          projectionUpdate("main", null, gitOid, canonicalCommitId, publicCommitId),
+        ),
+      ),
+    ).toEqual({ status: 200, body: { pending: true, fence: 1 } });
+    const request = fetchRequest(
+      incarnation,
+      "e0".repeat(16),
+      machine,
+      [fetchRef("main", gitOid, null, [fetchState(gitOid, canonicalCommitId, publicCommitId)], 0)],
+      [],
+    );
+    expect(await projectionRequest(repository, "git/fetches", request)).toMatchObject({
+      status: 409,
+      body: { code: "fetch-overlaps-pending-push" },
+    });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 0,
+      cursors: [],
+    });
+
+    expect(
+      await projectionRequest(repository, `git/pushes/${batchId}/recover`, {
+        incarnation,
+        machineId: machine,
+        fence: 1,
+        observations: [{ bookmark: "main", liveOid: null }],
+      }),
+    ).toMatchObject({ status: 200, body: { outcome: "aborted" } });
+    expect(await projectionRequest(repository, "git/fetches", request)).toEqual({
+      status: 200,
+      body: { fetchId: "e0".repeat(16), activationCursor: 1 },
+    });
+  });
+
+  it("rejects non-durable commits without retaining receipts or states", async () => {
+    const repository = "fetch-durability";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
+    const gitOid = "e1".repeat(20);
+    const missingCanonical = "e2".repeat(64);
+    const missingPublic = "e3".repeat(64);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "e4".repeat(16),
+          machine,
+          [
+            fetchRef(
+              "main",
+              gitOid,
+              null,
+              [fetchState(gitOid, missingCanonical, missingPublic)],
+              0,
+            ),
+          ],
+          [{ gitOid, publicCommitId: missingPublic }],
+        ),
+      ),
+    ).toMatchObject({
+      status: 409,
+      body: { code: "fetch-commit-not-durable" },
+    });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 0,
+      cursors: [],
+      mappings: [],
+    });
+
+    const [canonicalCommitId, publicCommitId] = await installProjectionCommits(repository);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "e5".repeat(16),
+          machine,
+          [
+            fetchRef(
+              "main",
+              gitOid,
+              null,
+              [fetchState(gitOid, canonicalCommitId, publicCommitId)],
+              0,
+            ),
+          ],
+          [{ gitOid, publicCommitId }],
+        ),
+      ),
+    ).toMatchObject({ status: 200, body: { activationCursor: 1 } });
+  });
+
+  it("enforces immutable receipts and state receipt coverage", async () => {
+    const repository = "fetch-receipts";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
+    const [canonicalCommitId, publicCommitId, otherPublicCommitId] =
+      await installProjectionCommits(repository, 3);
+    const gitOid = "e6".repeat(20);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "e7".repeat(16),
+          machine,
+          [
+            fetchRef(
+              "main",
+              gitOid,
+              null,
+              [fetchState(gitOid, canonicalCommitId, publicCommitId)],
+              0,
+            ),
+          ],
+          [{ gitOid, publicCommitId }],
+        ),
+      ),
+    ).toMatchObject({ status: 200 });
+
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "e8".repeat(16),
+          machine,
+          [
+            fetchRef(
+              "conflict",
+              gitOid,
+              null,
+              [fetchState(gitOid, canonicalCommitId, otherPublicCommitId)],
+              0,
+            ),
+          ],
+          [{ gitOid, publicCommitId: otherPublicCommitId }],
+        ),
+      ),
+    ).toMatchObject({ status: 409, body: { code: "git-receipt-conflict" } });
+
+    const unmatchedOid = "e9".repeat(20);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "ea".repeat(16),
+          machine,
+          [
+            fetchRef(
+              "unmatched",
+              unmatchedOid,
+              null,
+              [fetchState(unmatchedOid, canonicalCommitId, otherPublicCommitId)],
+              0,
+            ),
+          ],
+          [],
+        ),
+      ),
+    ).toMatchObject({ status: 409, body: { code: "fetch-state-receipt-mismatch" } });
+
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "eb".repeat(16),
+          machine,
+          [
+            fetchRef(
+              "same",
+              gitOid,
+              null,
+              [fetchState(gitOid, canonicalCommitId, publicCommitId)],
+              0,
+            ),
+          ],
+          [{ gitOid, publicCommitId }],
+        ),
+      ),
+    ).toMatchObject({ status: 200, body: { activationCursor: 2 } });
+  });
+
+  it("rejects ambiguous lineage within a fetch and against active bookmark tips", async () => {
+    const repository = "fetch-lineage";
+    await initializeProjectionRepository(repository, incarnation);
+    await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
+    const [canonicalOne, publicCommitId, canonicalTwo] =
+      await installProjectionCommits(repository, 3);
+    const gitOid = "ec".repeat(20);
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "ed".repeat(16),
+          machine,
+          [
+            fetchRef("a", gitOid, null, [fetchState(gitOid, canonicalOne, publicCommitId)], 0),
+            fetchRef("b", gitOid, null, [fetchState(gitOid, canonicalTwo, publicCommitId)], 0),
+          ],
+          [{ gitOid, publicCommitId }],
+        ),
+      ),
+    ).toMatchObject({ status: 409, body: { code: "fetch-lineage-ambiguous" } });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 0,
+      mappings: [],
+    });
+
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "ee".repeat(16),
+          machine,
+          [fetchRef("a", gitOid, null, [fetchState(gitOid, canonicalOne, publicCommitId)], 0)],
+          [{ gitOid, publicCommitId }],
+        ),
+      ),
+    ).toMatchObject({ status: 200 });
+    expect(
+      await projectionRequest(
+        repository,
+        "git/fetches",
+        fetchRequest(
+          incarnation,
+          "ef".repeat(16),
+          machine,
+          [fetchRef("b", gitOid, null, [fetchState(gitOid, canonicalTwo, publicCommitId)], 0)],
+          [],
+        ),
+      ),
+    ).toMatchObject({ status: 409, body: { code: "fetch-lineage-ambiguous" } });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 1,
+      cursors: [{ bookmark: "a", canonicalCommitId: canonicalOne }],
+    });
+  });
+
+  it("enforces auth, incarnation, remote registration, strict decoding, and bounds", async () => {
+    const repository = "fetch-validation";
+    await initializeProjectionRepository(repository, incarnation);
+    const [canonicalCommitId, publicCommitId] = await installProjectionCommits(repository);
+    const gitOid = "f0".repeat(20);
+    const valid = fetchRequest(
+      incarnation,
+      "f1".repeat(16),
+      machine,
+      [fetchRef("main", gitOid, null, [fetchState(gitOid, canonicalCommitId, publicCommitId)], 0)],
+      [{ gitOid, publicCommitId }],
+    );
+
+    const target = await ensureRepository(repository, incarnation);
+    const authMismatch = await repositoryRequest(
+      repository,
+      "git/fetches",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...valid, incarnation: target.incarnation }),
+      },
+      recoveryMachine,
+    );
+    expect({ status: authMismatch.status, body: await authMismatch.json() }).toMatchObject({
+      status: 403,
+      body: { code: "fetch-machine-mismatch" },
+    });
+
+    expect(
+      await projectionRequest(repository, "git/fetches", {
+        ...valid,
+        incarnation: "f2".repeat(16),
+      }),
+    ).toMatchObject({ status: 409, body: { code: "repository-incarnation-mismatch" } });
+    expect(await projectionRequest(repository, "git/fetches", valid)).toEqual({
+      status: 404,
+      body: { error: "remote origin is not registered", code: "remote-not-found" },
+    });
+
+    await putRemote(repository, incarnation, "origin", "/tmp/origin.git");
+    expect(
+      await projectionRequest(repository, "git/fetches", { ...valid, unexpected: true }),
+    ).toMatchObject({ status: 400, body: { code: "invalid-fetch-request" } });
+    expect(
+      await projectionRequest(repository, "git/fetches", { ...valid, refs: [] }),
+    ).toMatchObject({ status: 400, body: { code: "invalid-fetch-request" } });
+
+    const tooManyRefs = Array.from({ length: MAX_PROJECTION_REFS + 1 }, (_, index) =>
+      fetchRef(`ref-${index}`, gitOid, null, [], null),
+    );
+    expect(
+      await projectionRequest(repository, "git/fetches", { ...valid, refs: tooManyRefs }),
+    ).toEqual({
+      status: 400,
+      body: {
+        error: `refs exceeds the ${MAX_PROJECTION_REFS}-ref limit`,
+        code: "invalid-fetch-request",
+      },
+    });
+    expect(
+      await projectionRawRequest(
+        repository,
+        "git/fetches",
+        new TextEncoder().encode("{"),
+        machine,
+      ),
+    ).toEqual({
+      status: 400,
+      body: {
+        error: "projection fetch request must be valid JSON",
+        code: "invalid-fetch-request",
+      },
+    });
+    expect(
+      await projectionRawRequest(
+        repository,
+        "git/fetches",
+        new Uint8Array(MAX_PROJECTION_REQUEST_BYTES + 1),
+        machine,
+      ),
+    ).toEqual({
+      status: 400,
+      body: {
+        error: `projection fetch request exceeds ${MAX_PROJECTION_REQUEST_BYTES} byte limit`,
+        code: "invalid-fetch-request",
+      },
+    });
+    expect((await getProjection(repository, incarnation)).body).toMatchObject({
+      activationCursor: 0,
+      cursors: [],
+      mappings: [],
+    });
+  });
+});
+
 describe("remote registry", () => {
   const incarnation = "56".repeat(16);
   const machine = "66".repeat(16);
@@ -1551,6 +2120,35 @@ function projectionBatch(
   ...updates: ReturnType<typeof projectionUpdate>[]
 ) {
   return { incarnation, batchId, machineId, remote: "origin", updates };
+}
+
+function fetchState(
+  gitOid: string,
+  canonicalCommitId: string,
+  publicCommitId: string,
+  hiddenSetId: string | null = null,
+) {
+  return { gitOid, canonicalCommitId, publicCommitId, hiddenSetId };
+}
+
+function fetchRef(
+  bookmark: string,
+  observedGitOid: string,
+  expectedCursorOid: string | null,
+  states: ReturnType<typeof fetchState>[],
+  proposedState: number | null,
+) {
+  return { bookmark, observedGitOid, expectedCursorOid, states, proposedState };
+}
+
+function fetchRequest(
+  incarnation: string,
+  fetchId: string,
+  machineId: string,
+  refs: ReturnType<typeof fetchRef>[],
+  receipts: Array<{ gitOid: string; publicCommitId: string }>,
+) {
+  return { incarnation, fetchId, machineId, remote: "origin", refs, receipts };
 }
 
 async function projectionRequest(repository: string, path: string, body: unknown) {

@@ -33,6 +33,29 @@ pub struct ProjectionUpdate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchRef {
+    pub bookmark: String,
+    pub observed_git_oid: [u8; 20],
+    pub expected_cursor_oid: Option<[u8; 20]>,
+    pub states: Vec<ProjectionState>,
+    pub proposed_state: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchReceipt {
+    pub git_oid: [u8; 20],
+    pub public_commit_id: [u8; 64],
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchResult {
+    #[serde(deserialize_with = "deserialize_short_id")]
+    pub fetch_id: [u8; 16],
+    pub activation_cursor: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionObservation {
     pub bookmark: String,
     pub live_oid: Option<[u8; 20]>,
@@ -251,6 +274,58 @@ impl ProjectionTransport {
             .send(
                 self.client
                     .post(format!("{}/git/pushes", self.repository_url))
+                    .json(&body),
+            )
+            .await?;
+        self.read_json(response).await
+    }
+
+    pub async fn record_fetch(
+        &self,
+        fetch_id: [u8; 16],
+        machine_id: [u8; 16],
+        remote: &str,
+        refs: &[FetchRef],
+        receipts: &[FetchReceipt],
+    ) -> Result<FetchResult, TransportError> {
+        let refs = refs
+            .iter()
+            .map(|fetch_ref| {
+                serde_json::json!({
+                    "bookmark": fetch_ref.bookmark,
+                    "observedGitOid": hex(&fetch_ref.observed_git_oid),
+                    "expectedCursorOid": fetch_ref.expected_cursor_oid.as_ref().map(|id| hex(id)),
+                    "states": fetch_ref.states.iter().map(|state| serde_json::json!({
+                        "gitOid": hex(&state.git_oid),
+                        "canonicalCommitId": hex(&state.canonical_commit_id),
+                        "publicCommitId": hex(&state.public_commit_id),
+                        "hiddenSetId": state.hidden_set_id.as_ref().map(|id| hex(id)),
+                    })).collect::<Vec<_>>(),
+                    "proposedState": fetch_ref.proposed_state,
+                })
+            })
+            .collect::<Vec<_>>();
+        let receipts = receipts
+            .iter()
+            .map(|receipt| {
+                serde_json::json!({
+                    "gitOid": hex(&receipt.git_oid),
+                    "publicCommitId": hex(&receipt.public_commit_id),
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = serde_json::json!({
+            "incarnation": self.incarnation,
+            "fetchId": hex(&fetch_id),
+            "machineId": hex(&machine_id),
+            "remote": remote,
+            "refs": refs,
+            "receipts": receipts,
+        });
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/git/fetches", self.repository_url))
                     .json(&body),
             )
             .await?;

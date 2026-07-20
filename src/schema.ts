@@ -203,6 +203,12 @@ export function initializeSchema(sql: SqlStorage) {
     CREATE TABLE IF NOT EXISTS projection_recovery_claims (
       batch_id BLOB PRIMARY KEY
     ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS projection_fetch_results (
+      fetch_id BLOB PRIMARY KEY,
+      remote TEXT NOT NULL,
+      request_hash BLOB NOT NULL,
+      activation_cursor INTEGER NOT NULL CHECK (activation_cursor >= 0)
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS remotes (
       name TEXT PRIMARY KEY,
       url TEXT NOT NULL

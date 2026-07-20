@@ -142,6 +142,12 @@ export class Repository extends DurableObject<Env> {
     return this.withAuthority(authority, () => this.projection.begin(value, authority.machineId));
   }
 
+  recordProjectionFetch(authority: RepositoryAuthority, value: unknown) {
+    return this.withAuthority(authority, () =>
+      this.projection.recordFetch(value, authority.machineId),
+    );
+  }
+
   claimProjectionPush(authority: RepositoryAuthority, batchId: unknown, value: unknown) {
     return this.withAuthority(authority, () =>
       this.projection.claim(batchId, value, authority.machineId),
