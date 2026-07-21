@@ -16,7 +16,7 @@ use jj_cli::ui::Ui;
 use jj_lib::settings::UserSettings;
 
 use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
-use crate::sync::{LockedSyncRun, run_sync_entry_locked};
+use crate::sync::{LockedSyncRun, run_sync_entry_foreground_locked};
 
 use self::projection_sidecar::open_or_create_projection;
 
@@ -238,12 +238,13 @@ fn resolve_checkout_entry(
 }
 
 pub(super) async fn locked_checkout_entry(
+    ui: &mut Ui,
     workspace_root: &Path,
     settings: &UserSettings,
     operation: &str,
 ) -> Result<LockedCheckoutEntry, CommandError> {
     let (store, entry) = resolve_checkout_entry(workspace_root)?;
-    let guard = match run_sync_entry_locked(&store, &entry, settings).await {
+    let guard = match run_sync_entry_foreground_locked(ui, &store, &entry, settings).await {
         Ok(LockedSyncRun::Completed(guard)) => guard,
         Ok(LockedSyncRun::AlreadyLocked) => {
             return Err(user_error(format!(

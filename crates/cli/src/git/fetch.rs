@@ -46,7 +46,7 @@ pub(super) async fn fetch_bookmarks(
     let workspace_root = workspace.workspace_root().to_owned();
     drop(workspace);
 
-    let locked = locked_checkout_entry(&workspace_root, command.settings(), "fetch").await?;
+    let locked = locked_checkout_entry(ui, &workspace_root, command.settings(), "fetch").await?;
 
     fetch_entry(
         ui,

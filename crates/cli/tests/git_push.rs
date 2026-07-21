@@ -92,7 +92,7 @@ async fn devspace_checkout_owns_fetch_and_fences_unowned_git_commands() {
 }
 
 #[tokio::test]
-async fn git_push_fails_fast_while_the_repository_sync_lock_is_held() {
+async fn git_push_waits_for_the_repository_sync_lock_then_proceeds() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("machine");
     fs::create_dir_all(&home).unwrap();
@@ -109,21 +109,37 @@ async fn git_push_fails_fast_while_the_repository_sync_lock_is_held() {
         .resolve(&RepositoryName::parse("locked-push").unwrap())
         .unwrap()
         .unwrap();
-    let _guard = store.try_lock_repository_sync(&entry.identity).unwrap();
+    let guard = store.try_lock_repository_sync(&entry.identity).unwrap();
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(250));
+        drop(guard);
+    });
 
     let started = Instant::now();
     let output = ds(&checkout, &home, &config, &["git", "push", "-b", "main"]);
+    let elapsed = started.elapsed();
+    release.join().unwrap();
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "push took {:?}",
-        started.elapsed()
+        elapsed >= Duration::from_millis(200),
+        "push did not wait for the held lock: {elapsed:?}"
     );
     assert!(
-        stderr(&output).contains("already being synchronized"),
-        "{}",
-        stderr(&output)
+        elapsed < Duration::from_secs(5),
+        "push did not proceed after the lock was released: {elapsed:?}"
+    );
+    let diagnostic = stderr(&output);
+    assert_eq!(
+        diagnostic
+            .matches("Waiting for an in-flight operation")
+            .count(),
+        1,
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("already being synchronized"),
+        "{diagnostic}"
     );
 }
 

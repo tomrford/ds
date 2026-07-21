@@ -90,7 +90,7 @@ pub(super) async fn push_bookmarks(
     }
     drop(workspace);
 
-    let locked = locked_checkout_entry(&workspace_root, command.settings(), "push").await?;
+    let locked = locked_checkout_entry(ui, &workspace_root, command.settings(), "push").await?;
     let session = open_cloud_session(ui, command.settings(), &locked.store, &locked.entry).await?;
     let runtime = cloud_runtime()?;
     let lines = runtime

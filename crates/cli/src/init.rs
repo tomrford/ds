@@ -3,8 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use devspace_machine::{
-    CatalogEntry, GitProcessEnvironment, MachineRepository, MachineStore, MachineStoreError,
-    RemoteUrl, RepositoryName,
+    CatalogEntry, GitProcessEnvironment, MachineRepository, MachineStore, RemoteUrl, RepositoryName,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -24,6 +23,7 @@ use crate::repo::{
     CloudRepositoryCreationError, PendingRepositoryCreation, create_cloud_repository,
     materialize_cloud_repository,
 };
+use crate::sync::wait_for_repository_sync_lock;
 use crate::tx::{commit_repo_transaction, materialize_checkout};
 use crate::working_copy::devspace_working_copy_factories;
 
@@ -184,17 +184,6 @@ pub(crate) async fn import_git_repository(
             entry,
         } => (store, config, &entry.identity),
     };
-    let sync_guard = store
-        .try_lock_repository_sync(identity)
-        .map_err(|error| match error {
-            MachineStoreError::RepositorySyncAlreadyLocked { .. } => post_registration_error(
-                user_error(format!(
-                    "Repository `{name}` is already being imported or synchronized; retry after it finishes."
-                )),
-                &incomplete,
-            ),
-            error => post_registration_error(display_error(error), &incomplete),
-        })?;
     let provisional_entry = match &repository {
         ImportRepository::Pending(_) => CatalogEntry {
             name: name.clone(),
@@ -202,6 +191,16 @@ pub(crate) async fn import_git_repository(
             native_repository_path: store.native_repository_path(identity),
         },
         ImportRepository::Registered { entry, .. } => entry.clone(),
+    };
+    let Some(sync_guard) = wait_for_repository_sync_lock(ui, store, &provisional_entry)
+        .map_err(|error| post_registration_error(user_error(error), &incomplete))?
+    else {
+        return Err(post_registration_error(
+            user_error(format!(
+                "Repository `{name}` is already being imported or synchronized; retry after it finishes."
+            )),
+            &incomplete,
+        ));
     };
     crate::git::register_remote(config, &provisional_entry, ORIGIN, &git_url)
         .map_err(|error| post_registration_error(error, &incomplete))?;

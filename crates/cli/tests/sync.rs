@@ -172,6 +172,7 @@ async fn sync_run_skips_when_the_repository_lock_is_held() {
         .try_lock_repository_sync(&entry.identity)
         .unwrap();
 
+    let started = Instant::now();
     let output = ds(
         temp.path(),
         temp.path(),
@@ -180,6 +181,11 @@ async fn sync_run_skips_when_the_repository_lock_is_held() {
     );
 
     assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "sync run waited for the held lock: {:?}",
+        started.elapsed()
+    );
     assert!(stdout(&output).is_empty());
     assert_eq!(
         stderr(&output),

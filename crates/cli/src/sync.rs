@@ -1,6 +1,8 @@
 use std::error::Error as _;
 use std::io::Write as _;
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use devspace_machine::{
     CatalogEntry, HttpTransport, MachineConfig, MachineRepository, MachineStore, MachineStoreError,
@@ -13,6 +15,9 @@ use jj_cli::ui::Ui;
 use jj_lib::settings::UserSettings;
 
 use crate::checkout::reject_unsupported_global_options;
+
+const FOREGROUND_SYNC_LOCK_WAIT: Duration = Duration::from_secs(60);
+const SYNC_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(clap::Args)]
 pub(crate) struct SyncArgs {
@@ -101,6 +106,63 @@ pub(crate) async fn run_sync_entry_locked(
     entry: &CatalogEntry,
     settings: &UserSettings,
 ) -> Result<LockedSyncRun, String> {
+    validate_sync_entry(entry)?;
+
+    let guard = match store.try_lock_repository_sync(&entry.identity) {
+        Ok(guard) => guard,
+        Err(MachineStoreError::RepositorySyncAlreadyLocked { .. }) => {
+            return Ok(LockedSyncRun::AlreadyLocked);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    run_sync_entry_after_lock(store, entry, settings, guard).await
+}
+
+pub(crate) async fn run_sync_entry_foreground_locked(
+    ui: &mut Ui,
+    store: &MachineStore,
+    entry: &CatalogEntry,
+    settings: &UserSettings,
+) -> Result<LockedSyncRun, String> {
+    validate_sync_entry(entry)?;
+    let Some(guard) = wait_for_repository_sync_lock(ui, store, entry)? else {
+        return Ok(LockedSyncRun::AlreadyLocked);
+    };
+    run_sync_entry_after_lock(store, entry, settings, guard).await
+}
+
+pub(crate) fn wait_for_repository_sync_lock(
+    ui: &mut Ui,
+    store: &MachineStore,
+    entry: &CatalogEntry,
+) -> Result<Option<RepositorySyncGuard>, String> {
+    let deadline = Instant::now() + FOREGROUND_SYNC_LOCK_WAIT;
+    let mut reported_wait = false;
+    loop {
+        match store.try_lock_repository_sync(&entry.identity) {
+            Ok(guard) => return Ok(Some(guard)),
+            Err(MachineStoreError::RepositorySyncAlreadyLocked { .. }) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(None);
+                }
+                if !reported_wait {
+                    writeln!(
+                        ui.status(),
+                        "Waiting for an in-flight operation on repository `{}` to finish...",
+                        entry.name
+                    )
+                    .map_err(|error| error.to_string())?;
+                    reported_wait = true;
+                }
+                thread::sleep(SYNC_LOCK_POLL_INTERVAL.min(deadline - now));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn validate_sync_entry(entry: &CatalogEntry) -> Result<(), String> {
     let name = &entry.name;
     if !entry.native_repository_path.exists() {
         return Err(format!(
@@ -112,14 +174,15 @@ pub(crate) async fn run_sync_entry_locked(
             "Repository `{name}` is registered locally, but its native repository is invalid."
         ));
     }
+    Ok(())
+}
 
-    let guard = match store.try_lock_repository_sync(&entry.identity) {
-        Ok(guard) => guard,
-        Err(MachineStoreError::RepositorySyncAlreadyLocked { .. }) => {
-            return Ok(LockedSyncRun::AlreadyLocked);
-        }
-        Err(error) => return Err(error.to_string()),
-    };
+async fn run_sync_entry_after_lock(
+    store: &MachineStore,
+    entry: &CatalogEntry,
+    settings: &UserSettings,
+    guard: RepositorySyncGuard,
+) -> Result<LockedSyncRun, String> {
     let config = store.load_config().map_err(|error| error.to_string())?;
     let mut repository = MachineRepository::open(&entry.native_repository_path, settings)
         .await

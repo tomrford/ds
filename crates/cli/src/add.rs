@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 
 use devspace_machine::{
     CatalogEntry, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
-    MachineConfig, MachineRepository, MachineStore, MachineStoreError, RepositoryName,
-    sync_directory,
+    MachineConfig, MachineRepository, MachineStore, RepositoryName, sync_directory,
 };
 use jj_cli::cli_util::{CommandHelper, RevisionArg};
 use jj_cli::command_error::{CommandError, user_error};
@@ -26,6 +25,7 @@ use crate::checkout::{
     destination_hash, ensure_destination_parent, owned_directory_matches,
     reject_unsupported_global_options, workspace_name,
 };
+use crate::sync::wait_for_repository_sync_lock;
 use crate::tx::{
     MaterializeCheckoutError, RepoTransactionError, commit_repo_transaction, materialize_checkout,
 };
@@ -291,15 +291,12 @@ async fn clone_repository(
     config: Option<MachineConfig>,
 ) -> Result<(), CommandError> {
     let name = &entry.name;
-    let sync_guard =
-        store
-            .try_lock_repository_sync(&entry.identity)
-            .map_err(|error| match error {
-                MachineStoreError::RepositorySyncAlreadyLocked { .. } => user_error(format!(
-                    "Repository `{name}` is already being cloned or synchronized; retry `ds add`."
-                )),
-                error => user_error(error.to_string()),
-            })?;
+    let Some(sync_guard) = wait_for_repository_sync_lock(ui, store, entry).map_err(user_error)?
+    else {
+        return Err(user_error(format!(
+            "Repository `{name}` is already being cloned or synchronized; retry `ds add`."
+        )));
+    };
 
     if entry.native_repository_path.exists() {
         if is_stock_bare_repository(&entry.native_repository_path) {
