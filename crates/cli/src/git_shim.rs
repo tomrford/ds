@@ -42,7 +42,9 @@ fn ensure_inner(checkout_root: &Path) -> Result<(), String> {
     }
 
     make_git_dirs_writable(checkout_root)?;
-    let hidden_paths = crate::working_copy::discover_hidden_paths(checkout_root)
+    let base_ignores =
+        crate::working_copy::base_ignores(checkout_root).map_err(|error| error.to_string())?;
+    let hidden_paths = crate::working_copy::discover_hidden_paths(checkout_root, &base_ignores)
         .map_err(|error| error.to_string())?;
     ensure_info_exclude(&git_dir, hidden_paths.iter().map(|path| path.as_ref()))?;
     require_success(git(checkout_root).args(["add", "-A"]), "git add -A")?;

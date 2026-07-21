@@ -12,7 +12,9 @@ async-trait = "=0.1.89"
 blake2 = "0.10.6"
 clap = { version = "=4.6.2", features = ["derive"] }
 dunce = "=1.0.5"
+etcetera = "=0.11.0"
 getrandom = "=0.4.3"
+gix = { version = "=0.84.0", default-features = false }
 futures = "=0.3.32"
 jj-cli = "=0.42.0"
 jj-lib = { version = "=0.42.0", default-features = false, features = ["git"] }

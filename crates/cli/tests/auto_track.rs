@@ -9,7 +9,9 @@ use devspace_machine::{
 
 mod support;
 
-use support::{configure_machine, ds, machine_store, settings, stderr, stdout, write_cli_config};
+use support::{
+    configure_machine, ds, ds_with_env, machine_store, settings, stderr, stdout, write_cli_config,
+};
 
 async fn checkout(root: &Path, config: &Path, name: &str) -> PathBuf {
     configure_machine(root, "http://127.0.0.1:1");
@@ -133,6 +135,58 @@ async fn gitignored_directory_is_not_searched_for_nested_dsprivate() {
     );
     assert!(untracked.status.success(), "{}", stderr(&untracked));
     assert_eq!(stdout(&untracked), "");
+}
+
+#[tokio::test]
+async fn globally_ignored_parent_is_not_searched_for_hidden_matches() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    let checkout = checkout(temp.path(), &config, "global-ignored-parent").await;
+
+    // A global excludes file is part of jj's snapshot base ignores; hidden
+    // discovery must resolve the same chain.
+    let global_ignore = temp.path().join("global-ignore");
+    fs::write(&global_ignore, "vendored/\n").unwrap();
+    let global_config = temp.path().join("global-gitconfig");
+    fs::write(
+        &global_config,
+        format!("[core]\n\texcludesFile = {}\n", global_ignore.display()),
+    )
+    .unwrap();
+    let environment = [
+        ("GIT_CONFIG_GLOBAL", global_config.to_str().unwrap()),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ];
+
+    // The globally ignored parent contains a hidden match; an identical
+    // sibling proves the global excludes file is the only differentiator.
+    for parent in ["vendored", "app"] {
+        fs::create_dir(checkout.join(parent)).unwrap();
+        fs::write(checkout.join(parent).join(".dsprivate"), "secret.env\n").unwrap();
+        fs::write(checkout.join(parent).join("secret.env"), "private\n").unwrap();
+    }
+
+    let refreshed = ds_with_env(&checkout, temp.path(), &config, &["status"], &environment);
+    assert!(refreshed.status.success(), "{}", stderr(&refreshed));
+
+    // Snapshot traversal: nothing beneath the ignored parent is tracked.
+    let tracked = ds_with_env(
+        &checkout,
+        temp.path(),
+        &config,
+        &["file", "list"],
+        &environment,
+    );
+    assert!(tracked.status.success(), "{}", stderr(&tracked));
+    assert_eq!(stdout(&tracked), "app/.dsprivate\napp/secret.env\n");
+
+    // Hidden discovery agrees: only the sibling's paths are excluded from the
+    // Git index shim.
+    let exclude = fs::read_to_string(checkout.join(".git/info/exclude")).unwrap();
+    for pattern in ["/app/.dsprivate", "/app/secret.env"] {
+        assert!(exclude.lines().any(|line| line == pattern), "{exclude}");
+    }
+    assert!(!exclude.contains("vendored"), "{exclude}");
 }
 
 #[tokio::test]

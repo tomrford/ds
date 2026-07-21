@@ -16,7 +16,9 @@ blake2.workspace = true
 clap.workspace = true
 devspace-machine = { path = "../machine" }
 dunce.workspace = true
+etcetera.workspace = true
 getrandom.workspace = true
+gix.workspace = true
 jj-cli.workspace = true
 jj-lib.workspace = true
 serde.workspace = true

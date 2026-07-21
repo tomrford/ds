@@ -171,7 +171,8 @@ impl LockedWorkingCopy for LockedDevspaceWorkingCopy {
         &mut self,
         options: &SnapshotOptions,
     ) -> Result<(MergedTree, SnapshotStats), SnapshotError> {
-        let Some(hidden) = hidden_track_matcher(&self.working_copy_path)? else {
+        let Some(hidden) = hidden_track_matcher(&self.working_copy_path, &options.base_ignores)?
+        else {
             return self.inner.snapshot(options).await;
         };
         let start_tracking = UnionMatcher::new(options.start_tracking_matcher, &hidden);
@@ -223,13 +224,16 @@ impl LockedWorkingCopy for LockedDevspaceWorkingCopy {
     }
 }
 
-fn hidden_track_matcher(root: &Path) -> Result<Option<HiddenTrackMatcher>, SnapshotError> {
+fn hidden_track_matcher(
+    root: &Path,
+    base_ignores: &Arc<GitIgnoreFile>,
+) -> Result<Option<HiddenTrackMatcher>, SnapshotError> {
     let mut hidden = HiddenTrackMatcher::default();
     discover_hidden_paths_into(
         root,
         RepoPath::root(),
         &GitIgnoreFile::empty(),
-        &GitIgnoreFile::empty(),
+        base_ignores,
         &mut hidden,
     )?;
     if hidden.files.is_empty() && hidden.directories.is_empty() {
@@ -239,17 +243,54 @@ fn hidden_track_matcher(root: &Path) -> Result<Option<HiddenTrackMatcher>, Snaps
     }
 }
 
-pub(crate) fn discover_hidden_paths(root: &Path) -> Result<BTreeSet<RepoPathBuf>, SnapshotError> {
+pub(crate) fn discover_hidden_paths(
+    root: &Path,
+    base_ignores: &Arc<GitIgnoreFile>,
+) -> Result<BTreeSet<RepoPathBuf>, SnapshotError> {
     let mut hidden = HiddenTrackMatcher::default();
     discover_hidden_paths_into(
         root,
         RepoPath::root(),
         &GitIgnoreFile::empty(),
-        &GitIgnoreFile::empty(),
+        base_ignores,
         &mut hidden,
     )?;
     hidden.files.extend(hidden.directories);
     Ok(hidden.files)
+}
+
+/// Mirrors jj-cli 0.42's `WorkspaceCommandHelper::base_ignores` for
+/// non-Git-backend workspaces: the global Git excludes file (or the XDG
+/// `git/ignore` fallback), never a repository-level `.git/info/exclude`.
+/// Devspace checkouts use the simple backend, so jj snapshotting resolves
+/// exactly this chain into `SnapshotOptions::base_ignores`.
+pub(crate) fn base_ignores(
+    workspace_root: &Path,
+) -> Result<Arc<GitIgnoreFile>, jj_lib::gitignore::GitIgnoreError> {
+    fn xdg_config_home() -> Option<PathBuf> {
+        if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME")
+            && !config_home.is_empty()
+        {
+            return Some(PathBuf::from(config_home));
+        }
+        etcetera::home_dir().ok().map(|home| home.join(".config"))
+    }
+
+    let excludes_file_path = gix::config::File::from_globals()
+        .ok()
+        .and_then(|config| match config.string("core.excludesFile") {
+            // A relative configured path is resolved at the work-tree
+            // directory, matching jj-cli and `git status`.
+            Some(value) => str::from_utf8(&value)
+                .ok()
+                .map(jj_lib::file_util::expand_home_path)
+                .map(|path| workspace_root.join(path)),
+            None => xdg_config_home().map(|dir| dir.join("git").join("ignore")),
+        });
+    match excludes_file_path {
+        Some(path) => GitIgnoreFile::empty().chain_with_file(RepoPath::root(), path),
+        None => Ok(GitIgnoreFile::empty()),
+    }
 }
 
 #[derive(Debug, Default)]

@@ -45,8 +45,11 @@ at its directory, and force-tracks every discovered policy file and matching
 working-copy path, including files beneath matched directories. Discovery does
 not descend into a directory already hidden by the chained private matcher;
 the directory match force-tracks everything below it. It also does not descend
-into a gitignored directory unless that directory is privately matched. Root
-`.jj` and `.git` directories are skipped. An existing gitignored secret
+into a gitignored directory unless that directory is privately matched. The
+gitignore chain seeds from jj's snapshot base ignores (the global Git
+excludes file, or the XDG `git/ignore` fallback), so discovery prunes exactly
+the directories jj's own snapshot traversal prunes. Root `.jj` and `.git`
+directories are skipped. An existing gitignored secret
 therefore becomes canonical as soon as an applicable pattern is present for
 the next ordinary command or explicit snapshot.
 

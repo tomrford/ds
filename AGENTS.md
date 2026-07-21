@@ -25,6 +25,9 @@ Gate: `nix develop -c pnpm check` and `nix develop -c pnpm test`.
   gate.
 - Gitignore matching through jj-lib's gix-ignore wrapper is canonical projection
   behavior; audit it against the machine matcher golden tests on every jj bump.
+- `crates/cli/src/working_copy.rs::base_ignores` mirrors jj-cli's
+  `WorkspaceCommandHelper::base_ignores` (non-Git-backend branch) for hidden
+  discovery outside snapshotting; audit it on every jj bump.
 - Golden vectors are canonical bytes with jj ContentHash IDs, originally
   emitted by the old server as a jj-lib 0.42.0 oracle. The kernel rejects
   non-canonical encodings rather than normalizing; normalization is
