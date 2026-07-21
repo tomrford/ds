@@ -183,11 +183,17 @@ impl MachineStore {
     }
 
     fn repository_directory(&self, identity: &RepositoryIdentity) -> PathBuf {
+        self.repository_removal_root(identity)
+            .join(identity.incarnation.as_str())
+    }
+
+    /// Root holding every incarnation of one repository on this machine;
+    /// removing it (plus its shard parent when emptied) leaves no residue.
+    pub fn repository_removal_root(&self, identity: &RepositoryIdentity) -> PathBuf {
         self.root
             .join("repositories")
             .join(&identity.repository_id.as_str()[..2])
             .join(identity.repository_id.as_str())
-            .join(identity.incarnation.as_str())
     }
 
     pub fn try_lock_checkout_destination(

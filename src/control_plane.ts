@@ -27,13 +27,15 @@ const CREATION_RETIRED = "creation-retired";
 const CREATION_RETIRING = "creation-retiring";
 const IDEMPOTENCY_KEY_REUSED = "idempotency-key-reused";
 const REPOSITORY_NOT_FOUND = "repository-not-found";
+const REPOSITORY_CREATION_PROVISIONAL = "repository-creation-provisional";
 
 type ControlPlaneErrorCode =
   | typeof REPOSITORY_NAME_TAKEN
   | typeof CREATION_RETIRED
   | typeof CREATION_RETIRING
   | typeof IDEMPOTENCY_KEY_REUSED
-  | typeof REPOSITORY_NOT_FOUND;
+  | typeof REPOSITORY_NOT_FOUND
+  | typeof REPOSITORY_CREATION_PROVISIONAL;
 
 export interface AuthenticatedPrincipal {
   userId: string;
@@ -90,7 +92,7 @@ export class ControlPlane extends DurableObject<Env> {
     }
     const repositoryId = repositoryIdSchema.safeParse(repositoryIdValue);
     if (!repositoryId.success) {
-      return failure("repository not found", 404);
+      return failure(new ControlPlaneError("repository not found", 404, REPOSITORY_NOT_FOUND), 404);
     }
     let incarnation: string;
     try {
@@ -104,7 +106,7 @@ export class ControlPlane extends DurableObject<Env> {
       repository.status !== "active" ||
       repository.incarnation !== incarnation
     ) {
-      return failure("repository not found", 404);
+      return failure(new ControlPlaneError("repository not found", 404, REPOSITORY_NOT_FOUND), 404);
     }
     return {
       ok: true as const,
@@ -445,11 +447,15 @@ export class ControlPlane extends DurableObject<Env> {
           repository.name !== request.name ||
           repository.incarnation !== request.incarnation
         ) {
-          throw new ControlPlaneError("repository not found", 404);
+          throw new ControlPlaneError("repository not found", 404, REPOSITORY_NOT_FOUND);
         }
         if (repository.status === "deleted") return repository.status;
         if (repository.status === "provisional") {
-          throw new ControlPlaneError("repository creation is still provisional", 409);
+          throw new ControlPlaneError(
+            "repository creation is still provisional",
+            409,
+            REPOSITORY_CREATION_PROVISIONAL,
+          );
         }
         if (repository.status === "active") {
           const changed = this.ctx.storage.sql

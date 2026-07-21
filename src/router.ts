@@ -7,8 +7,8 @@ import { MAX_REMOTE_REQUEST_BYTES } from "./remote_protocol";
 import type { Repository } from "./repository";
 import {
   cursorStringSchema,
-  jsonObjectSchema,
   objectIdStringSchema,
+  repositoryDeletionBodySchema,
 } from "./validation";
 import { z } from "zod";
 
@@ -105,13 +105,22 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
           return rpcResponse(await control.renameRepository(principal, name, body));
         }
         if (request.method === "DELETE") {
-          const body = await readJsonBody(request, DIRECTORY_REQUEST_BYTES, "repository deletion request");
+          const body = await readJsonBody(
+            request,
+            DIRECTORY_REQUEST_BYTES,
+            "repository deletion request",
+            "invalid-repository-deletion-request",
+          );
           if (body instanceof Response) return body;
-          const record = jsonObjectSchema.safeParse(body);
-          if (!record.success) {
-            return errorResponse(400, "repository deletion request must be a JSON object");
+          const parsed = repositoryDeletionBodySchema.safeParse(body);
+          if (!parsed.success) {
+            return errorResponse(
+              400,
+              "invalid repository deletion request",
+              "invalid-repository-deletion-request",
+            );
           }
-          return rpcResponse(await control.deleteRepository(principal, { ...record.data, name }));
+          return rpcResponse(await control.deleteRepository(principal, { ...parsed.data, name }));
         }
       }
       return errorResponse(404, "not found");

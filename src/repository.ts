@@ -4,7 +4,16 @@ import { HeadStore } from "./head_store";
 import { Kernel, equalBytes, exactBuffer } from "./kernel";
 import { PackStore } from "./pack_store";
 import { ProjectionStore } from "./projection_store";
-import { initializeSchema } from "./schema";
+import { initializeSchema, purgeRepositoryData } from "./schema";
+
+class RepositoryAuthorityError extends Error {
+  constructor(
+    message: string,
+    readonly code: "repository-retired" | "repository-authority-stale",
+  ) {
+    super(message);
+  }
+}
 
 interface AuthorityRow extends Record<string, SqlStorageValue> {
   incarnation: ArrayBuffer;
@@ -77,6 +86,7 @@ export class Repository extends DurableObject<Env> {
             authority.userId,
             authority.repositoryId,
           );
+          purgeRepositoryData(this.ctx.storage.sql);
           return { ok: true as const, retired: true };
         }
         this.requireAuthority(authority, true);
@@ -91,6 +101,7 @@ export class Repository extends DurableObject<Env> {
             throw new Error("repository retirement did not change exactly one active state row");
           }
         }
+        purgeRepositoryData(this.ctx.storage.sql);
         return { ok: true as const, retired: true };
       });
     } catch (error) {
@@ -184,10 +195,15 @@ export class Repository extends DurableObject<Env> {
       state === undefined ||
       state.user_id !== authority.userId ||
       state.repository_id !== authority.repositoryId ||
-      !equalBytes(new Uint8Array(state.incarnation), hexBytes(authority.incarnation)) ||
-      (!allowRetired && state.retired !== 0)
+      !equalBytes(new Uint8Array(state.incarnation), hexBytes(authority.incarnation))
     ) {
-      throw new Error("repository authority is stale");
+      throw new RepositoryAuthorityError(
+        "repository authority is stale",
+        "repository-authority-stale",
+      );
+    }
+    if (!allowRetired && state.retired !== 0) {
+      throw new RepositoryAuthorityError("repository was deleted", "repository-retired");
     }
   }
 }
@@ -197,6 +213,10 @@ function authorityFailure(error: unknown) {
     ok: false as const,
     status: 409,
     error: error instanceof Error ? error.message : "repository authority is stale",
+    code:
+      error instanceof RepositoryAuthorityError
+        ? error.code
+        : "repository-authority-stale",
   };
 }
 

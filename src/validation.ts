@@ -27,6 +27,11 @@ export const cursorStringSchema = z
 
 export const jsonObjectSchema = z.record(z.string(), z.unknown());
 
+export const repositoryDeletionBodySchema = z.strictObject({
+  repositoryId: lowerHexStringSchema(32, "repository ID"),
+  incarnation: lowerHexStringSchema(16, "incarnation"),
+});
+
 export function boundedStringSchema(label: string, maxUtf8Bytes: number) {
   const encoder = new TextEncoder();
   return z

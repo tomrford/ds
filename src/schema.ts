@@ -223,3 +223,16 @@ export function initializeSchema(sql: SqlStorage) {
     ) WITHOUT ROWID;
   `);
 }
+
+export function purgeRepositoryData(sql: SqlStorage) {
+  const tables = sql
+    .exec<{ name: string }>(
+      `SELECT name FROM sqlite_master
+       WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'repository_state'`,
+    )
+    .toArray();
+  for (const { name } of tables) {
+    sql.exec(`DELETE FROM "${name}"`);
+  }
+  sql.exec("DELETE FROM sqlite_sequence");
+}

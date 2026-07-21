@@ -53,7 +53,11 @@ describe("cloud identity and repository directory", () => {
     });
     expect(
       await control.authorizeRepository(stranger, created.repositoryId, created.incarnation),
-    ).toEqual({ ok: false, status: 404, error: "repository not found" });
+    ).toMatchObject({
+      ok: false,
+      status: 404,
+      code: "repository-not-found",
+    });
     const repository = env.REPOSITORIES.get(env.REPOSITORIES.idFromString(created.repositoryId));
     expect(
       await repository.putPackManifest(
@@ -329,7 +333,7 @@ describe("cloud identity and repository directory", () => {
     expect(await repository.initializeRepository(authority)).toMatchObject({
       ok: false,
       status: 409,
-      error: "repository authority does not match",
+      code: "repository-authority-mismatch",
     });
   });
 
@@ -337,6 +341,17 @@ describe("cloud identity and repository directory", () => {
     const machineId = "51".repeat(16);
     const first = await createRepository(machineId, "replaceable", "51".repeat(16));
     const firstStub = env.REPOSITORIES.get(env.REPOSITORIES.idFromString(first.repositoryId));
+    await runInDurableObject(firstStub, (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO objects (kind, id, bytes) VALUES (?, ?, ?)",
+        1,
+        new Uint8Array([1]).buffer,
+        new Uint8Array([2]).buffer,
+      );
+      state.storage.sql.exec(
+        "INSERT INTO remotes (name, url) VALUES ('origin', 'https://example.test/repository')",
+      );
+    });
     await evictDurableObject(firstStub);
 
     const deleted = await apiRequest(machineId, "/repositories/replaceable", {
@@ -349,6 +364,26 @@ describe("cloud identity and repository directory", () => {
     });
     expect(deleted.status).toBe(200);
     expect(await deleted.json()).toEqual({ deleted: true });
+    await runInDurableObject(firstStub, (_instance, state) => {
+      const tombstone = state.storage.sql
+        .exec<{ retired: number; repository_id: string }>(
+          "SELECT retired, repository_id FROM repository_state WHERE singleton = 1",
+        )
+        .one();
+      expect(tombstone).toEqual({ retired: 1, repository_id: first.repositoryId });
+      const tables = state.storage.sql
+        .exec<{ name: string }>(
+          "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'repository_state'",
+        )
+        .toArray();
+      for (const { name } of tables) {
+        expect(
+          state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) AS count FROM ${name}`).one()
+            .count,
+          `${name} should be empty after retirement`,
+        ).toBe(0);
+      }
+    });
     expect(
       await firstStub.putPackManifest(
         {
@@ -360,7 +395,11 @@ describe("cloud identity and repository directory", () => {
         packId,
         new Uint8Array(),
       ),
-    ).toMatchObject({ ok: false, status: 409, error: "repository authority is stale" });
+    ).toMatchObject({
+      ok: false,
+      status: 409,
+      code: "repository-retired",
+    });
 
     const second = await createRepository(machineId, "replaceable", "52".repeat(16));
     expect(second.repositoryId).not.toBe(first.repositoryId);

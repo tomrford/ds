@@ -79,6 +79,47 @@ pub(crate) enum BoundedResponseError {
     Request(#[from] reqwest::Error),
 }
 
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread;
+
+    use reqwest::header::HeaderValue;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn retired_repository_error_is_coded_and_comprehensible() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = connection.read(&mut request).unwrap();
+            let body = r#"{"error":"repository was deleted","code":"repository-retired"}"#;
+            write!(
+                connection,
+                "HTTP/1.1 409 Conflict\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let error = send(
+            reqwest::Client::new().get(format!("http://{address}/heads")),
+            &HeaderValue::from_static("Bearer test-secret"),
+            &"12".repeat(16),
+            &"34".repeat(16),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+        let message = error.to_string();
+        assert!(message.contains("repository-retired: repository was deleted"));
+        assert!(!message.contains(r#"{"error""#));
+    }
+}
+
 pub fn encode_lower_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);

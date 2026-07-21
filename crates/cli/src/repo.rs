@@ -1,9 +1,11 @@
+use std::fs;
 use std::io::Write as _;
 
 use devspace_machine::{
     CatalogEntry, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
-    MachineConfig, MachineStore, RepositoryCreationIntent, RepositoryCreationIntentError,
-    RepositoryCreationKey, RepositoryCreationTarget, RepositoryIdentity, RepositoryName,
+    MachineConfig, MachineStore, RepositoryCreationIntent,
+    RepositoryCreationIntentError, RepositoryCreationKey, RepositoryCreationTarget,
+    RepositoryIdentity, RepositoryName,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -62,6 +64,13 @@ enum RepoCommand {
     },
     /// Rename a cloud repository and its local catalog entry.
     Rename { old: String, new: String },
+    /// Delete a cloud repository and this machine's local copy.
+    Remove {
+        name: String,
+        /// Delete without an interactive confirmation.
+        #[arg(long)]
+        force: bool,
+    },
     /// List active cloud repositories.
     List,
 }
@@ -103,6 +112,7 @@ async fn run_repo(
             imported.write_summary(ui)
         }
         RepoCommand::Rename { old, new } => rename_repository(ui, old, new),
+        RepoCommand::Remove { name, force } => remove_repository(ui, command, name, force).await,
         RepoCommand::List => list_repositories(ui, command).await,
     }
 }
@@ -325,6 +335,97 @@ fn rename_repository(ui: &mut Ui, old: String, new: String) -> Result<(), Comman
     Ok(())
 }
 
+async fn remove_repository(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    name: String,
+    force: bool,
+) -> Result<(), CommandError> {
+    let name = parse_repository_name(name)?;
+    let store = MachineStore::platform_default().map_err(display_error)?;
+    let config = store.load_config().map_err(display_error)?;
+    let client = ControlPlaneClient::new(&config).map_err(display_error)?;
+    let local = store.resolve(&name).map_err(display_error)?;
+    let runtime = cloud_runtime()?;
+    let identity = match &local {
+        Some(entry) => entry.identity.clone(),
+        None => match runtime.block_on(client.resolve_repository(&name)) {
+            Ok(repository) => repository.identity,
+            Err(ControlPlaneClientError::Remote {
+                kind: ControlPlaneRemoteErrorKind::RepositoryNotFound,
+                ..
+            }) => {
+                return Err(user_error(format!(
+                    "repository-not-found: repository `{name}` was not found in the control plane"
+                )));
+            }
+            Err(error) => return Err(display_error(error)),
+        },
+    };
+
+    if let Some(entry) = &local {
+        let paths = registered_checkout_paths(entry, command).await?;
+        if !paths.is_empty() {
+            return Err(user_error(format!(
+                "Repository `{name}` has registered checkouts on this machine:\n{}\nRun `ds remove <path>` for each checkout before deleting the repository.",
+                paths
+                    .iter()
+                    .map(|path| format!("  {}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )));
+        }
+        let remote_workspaces = remote_workspace_names(entry, command).await?;
+        if !remote_workspaces.is_empty() {
+            writeln!(
+                ui.warning_default(),
+                "Other machines still have workspaces in `{name}`: {}. Deletion will proceed.",
+                remote_workspaces.join(", ")
+            )?;
+        }
+    }
+
+    if !force {
+        if !ui.can_prompt() {
+            return Err(user_error(
+                "Repository deletion requires `--force` when not interactive.",
+            ));
+        }
+        let confirmation = ui
+            .prompt(&format!(
+                "Retype repository name `{name}` to confirm deletion"
+            ))
+            .map_err(display_error)?;
+        if confirmation != name.as_str() {
+            return Err(user_error(
+                "Repository deletion confirmation did not match; nothing was deleted.",
+            ));
+        }
+    }
+
+    let already_deleted = match runtime.block_on(client.delete_repository(&name, &identity)) {
+        Ok(_) => false,
+        Err(ControlPlaneClientError::Remote {
+            kind: ControlPlaneRemoteErrorKind::RepositoryNotFound,
+            ..
+        }) if local.is_some() => true,
+        Err(error) => return Err(display_error(error)),
+    };
+
+    let cleanup = local
+        .as_ref()
+        .map(|entry| cleanup_local_repository(ui, &store, entry))
+        .transpose()?;
+    writeln!(ui.status(), "Deleted repository `{name}`.")?;
+    if already_deleted {
+        writeln!(ui.status(), "The cloud repository was already deleted.")?;
+    }
+    if cleanup.is_some() {
+        writeln!(ui.status(), "Removed this machine's local repository data.")?;
+    }
+    Ok(())
+}
+
 async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), CommandError> {
     let store = MachineStore::platform_default().map_err(display_error)?;
     let config = store.load_config().map_err(display_error)?;
@@ -346,9 +447,10 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
             writeln!(ui.stdout(), "{}", repository.name)?;
             continue;
         };
-        if local[index].name != repository.name {
-            let old_name = local[index].name.clone();
-            local[index] = store
+        let mut entry = local.remove(index);
+        if entry.name != repository.name {
+            let old_name = entry.name.clone();
+            entry = store
                 .rename_repository(&old_name, repository.name.clone(), &repository.identity)
                 .map_err(|error| {
                     user_error(format!(
@@ -357,7 +459,7 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
                     ))
                 })?;
         }
-        let paths = registered_checkout_paths(&local[index], command).await?;
+        let paths = registered_checkout_paths(&entry, command).await?;
         if paths.is_empty() {
             writeln!(ui.stdout(), "{} (local)", repository.name)?;
         } else {
@@ -365,6 +467,28 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
                 ui.stdout(),
                 "{} (local: {})",
                 repository.name,
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+    }
+    for entry in local {
+        let paths = registered_checkout_paths(&entry, command).await?;
+        if paths.is_empty() {
+            cleanup_local_repository(ui, &store, &entry)?;
+            writeln!(
+                ui.status(),
+                "Removed local repository `{}` because it was deleted in the cloud.",
+                entry.name
+            )?;
+        } else {
+            writeln!(
+                ui.stdout(),
+                "{} (deleted in cloud; local checkouts remain: {})",
+                entry.name,
                 paths
                     .iter()
                     .map(|path| path.display().to_string())
@@ -407,6 +531,62 @@ async fn registered_checkout_paths(
     }
     paths.sort();
     Ok(paths)
+}
+
+async fn remote_workspace_names(
+    entry: &CatalogEntry,
+    command: &CommandHelper,
+) -> Result<Vec<String>, CommandError> {
+    if !entry.native_repository_path.exists() {
+        return Ok(Vec::new());
+    }
+    let repository = devspace_machine::MachineRepository::open(
+        &entry.native_repository_path,
+        command.settings(),
+    )
+    .await
+    .map_err(display_error)?;
+    let workspace_store = SimpleWorkspaceStore::load(&entry.native_repository_path)
+        .map_err(|error| user_error(error.to_string()))?;
+    let mut names = Vec::new();
+    for workspace in repository.repo().view().wc_commit_ids().keys() {
+        if workspace_store
+            .get_workspace_path(workspace)
+            .map_err(|error| user_error(error.to_string()))?
+            .is_none()
+        {
+            names.push(workspace.as_str().to_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn cleanup_local_repository(
+    ui: &mut Ui,
+    store: &MachineStore,
+    entry: &CatalogEntry,
+) -> Result<(), CommandError> {
+    let Some(_sync_guard) =
+        crate::sync::wait_for_repository_sync_lock(ui, store, entry).map_err(user_error)?
+    else {
+        return Err(user_error(
+            "repository-sync-busy: repository synchronization is in progress; retry repository removal",
+        ));
+    };
+    store
+        .unregister_repository(&entry.name, &entry.identity)
+        .map_err(display_error)?;
+    let root = store.repository_removal_root(&entry.identity);
+    match fs::symlink_metadata(&root) {
+        Ok(_) => fs::remove_dir_all(&root).map_err(display_error)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(display_error(error)),
+    }
+    if let Some(shard) = root.parent() {
+        let _ = fs::remove_dir(shard);
+    }
+    Ok(())
 }
 
 fn cloud_runtime() -> Result<tokio::runtime::Runtime, CommandError> {

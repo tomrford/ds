@@ -41,6 +41,19 @@ struct RenameRepositoryRequest {
     new_name: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteRepositoryRequest<'a> {
+    repository_id: &'a str,
+    incarnation: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteRepositoryResponse {
+    deleted: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepositoryListResponse {
@@ -134,6 +147,34 @@ impl ControlPlaneClient {
             })
             .build()?;
         self.send_repository(request, new_name).await
+    }
+
+    pub async fn delete_repository(
+        &self,
+        name: &RepositoryName,
+        identity: &RepositoryIdentity,
+    ) -> Result<bool, ControlPlaneClientError> {
+        let request = self.delete_repository_request(name, identity)?;
+        let bytes = self.send(request).await?;
+        Ok(serde_json::from_slice::<DeleteRepositoryResponse>(&bytes)?.deleted)
+    }
+
+    fn delete_repository_request(
+        &self,
+        name: &RepositoryName,
+        identity: &RepositoryIdentity,
+    ) -> Result<reqwest::Request, ControlPlaneClientError> {
+        Ok(self
+            .authenticated(self.client.delete(format!(
+                "{}/repositories/{}",
+                self.base_url,
+                name.as_str()
+            )))
+            .json(&DeleteRepositoryRequest {
+                repository_id: identity.repository_id.as_str(),
+                incarnation: identity.incarnation.as_str(),
+            })
+            .build()?)
     }
 
     fn create_repository_request(
@@ -301,6 +342,35 @@ mod tests {
             serde_json::json!({
                 "name": "request-repository",
                 "idempotencyKey": "34".repeat(16),
+            })
+        );
+    }
+
+    #[test]
+    fn delete_request_carries_the_resolved_identity() {
+        let client = client("request-construction-secret");
+        let identity = RepositoryIdentity::new(
+            RepositoryId::parse("ab".repeat(32)).unwrap(),
+            RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
+        );
+        let request = client
+            .delete_repository_request(
+                &RepositoryName::parse("removed-repository").unwrap(),
+                &identity,
+            )
+            .unwrap();
+        assert_eq!(request.method(), reqwest::Method::DELETE);
+        assert_eq!(
+            request.url().as_str(),
+            "https://worker.example.test/base/repositories/removed-repository"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "repositoryId": "ab".repeat(32),
+                "incarnation": "cd".repeat(16),
             })
         );
     }
