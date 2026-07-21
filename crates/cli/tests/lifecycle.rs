@@ -1,91 +1,25 @@
 use std::fs;
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::thread;
+use std::process::Output;
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
-    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
+    MachineConfig, MachineId, MachineRepository, RepositoryId, RepositoryIdentity,
+    RepositoryIncarnation, RepositoryName, SharedSecret,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
-use jj_lib::settings::UserSettings;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
+mod support;
 mod support_fs;
+
+use support::fake_worker::{create_server, repository_response, respond};
+use support::{
+    commit_id, ds, ds_command, machine_store, settings, stderr, stdout, write_cli_config,
+};
 
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
 const MACHINE_ID: &str = "12121212121212121212121212121212";
-
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
-
-fn write_cli_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
-        &path,
-        r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
-            [ui]
-            color = "never"
-
-            [snapshot]
-            auto-update-stale = true
-        "#,
-    )
-    .unwrap();
-    path
-}
-
-fn ds(cwd: &Path, config: &Path, args: &[&str]) -> Output {
-    ds_command(cwd, config).args(args).output().unwrap()
-}
-
-fn ds_command(cwd: &Path, config: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
-    command
-        .current_dir(cwd)
-        .env(
-            MACHINE_STORE_OVERRIDE,
-            config.parent().unwrap().join("machine-store"),
-        )
-        .env("JJ_CONFIG", config)
-        .env("DEVSPACE_BOUNDARY_SYNC", "0")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat");
-    command
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-fn machine_store(root: &Path) -> MachineStore {
-    MachineStore::new(root.join("machine-store"))
-}
 
 fn configure_machine(root: &Path, base_url: &str) {
     configure_machine_with_name(root, base_url, None);
@@ -145,23 +79,6 @@ fn remove_checkout(cwd: &Path, config: &Path, path: &Path) -> Output {
         .arg(path)
         .output()
         .unwrap()
-}
-
-fn commit_id(cwd: &Path, config: &Path, revision: &str) -> String {
-    let output = ds(
-        cwd,
-        config,
-        &[
-            "log",
-            "-r",
-            revision,
-            "--no-graph",
-            "-T",
-            "commit_id ++ \"\\n\"",
-        ],
-    );
-    assert!(output.status.success(), "{}", stderr(&output));
-    stdout(&output).trim().to_owned()
 }
 
 fn visible_head_ids(cwd: &Path, config: &Path, repo: &str) -> Vec<String> {
@@ -246,73 +163,15 @@ fn checkout_repository_path(checkout: &Path) -> PathBuf {
     dunce::canonicalize(pointer).unwrap()
 }
 
-fn create_server<F>(mut handle: F) -> (String, thread::JoinHandle<String>)
-where
-    F: FnMut(&str, &mut TcpStream) + Send + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = format!("http://{}", listener.local_addr().unwrap());
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let request = read_http_request(&mut stream);
-        handle(&request, &mut stream);
-        request
-    });
-    (address, server)
-}
-
-fn read_http_request(stream: &mut TcpStream) -> String {
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .unwrap();
-    let mut bytes = Vec::new();
-    let mut buffer = [0; 4096];
-    let expected_length = loop {
-        let read = stream.read(&mut buffer).unwrap();
-        assert_ne!(read, 0, "HTTP request ended before its headers");
-        bytes.extend_from_slice(&buffer[..read]);
-        if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            let headers = String::from_utf8_lossy(&bytes[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-            break header_end + 4 + content_length;
-        }
-    };
-    while bytes.len() < expected_length {
-        let read = stream.read(&mut buffer).unwrap();
-        assert_ne!(read, 0, "HTTP request ended before its body");
-        bytes.extend_from_slice(&buffer[..read]);
-    }
-    String::from_utf8(bytes[..expected_length].to_vec()).unwrap()
-}
-
-fn respond(stream: &mut TcpStream, body: &str) {
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-}
-
 #[tokio::test]
 async fn checkpoint_three_checkout_lifecycle_preserves_one_native_repository() {
     let temp = tempfile::tempdir().unwrap();
     let repository_name = "lifecycle";
-    let response = format!(
-        r#"{{"name":"{repository_name}","repositoryId":"{}","incarnation":"{}"}}"#,
-        "ab".repeat(32),
-        "cd".repeat(16)
-    );
-    let (base_url, server) = create_server(move |request, stream| {
+    let response = repository_response(repository_name);
+    let (base_url, server) = create_server(move |_, request, stream| {
         assert!(request.starts_with("POST /repositories HTTP/1.1"));
-        respond(stream, &response);
+        respond(stream, "200 OK", &response);
+        true
     });
     configure_machine(temp.path(), &base_url);
     let config = write_cli_config(temp.path());

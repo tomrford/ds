@@ -8,28 +8,14 @@ use devspace_machine::{
     PackCatalogEntry, PackCatalogPage, PackManifest, PackOptions, PendingHeadBatch,
     PendingHeadTransaction, SyncEngine, SyncTransport, TransportError,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{OperationId, RefTarget, RemoteRef, RemoteRefState};
 use jj_lib::ref_name::{RefName, RemoteRefSymbol};
 use jj_lib::repo::Repo as _;
-use jj_lib::settings::UserSettings;
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
+mod common;
+
+use common::settings;
 
 async fn offline_machine(path: &std::path::Path, name: &str) -> MachineRepository {
     let repository = MachineRepository::init(path, &settings()).await.unwrap();

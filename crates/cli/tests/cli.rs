@@ -3,41 +3,26 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineRepository, MachineStore, RepositoryId, RepositoryIdentity,
-    RepositoryIncarnation, RepositoryName,
+    MachineRepository, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::default_index::DefaultIndexStore;
 use jj_lib::default_submodule_store::DefaultSubmoduleStore;
 use jj_lib::op_store::RefTarget;
 use jj_lib::repo::Repo as _;
-use jj_lib::settings::UserSettings;
 use jj_lib::simple_backend::SimpleBackend;
 use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
 use jj_lib::simple_op_store::SimpleOpStore;
 
+mod support;
+
+use support::{ds, machine_store, settings, stderr, stdout};
+
 const FIXTURE_DESCRIPTION: &str = "bare repository fixture";
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
-
-fn write_cli_config(root: &Path) -> PathBuf {
+fn write_fixture_cli_config(root: &Path) -> PathBuf {
     let path = root.join("jj-config.toml");
     fs::write(
         &path,
@@ -105,31 +90,13 @@ fn write_watchman_config(root: &Path) -> PathBuf {
     path
 }
 
-fn ds(cwd: &Path, config: &Path, args: &[&str]) -> Output {
-    ds_with_env(cwd, config, args, &[])
-}
-
 fn ds_with_env(cwd: &Path, config: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
-    command
-        .current_dir(cwd)
-        .env(
-            MACHINE_STORE_OVERRIDE,
-            config.parent().unwrap().join("machine-store"),
-        )
-        .env("JJ_CONFIG", config)
-        .env("DEVSPACE_BOUNDARY_SYNC", "0")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat")
-        .args(args);
+    let mut command = support::ds_command(cwd, config);
+    command.args(args);
     for (name, value) in environment {
         command.env(name, value);
     }
     command.output().unwrap()
-}
-
-fn machine_store(root: &Path) -> MachineStore {
-    MachineStore::new(root.join("machine-store"))
 }
 
 fn repository_identity(repository_name: &str) -> RepositoryIdentity {
@@ -154,14 +121,6 @@ async fn catalog_repository(
         .unwrap();
     let operation = bare_repository(&entry.native_repository_path).await;
     (entry.native_repository_path, operation)
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 async fn bare_repository(path: &Path) -> jj_lib::op_store::OperationId {
@@ -309,7 +268,7 @@ fn add_bare_marker_collision(path: &Path) {
 #[test]
 fn root_help_is_devspace_first() {
     let temp = tempfile::tempdir().unwrap();
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     let output = ds(temp.path(), &config, &["--help"]);
 
@@ -333,7 +292,7 @@ fn root_help_is_devspace_first() {
 #[test]
 fn jj_help_lists_the_embedded_command_surface() {
     let temp = tempfile::tempdir().unwrap();
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     let output = ds(temp.path(), &config, &["help", "jj"]);
 
@@ -351,7 +310,7 @@ fn jj_help_lists_the_embedded_command_surface() {
 #[test]
 fn embedded_jj_command_help_still_works() {
     let temp = tempfile::tempdir().unwrap();
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     let output = ds(temp.path(), &config, &["log", "--help"]);
 
@@ -389,7 +348,7 @@ async fn bare_log_uses_stock_alias_revset_template_and_graph_without_workspace_s
     let repository_name = "machine-repo";
     let (repository_path, expected_operation) =
         catalog_repository(temp.path(), repository_name).await;
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     let configured = ds(temp.path(), &config, &["-R", repository_name, "fixture"]);
     assert!(configured.status.success(), "{}", stderr(&configured));
@@ -434,7 +393,7 @@ async fn local_name_log_has_no_network_dependency() {
     let temp = tempfile::tempdir().unwrap();
     let repository_name = "offline-repository";
     catalog_repository(temp.path(), repository_name).await;
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     let output = ds_with_env(
         temp.path(),
@@ -457,7 +416,7 @@ async fn bare_log_accepts_all_repository_option_spellings() {
     let temp = tempfile::tempdir().unwrap();
     let repository_name = "machine-repo";
     catalog_repository(temp.path(), repository_name).await;
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     for args in [
         vec!["-R".to_owned(), repository_name.to_owned()],
@@ -478,7 +437,7 @@ async fn bare_log_accepts_all_repository_option_spellings() {
 #[test]
 fn missing_local_name_points_to_add_without_network() {
     let temp = tempfile::tempdir().unwrap();
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     let output = ds(temp.path(), &config, &["-R", "not-local", "log"]);
 
@@ -500,7 +459,7 @@ async fn bare_log_reports_that_at_is_unavailable() {
     let temp = tempfile::tempdir().unwrap();
     let repository_name = "machine-repo";
     catalog_repository(temp.path(), repository_name).await;
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     let output = ds(
         temp.path(),
@@ -524,7 +483,7 @@ async fn bare_log_reads_non_writable_repository_without_touching_lock_path() {
     let lock_path = repository_path.join("op_heads/heads/lock");
     fs::create_dir(&lock_path).unwrap();
     let before = repository_storage_snapshot(&repository_path);
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
     set_repository_read_only(&repository_path, true);
 
     let output = ds(
@@ -544,7 +503,7 @@ async fn bare_log_reads_non_writable_repository_without_touching_lock_path() {
 #[tokio::test]
 async fn bare_log_rejects_divergent_heads_without_writes() {
     let temp = tempfile::tempdir().unwrap();
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
     let repository_name = "divergent";
     let (repository_path, _) = catalog_repository(temp.path(), repository_name).await;
     add_divergent_operation_heads(&repository_path).await;
@@ -565,7 +524,7 @@ async fn bare_log_rejects_divergent_heads_without_writes() {
 #[tokio::test]
 async fn bare_log_prunes_redundant_heads_without_writes() {
     let temp = tempfile::tempdir().unwrap();
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
     let repository_name = "redundant";
     let (repository_path, _) = catalog_repository(temp.path(), repository_name).await;
     add_redundant_operation_head(&repository_path).await;
@@ -582,7 +541,7 @@ async fn bare_log_prunes_redundant_heads_without_writes() {
 #[tokio::test]
 async fn bare_config_markers_are_rejected_before_loading_or_writing() {
     let temp = tempfile::tempdir().unwrap();
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
     let pager_marker = temp.path().join("pager-ran");
     let config_home = temp.path().join("config-home");
     let home = temp.path().join("home");
@@ -640,7 +599,7 @@ async fn bare_config_markers_are_rejected_before_loading_or_writing() {
 async fn raw_native_repository_paths_are_not_product_repository_identities() {
     let temp = tempfile::tempdir().unwrap();
     let (repository_path, _) = catalog_repository(temp.path(), "machine-repo").await;
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     for (cwd, args) in [
         (repository_path.as_path(), vec!["log"]),
@@ -665,7 +624,7 @@ async fn bare_repository_rejects_mutating_and_working_copy_commands() {
     let repository_name = "machine-repo";
     let (repository_path, expected_operation) =
         catalog_repository(temp.path(), repository_name).await;
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     for command in ["new", "status"] {
         let output = ds(temp.path(), &config, &["-R", repository_name, command]);
@@ -688,7 +647,7 @@ async fn bare_repository_rejects_mutating_and_working_copy_commands() {
 fn normal_jj_workspaces_keep_stock_command_behavior() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
 
     let init = ds(
         temp.path(),
@@ -750,7 +709,7 @@ fn normal_jj_workspaces_keep_stock_command_behavior() {
 fn normal_workspace_marker_names_are_not_misclassified_from_cwd_or_repository() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
-    let config = write_cli_config(temp.path());
+    let config = write_fixture_cli_config(temp.path());
     let init = ds(
         temp.path(),
         &config,

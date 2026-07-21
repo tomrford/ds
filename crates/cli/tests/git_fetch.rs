@@ -3,11 +3,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use devspace_machine::{
-    HttpTransport, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository,
-    MachineStore, ProjectionSnapshot, RepositoryName, SharedSecret,
+    HttpTransport, MachineConfig, MachineId, MachineRepository, ProjectionSnapshot, RepositoryName,
+    SharedSecret,
 };
+
+mod support;
+
 use jj_lib::ref_name::RefName;
 use jj_lib::repo::Repo as _;
+use support::{
+    ds_command_with_home as ds_command, ds_with_home as ds, machine_store, settings, stderr,
+    stdout, write_cli_config,
+};
 
 const MACHINE_ID: &str = "56565656565656565656565656565656";
 const PRIVATE_SENTINEL: &[u8] = b"FETCH_PRIVATE_SENTINEL\0\xff";
@@ -437,62 +444,6 @@ fn collaborator_commit(worktree: &Path, description: &str) {
     git_worktree(worktree, &["push", "origin", "main"]);
 }
 
-fn machine_store(root: &Path) -> MachineStore {
-    MachineStore::new(root.join("machine-store"))
-}
-
-fn write_cli_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
-        &path,
-        r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
-            [ui]
-            color = "never"
-
-            [snapshot]
-            auto-update-stale = true
-        "#,
-    )
-    .unwrap();
-    path
-}
-
-fn settings() -> jj_lib::settings::UserSettings {
-    let mut config = jj_lib::config::StackedConfig::with_defaults();
-    config.add_layer(
-        jj_lib::config::ConfigLayer::parse(
-            jj_lib::config::ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    jj_lib::settings::UserSettings::from_config(config).unwrap()
-}
-
-fn ds(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
-    ds_command(cwd, home, config).args(args).output().unwrap()
-}
-
-fn ds_command(cwd: &Path, home: &Path, config: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
-    command
-        .current_dir(cwd)
-        .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
-        .env("JJ_CONFIG", config)
-        .env("DEVSPACE_BOUNDARY_SYNC", "0")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat");
-    command
-}
-
 fn git(remote: &Path, args: &[&str]) {
     let output = git_command(remote, args).output().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
@@ -559,12 +510,4 @@ fn unique_repository_name(temp: &Path, label: &str) -> String {
 
 fn parse_incarnation(value: &str) -> [u8; 16] {
     std::array::from_fn(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap())
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }

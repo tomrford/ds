@@ -7,28 +7,14 @@ use devspace_machine::{
     PackOptions, build_packs,
 };
 use jj_lib::backend::{CopyId, TreeValue};
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPathBuf;
-use jj_lib::settings::UserSettings;
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
+mod common;
+
+use common::settings;
 
 async fn repository_with_file() -> (tempfile::TempDir, MachineRepository, ObjectClosure) {
     let temp = tempfile::tempdir().unwrap();

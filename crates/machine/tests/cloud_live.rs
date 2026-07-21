@@ -6,30 +6,16 @@ use devspace_machine::{
     HttpTransport, MachineConfig, MachineId, MachineRepository, MachineSyncStore, SharedSecret,
     SyncEngine,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
 use jj_lib::ref_name::{RefName, RemoteRefSymbol};
 use jj_lib::repo::Repo as _;
-use jj_lib::settings::UserSettings;
 use std::collections::BTreeSet;
 use std::fs;
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
+mod common;
+
+use common::settings;
 
 async fn offline_machine(path: &std::path::Path, name: &str) -> MachineRepository {
     let repository = MachineRepository::init(path, &settings()).await.unwrap();

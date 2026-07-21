@@ -2,76 +2,22 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
-    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
+    MachineConfig, MachineId, MachineRepository, RepositoryId, RepositoryIdentity,
+    RepositoryIncarnation, RepositoryName, SharedSecret,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
-use jj_lib::settings::UserSettings;
+
+mod support;
+
+use support::{ds, ds_command, machine_store, settings, stderr, write_cli_config};
 
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
-
-fn write_cli_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
-        &path,
-        r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
-            [ui]
-            color = "never"
-        "#,
-    )
-    .unwrap();
-    path
-}
-
-fn ds_command(cwd: &Path, config: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
-    command
-        .current_dir(cwd)
-        .env(
-            MACHINE_STORE_OVERRIDE,
-            config.parent().unwrap().join("machine-store"),
-        )
-        .env("JJ_CONFIG", config)
-        .env("DEVSPACE_BOUNDARY_SYNC", "0")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat");
-    command
-}
-
-fn ds(cwd: &Path, config: &Path, args: &[&str]) -> Output {
-    ds_command(cwd, config).args(args).output().unwrap()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 async fn local_repository(root: &Path, name: &str) {
-    let store = MachineStore::new(root.join("machine-store"));
+    let store = machine_store(root);
     store
         .write_config(
             &MachineConfig::new(

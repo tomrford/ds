@@ -10,20 +10,16 @@ use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use devspace_machine::{
     CatalogEntry, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository,
-    MachineStore, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
-    SharedSecret,
+    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
-use jj_lib::settings::UserSettings;
 use stalling_server::StallingServer;
-use support::daemon_socket_path;
+use support::{daemon_socket_path, machine_store, poll_until, settings, stderr, write_cli_config};
 
 const MACHINE_ID: &str = "12121212121212121212121212121212";
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
@@ -190,22 +186,6 @@ async fn daemon_drains_queued_repositories_before_idle_exit() {
     assert!(first < second && second < exit, "{log}");
 }
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
-
 async fn local_repository(root: &Path, name: &str) -> CatalogEntry {
     local_repository_with_identity(root, name, 0xab, "http://127.0.0.1:1").await
 }
@@ -234,10 +214,6 @@ async fn local_repository_with_identity(
     entry
 }
 
-fn machine_store(root: &Path) -> MachineStore {
-    MachineStore::new(root.join("machine-store"))
-}
-
 fn configure_machine(root: &Path, base_url: &str) {
     machine_store(root)
         .write_config(
@@ -249,23 +225,6 @@ fn configure_machine(root: &Path, base_url: &str) {
             .unwrap(),
         )
         .unwrap();
-}
-
-fn write_cli_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
-        &path,
-        r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
-            [ui]
-            color = "never"
-        "#,
-    )
-    .unwrap();
-    path
 }
 
 fn daemon_command(root: &Path, config: &Path, poll_ms: u64, idle_ms: u64) -> Command {
@@ -327,10 +286,6 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| format!("<unavailable: {error}>"))
 }
 
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 fn stop(child: &mut Child, socket: &Path) {
     if child.try_wait().unwrap().is_none() {
         child.kill().unwrap();
@@ -339,15 +294,4 @@ fn stop(child: &mut Child, socket: &Path) {
     if socket.exists() {
         fs::remove_file(socket).unwrap();
     }
-}
-
-fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if condition() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    condition()
 }

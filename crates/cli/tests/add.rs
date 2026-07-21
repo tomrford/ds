@@ -1,91 +1,26 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::thread;
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore, PackOptions,
-    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
-    build_packs,
+    MachineConfig, MachineId, MachineRepository, PackOptions, RepositoryId, RepositoryIdentity,
+    RepositoryIncarnation, RepositoryName, SharedSecret, build_packs,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{StoreFactories, StoreLoadError};
-use jj_lib::settings::UserSettings;
 use jj_lib::workspace::{Workspace, WorkspaceLoadError, default_working_copy_factories};
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
+mod support;
 mod support_fs;
+
+use support::fake_worker::{create_server, repository_response, respond, respond_bytes};
+use support::{commit_id, ds, ds_command, machine_store, settings, stderr, write_cli_config};
 
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
 const MACHINE_ID: &str = "12121212121212121212121212121212";
-
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
-
-fn write_cli_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
-        &path,
-        r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
-            [ui]
-            color = "never"
-        "#,
-    )
-    .unwrap();
-    path
-}
-
-fn ds(cwd: &Path, config: &Path, args: &[&str]) -> Output {
-    ds_command(cwd, config).args(args).output().unwrap()
-}
-
-fn ds_command(cwd: &Path, config: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
-    command
-        .current_dir(cwd)
-        .env(
-            MACHINE_STORE_OVERRIDE,
-            config.parent().unwrap().join("machine-store"),
-        )
-        .env("JJ_CONFIG", config)
-        .env("DEVSPACE_BOUNDARY_SYNC", "0")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat");
-    command
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-fn machine_store(root: &Path) -> MachineStore {
-    MachineStore::new(root.join("machine-store"))
-}
 
 fn configure_machine(root: &Path, base_url: &str) {
     machine_store(root)
@@ -116,94 +51,6 @@ async fn local_repository(root: &Path, repository_name: &str) -> PathBuf {
         .await
         .unwrap();
     entry.native_repository_path
-}
-
-fn create_server<F>(mut handle: F) -> (String, thread::JoinHandle<Vec<String>>)
-where
-    F: FnMut(&str, &mut TcpStream) -> bool + Send + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let address = format!("http://{}", listener.local_addr().unwrap());
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let (mut stream, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        return requests;
-                    }
-                    thread::sleep(std::time::Duration::from_millis(5));
-                    continue;
-                }
-                Err(error) => panic!("failed to accept test HTTP connection: {error}"),
-            };
-            stream.set_nonblocking(false).unwrap();
-            let request = read_http_request(&mut stream);
-            let done = handle(&request, &mut stream);
-            requests.push(request);
-            if done {
-                return requests;
-            }
-            deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        }
-    });
-    (address, server)
-}
-
-fn read_http_request(stream: &mut TcpStream) -> String {
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .unwrap();
-    let mut bytes = Vec::new();
-    let mut buffer = [0; 16 * 1024];
-    let expected_length = loop {
-        let read = stream.read(&mut buffer).unwrap();
-        assert_ne!(read, 0, "HTTP request ended before its headers");
-        bytes.extend_from_slice(&buffer[..read]);
-        if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            let headers = String::from_utf8_lossy(&bytes[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-            break header_end + 4 + content_length;
-        }
-    };
-    while bytes.len() < expected_length {
-        let read = stream.read(&mut buffer).unwrap();
-        assert_ne!(read, 0, "HTTP request ended before its body");
-        bytes.extend_from_slice(&buffer[..read]);
-    }
-    String::from_utf8_lossy(&bytes[..expected_length]).into_owned()
-}
-
-fn respond(stream: &mut TcpStream, status: &str, body: &str) {
-    respond_bytes(stream, status, "application/json", body.as_bytes());
-}
-
-fn respond_bytes(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    )
-    .unwrap();
-    stream.write_all(body).unwrap();
-}
-
-fn repository_response(name: &str) -> String {
-    format!(
-        r#"{{"name":"{name}","repositoryId":"{}","incarnation":"{}"}}"#,
-        "ab".repeat(32),
-        "cd".repeat(16)
-    )
 }
 
 fn request_body(request: &str) -> serde_json::Value {
@@ -258,7 +105,7 @@ fn hex_bytes<const N: usize>(bytes: [u8; N]) -> String {
 }
 
 fn create_cloud_sync_server(fixture: CloudFixture) -> (String, thread::JoinHandle<Vec<String>>) {
-    create_server(move |request, stream| {
+    create_server(move |_, request, stream| {
         let request_line = request.lines().next().unwrap();
         if request_line.starts_with("GET ") && request_line.contains("/packs?") {
             respond(
@@ -342,7 +189,7 @@ fn add_catalog_miss_reports_unreachable_control_plane_without_registering() {
 #[test]
 fn add_catalog_miss_classifies_unknown_name_by_remote_code() {
     let temp = tempfile::tempdir().unwrap();
-    let (base_url, server) = create_server(|_, stream| {
+    let (base_url, server) = create_server(|_, _, stream| {
         respond(
             stream,
             "409 Conflict",
@@ -391,7 +238,7 @@ async fn add_resumes_after_kill_between_catalog_registration_and_native_publicat
     let temp = tempfile::tempdir().unwrap();
     let fixture = cloud_fixture(temp.path()).await;
     let response = repository_response("kill-clone");
-    let (base_url, resolver) = create_server(move |_, stream| {
+    let (base_url, resolver) = create_server(move |_, _, stream| {
         respond(stream, "200 OK", &response);
         true
     });
@@ -491,23 +338,6 @@ fn add_json(
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     serde_json::from_slice(&output.stdout).unwrap()
-}
-
-fn commit_id(cwd: &Path, config: &Path, revision: &str) -> String {
-    let output = ds(
-        cwd,
-        config,
-        &[
-            "log",
-            "-r",
-            revision,
-            "--no-graph",
-            "-T",
-            "commit_id ++ \"\\n\"",
-        ],
-    );
-    assert!(output.status.success(), "{}", stderr(&output));
-    stdout(&output).trim().to_owned()
 }
 
 fn spawn_add_at_failpoint(

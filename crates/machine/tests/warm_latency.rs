@@ -3,7 +3,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use devspace_machine::MachineRepository;
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
 use jj_lib::ref_name::{RefName, RemoteRefSymbol};
 use jj_lib::repo::{Repo as _, RepoLoader, StoreFactories};
@@ -14,21 +13,9 @@ const SAMPLE_BATCHES: usize = 21;
 const OPENS_PER_BATCH: usize = 20;
 const FIXTURE_OPERATIONS: usize = 64;
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
+mod common;
+
+use common::settings;
 
 async fn stock_jj_batch(path: &Path, settings: &UserSettings) -> Duration {
     let started = Instant::now();

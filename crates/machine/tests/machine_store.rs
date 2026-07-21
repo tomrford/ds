@@ -8,21 +8,9 @@ use devspace_machine::{
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::settings::UserSettings;
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
+mod common;
+
+use common::settings;
 
 fn settings_with_unknown_signing_backend() -> UserSettings {
     let mut config = StackedConfig::with_defaults();

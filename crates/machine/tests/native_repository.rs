@@ -1,27 +1,13 @@
 use std::fs;
 
 use devspace_machine::{MachineRepository, MachineRepositoryError};
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
 use jj_lib::ref_name::RemoteRefSymbol;
 use jj_lib::repo::Repo as _;
-use jj_lib::settings::UserSettings;
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                    [user]
-                    name = "Devspace Test"
-                    email = "devspace@example.invalid"
-                "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
+mod common;
+
+use common::settings;
 
 #[tokio::test]
 async fn initializes_stock_simple_stores_and_reloads_native_state() {

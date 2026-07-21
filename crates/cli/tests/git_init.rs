@@ -3,10 +3,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
-    RepositoryName, SharedSecret,
+    MachineConfig, MachineId, MachineRepository, MachineStore, RepositoryName, SharedSecret,
 };
+
+mod support;
+
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
+use support::{
+    ds_command_with_home as ds_command, ds_with_home as ds, settings, stderr, stdout,
+    write_cli_config,
+};
 
 const PRIVATE_SENTINEL: &[u8] = b"INIT_PRIVATE_SENTINEL\0\xff";
 
@@ -387,58 +393,6 @@ fn configure_machine(root: &Path, machine_id: String) {
         .unwrap();
 }
 
-fn write_cli_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
-        &path,
-        r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
-            [ui]
-            color = "never"
-
-            [snapshot]
-            auto-update-stale = true
-        "#,
-    )
-    .unwrap();
-    path
-}
-
-fn settings() -> jj_lib::settings::UserSettings {
-    let mut config = jj_lib::config::StackedConfig::with_defaults();
-    config.add_layer(
-        jj_lib::config::ConfigLayer::parse(
-            jj_lib::config::ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    jj_lib::settings::UserSettings::from_config(config).unwrap()
-}
-
-fn ds(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
-    ds_command(cwd, home, config).args(args).output().unwrap()
-}
-
-fn ds_command(cwd: &Path, home: &Path, config: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
-    command
-        .current_dir(cwd)
-        .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
-        .env("JJ_CONFIG", config)
-        .env("DEVSPACE_BOUNDARY_SYNC", "0")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat");
-    command
-}
-
 fn configure_git_identity(worktree: &Path) {
     git_worktree(worktree, &["config", "user.name", "Plain Git"]);
     git_worktree(worktree, &["config", "user.email", "plain@example.invalid"]);
@@ -490,12 +444,4 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn path(path: &Path) -> &str {
     path.to_str().unwrap()
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }

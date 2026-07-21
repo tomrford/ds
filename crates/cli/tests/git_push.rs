@@ -1,6 +1,5 @@
 use std::fs;
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -8,12 +7,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use devspace_machine::{
-    GitProjection, HttpTransport, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId,
-    MachineRepository, MachineStore, MachineStoreError, ProjectionSnapshot, RepositoryId,
-    RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
+    GitProjection, HttpTransport, MachineConfig, MachineId, MachineRepository, MachineStoreError,
+    ProjectionSnapshot, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
+    SharedSecret,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
-use jj_lib::settings::UserSettings;
+
+mod support;
+
+use support::fake_worker::{create_server, read_http_request, respond};
+use support::{
+    ds_command_with_home as ds_command, ds_with_home as ds, machine_store, seal_commit, settings,
+    stderr, stdout, write_cli_config,
+};
 
 const FIRST_MACHINE_ID: &str = "12121212121212121212121212121212";
 const SECOND_MACHINE_ID: &str = "34343434343434343434343434343434";
@@ -166,48 +171,15 @@ async fn git_push_holds_the_repository_sync_lock_after_sync_completes() {
 
 #[tokio::test]
 async fn remote_add_prints_the_workers_kebab_case_error_code_without_the_url() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break Some(stream),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        break None;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("failed to accept test connection: {error}"),
-            }
-        };
-        let Some(ref mut stream) = stream else {
-            return false;
-        };
-        stream.set_nonblocking(false).unwrap();
-        let mut request = [0; 8192];
-        let _ = stream.read(&mut request).unwrap();
+    let (base_url, server) = create_server(|_, _, stream| {
         let body = r#"{"error":"remote URL must not contain userinfo credentials","code":"credentials-in-remote-url"}"#;
-        write!(
-            stream,
-            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .unwrap();
+        respond(stream, "400 Bad Request", body);
         true
     });
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("machine");
     fs::create_dir_all(&home).unwrap();
-    configure_machine(
-        &home,
-        &format!("http://{address}"),
-        FIRST_MACHINE_ID,
-        DEVELOPMENT_SECRET,
-    );
+    configure_machine(&home, &base_url, FIRST_MACHINE_ID, DEVELOPMENT_SECRET);
     let config = write_cli_config(&home);
     let checkout = local_checkout(&home, &config, "remote-error").await;
     let sentinel = "REMOTE_PASSWORD_SENTINEL";
@@ -221,7 +193,7 @@ async fn remote_add_prints_the_workers_kebab_case_error_code_without_the_url() {
     );
     let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
     assert!(
-        server.join().unwrap(),
+        !server.join().unwrap().is_empty(),
         "CLI never contacted the Worker: {diagnostic}"
     );
     assert_eq!(output.status.code(), Some(1));
@@ -649,28 +621,31 @@ fn cloud_paused_at_remote_list() -> (String, Receiver<()>, SyncSender<()>, JoinH
             if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
                 push_reached_tx.send(()).unwrap();
                 release_push_rx.recv().unwrap();
-                respond_json(&mut stream, r#"{"remotes":[]}"#);
+                respond(&mut stream, "200 OK", r#"{"remotes":[]}"#);
                 return;
             }
             if request_line.starts_with("GET ") && request_line.contains("/packs?") {
-                respond_json(
+                respond(
                     &mut stream,
+                    "200 OK",
                     r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
                 );
             } else if request_line.starts_with("GET ") && request_line.contains("/heads?") {
-                respond_json(&mut stream, r#"{"cursor":0,"heads":[]}"#);
+                respond(&mut stream, "200 OK", r#"{"cursor":0,"heads":[]}"#);
             } else if request_line.starts_with("POST ")
                 && request_line.contains("/objects/inventory ")
             {
                 let body: serde_json::Value = serde_json::from_str(request_body(&request)).unwrap();
-                respond_json(
+                respond(
                     &mut stream,
+                    "200 OK",
                     &serde_json::json!({ "objects": body["objects"] }).to_string(),
                 );
             } else if request_line.starts_with("POST ") && request_line.contains("/heads ") {
                 let body: serde_json::Value = serde_json::from_str(request_body(&request)).unwrap();
-                respond_json(
+                respond(
                     &mut stream,
+                    "200 OK",
                     &serde_json::json!({ "cursor": 1, "heads": [body["newHead"]] }).to_string(),
                 );
             } else {
@@ -681,45 +656,8 @@ fn cloud_paused_at_remote_list() -> (String, Receiver<()>, SyncSender<()>, JoinH
     (base_url, push_reached_rx, release_push_tx, server)
 }
 
-fn read_http_request(stream: &mut TcpStream) -> String {
-    let mut bytes = Vec::new();
-    let mut buffer = [0; 8_192];
-    loop {
-        let count = stream.read(&mut buffer).unwrap();
-        assert!(count > 0, "client closed before completing its request");
-        bytes.extend_from_slice(&buffer[..count]);
-        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
-            continue;
-        };
-        let header_end = header_end + 4;
-        let headers = String::from_utf8_lossy(&bytes[..header_end]);
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                line.split_once(':').and_then(|(name, value)| {
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-            })
-            .unwrap_or(0);
-        if bytes.len() >= header_end + content_length {
-            return String::from_utf8(bytes).unwrap();
-        }
-    }
-}
-
 fn request_body(request: &str) -> &str {
     request.split_once("\r\n\r\n").unwrap().1
-}
-
-fn respond_json(stream: &mut TcpStream, body: &str) {
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )
-    .unwrap();
 }
 
 async fn local_checkout(home: &Path, config: &Path, name: &str) -> PathBuf {
@@ -745,46 +683,6 @@ async fn local_checkout(home: &Path, config: &Path, name: &str) -> PathBuf {
     checkout
 }
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
-
-fn write_cli_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
-        &path,
-        r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
-            [ui]
-            color = "never"
-
-            [snapshot]
-            auto-update-stale = true
-        "#,
-    )
-    .unwrap();
-    path
-}
-
-fn machine_store(root: &Path) -> MachineStore {
-    MachineStore::new(root.join("machine-store"))
-}
-
 fn configure_machine(root: &Path, base_url: &str, machine_id: &str, secret: &str) {
     machine_store(root)
         .write_config(
@@ -796,29 +694,6 @@ fn configure_machine(root: &Path, base_url: &str, machine_id: &str, secret: &str
             .unwrap(),
         )
         .unwrap();
-}
-
-fn ds(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
-    ds_command(cwd, home, config).args(args).output().unwrap()
-}
-
-fn ds_command(cwd: &Path, home: &Path, config: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
-    command
-        .current_dir(cwd)
-        .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
-        .env("JJ_CONFIG", config)
-        .env("DEVSPACE_BOUNDARY_SYNC", "0")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat");
-    command
-}
-
-fn seal_commit(cwd: &Path, home: &Path, config: &Path, description: &str) {
-    let described = ds(cwd, home, config, &["describe", "-m", description]);
-    assert!(described.status.success(), "{}", stderr(&described));
-    let sealed = ds(cwd, home, config, &["new"]);
-    assert!(sealed.status.success(), "{}", stderr(&sealed));
 }
 
 fn set_bookmark(cwd: &Path, home: &Path, config: &Path, name: &str, revision: &str) {
@@ -904,14 +779,6 @@ fn git_command(args: &[&str], git_dir: Option<&Path>) -> Command {
     }
     command.args(args);
     command
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 fn unique_repository_name(temp: &Path, label: &str) -> String {

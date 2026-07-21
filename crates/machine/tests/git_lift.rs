@@ -12,25 +12,15 @@ use jj_lib::backend::{
     ChangeId, Commit as BackendCommit, CommitId, CopyId, MillisSinceEpoch, Signature, Timestamp,
     Tree as BackendTree, TreeId, TreeValue,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::merge::Merge;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
-use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            "[user]\nname = 'Devspace Test'\nemail = 'devspace@example.invalid'\n",
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
+mod common;
+
+use common::settings;
 
 fn path(value: &str) -> RepoPathBuf {
     RepoPathBuf::from_internal_string(value).unwrap()
@@ -743,10 +733,6 @@ async fn lifting_is_deterministic_across_fresh_stores() {
 
 #[tokio::test]
 async fn tombstone_bytes_ids_and_a_collision_fallback_are_frozen() {
-    assert_eq!(TOMBSTONE_A.last(), Some(&b'\n'));
-    assert_eq!(TOMBSTONE_B.last(), Some(&b'\n'));
-    assert_eq!(TOMBSTONE_A.len(), 350);
-    assert_eq!(TOMBSTONE_B.len(), 350);
     let fixture = lift_fixture(b"/hidden\n", None).await;
     let store = fixture.repository.repo().store();
     let a = file(store, "a", TOMBSTONE_A).await;

@@ -1,61 +1,25 @@
 use std::fs;
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::thread;
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
-    RepositoryName, SharedSecret,
+    MachineConfig, MachineId, MachineRepository, MachineStore, RepositoryName, SharedSecret,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::default_index::DefaultIndexStore;
 use jj_lib::default_submodule_store::DefaultSubmoduleStore;
 use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::Repo as _;
-use jj_lib::settings::UserSettings;
 use jj_lib::simple_backend::SimpleBackend;
 use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
 use jj_lib::simple_op_store::SimpleOpStore;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
+mod support;
 mod support_fs;
 
+use support::fake_worker::{create_server, repository_response, respond};
+use support::{ds, machine_store, settings, stderr, stdout, write_cli_config};
+
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
-
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
-
-fn write_cli_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
-        &path,
-        r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
-            [ui]
-            color = "never"
-        "#,
-    )
-    .unwrap();
-    path
-}
 
 fn write_unknown_signing_config(root: &Path) -> PathBuf {
     let path = root.join("jj-config.toml");
@@ -77,38 +41,6 @@ fn write_unknown_signing_config(root: &Path) -> PathBuf {
     path
 }
 
-fn ds(cwd: &Path, config: &Path, args: &[&str]) -> Output {
-    let mut command = ds_command(cwd, config);
-    command.args(args).output().unwrap()
-}
-
-fn ds_command(cwd: &Path, config: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
-    command
-        .current_dir(cwd)
-        .env(
-            MACHINE_STORE_OVERRIDE,
-            config.parent().unwrap().join("machine-store"),
-        )
-        .env("JJ_CONFIG", config)
-        .env("DEVSPACE_BOUNDARY_SYNC", "0")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat");
-    command
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-fn machine_store(root: &Path) -> MachineStore {
-    MachineStore::new(root.join("machine-store"))
-}
-
 fn configure_machine(root: &Path, base_url: &str) {
     machine_store(root)
         .write_config(
@@ -122,79 +54,9 @@ fn configure_machine(root: &Path, base_url: &str) {
         .unwrap();
 }
 
-fn create_server<F>(
-    request_count: usize,
-    mut handle: F,
-) -> (String, thread::JoinHandle<Vec<String>>)
-where
-    F: FnMut(usize, &str, &mut TcpStream) + Send + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = format!("http://{}", listener.local_addr().unwrap());
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for index in 0..request_count {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_http_request(&mut stream);
-            handle(index, &request, &mut stream);
-            requests.push(request);
-        }
-        requests
-    });
-    (address, server)
-}
-
-fn read_http_request(stream: &mut TcpStream) -> String {
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .unwrap();
-    let mut bytes = Vec::new();
-    let mut buffer = [0; 4096];
-    let expected_length = loop {
-        let read = stream.read(&mut buffer).unwrap();
-        assert_ne!(read, 0, "HTTP request ended before its headers");
-        bytes.extend_from_slice(&buffer[..read]);
-        if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            let headers = String::from_utf8_lossy(&bytes[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-            break header_end + 4 + content_length;
-        }
-    };
-    while bytes.len() < expected_length {
-        let read = stream.read(&mut buffer).unwrap();
-        assert_ne!(read, 0, "HTTP request ended before its body");
-        bytes.extend_from_slice(&buffer[..read]);
-    }
-    String::from_utf8(bytes[..expected_length].to_vec()).unwrap()
-}
-
 fn request_json(request: &str) -> serde_json::Value {
     let (_, body) = request.split_once("\r\n\r\n").unwrap();
     serde_json::from_str(body).unwrap()
-}
-
-fn respond(stream: &mut TcpStream, status: &str, body: &str) {
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-}
-
-fn repository_response(name: &str) -> String {
-    format!(
-        r#"{{"name":"{name}","repositoryId":"{}","incarnation":"{}"}}"#,
-        "ab".repeat(32),
-        "cd".repeat(16)
-    )
 }
 
 fn checkout_repository_path(checkout: &Path) -> PathBuf {
@@ -254,7 +116,7 @@ async fn repo_new_replays_a_lost_response_with_the_durable_request_key() {
     let temp = tempfile::tempdir().unwrap();
     let response = repository_response("retry-safe");
     let store_root = temp.path().join("machine-store");
-    let (base_url, server) = create_server(2, move |index, request, stream| {
+    let (base_url, server) = create_server(move |index, request, stream| {
         let persisted = MachineStore::new(&store_root)
             .repository_creation_intent(&RepositoryName::parse("retry-safe").unwrap())
             .unwrap()
@@ -271,6 +133,7 @@ async fn repo_new_replays_a_lost_response_with_the_durable_request_key() {
         if index == 1 {
             respond(stream, "200 OK", &response);
         }
+        index == 1
     });
     configure_machine(temp.path(), &base_url);
     let config = write_cli_config(temp.path());
@@ -354,8 +217,9 @@ async fn repo_new_replays_a_lost_response_with_the_durable_request_key() {
 async fn repo_new_attaches_two_independent_checkouts_to_one_machine_repository() {
     let temp = tempfile::tempdir().unwrap();
     let response = repository_response("shared-checkouts");
-    let (base_url, server) = create_server(1, move |_, _, stream| {
+    let (base_url, server) = create_server(move |_, _, stream| {
         respond(stream, "200 OK", &response);
+        true
     });
     configure_machine(temp.path(), &base_url);
     let config = write_cli_config(temp.path());
@@ -551,9 +415,10 @@ async fn repo_new_recovers_locally_after_cloud_success_precedes_catalog_write() 
     let temp = tempfile::tempdir().unwrap();
     let catalog_path = machine_store(temp.path()).catalog_path();
     let response = repository_response("catalog-retry");
-    let (base_url, server) = create_server(1, move |_, _, stream| {
+    let (base_url, server) = create_server(move |_, _, stream| {
         fs::create_dir(&catalog_path).unwrap();
         respond(stream, "200 OK", &response);
+        true
     });
     configure_machine(temp.path(), &base_url);
     let config = write_cli_config(temp.path());
@@ -577,8 +442,9 @@ async fn repo_new_recovers_locally_after_cloud_success_precedes_catalog_write() 
 async fn repo_new_recovers_after_catalog_registration_precedes_materialization() {
     let temp = tempfile::tempdir().unwrap();
     let response = repository_response("materialization-retry");
-    let (base_url, server) = create_server(1, move |_, _, stream| {
+    let (base_url, server) = create_server(move |_, _, stream| {
         respond(stream, "200 OK", &response);
+        true
     });
     configure_machine(temp.path(), &base_url);
     let bad_config = write_unknown_signing_config(temp.path());
@@ -618,7 +484,7 @@ async fn repo_new_recovers_after_catalog_registration_precedes_materialization()
 fn repo_new_retries_a_retired_receipt_once_with_a_fresh_key() {
     let temp = tempfile::tempdir().unwrap();
     let response = repository_response("expired-provisional");
-    let (base_url, server) = create_server(2, move |index, _, stream| {
+    let (base_url, server) = create_server(move |index, _, stream| {
         if index == 0 {
             respond(
                 stream,
@@ -628,6 +494,7 @@ fn repo_new_retries_a_retired_receipt_once_with_a_fresh_key() {
         } else {
             respond(stream, "200 OK", &response);
         }
+        index == 1
     });
     configure_machine(temp.path(), &base_url);
     let config = write_cli_config(temp.path());
@@ -654,12 +521,13 @@ fn repo_new_retries_a_retired_receipt_once_with_a_fresh_key() {
 #[test]
 fn repo_new_discards_an_idempotency_key_invariant_failure() {
     let temp = tempfile::tempdir().unwrap();
-    let (base_url, server) = create_server(1, |_, _, stream| {
+    let (base_url, server) = create_server(|_, _, stream| {
         respond(
             stream,
             "409 Conflict",
             r#"{"error":"idempotency key was already used for a different repository request","code":"idempotency-key-reused"}"#,
         );
+        true
     });
     configure_machine(temp.path(), &base_url);
     let config = write_cli_config(temp.path());
@@ -697,8 +565,9 @@ fn repo_new_retains_the_intent_for_authentication_and_server_failures() {
             r#"{"error":"temporarily unavailable"}"#,
         ),
     ] {
-        let (base_url, server) = create_server(1, move |_, _, stream| {
+        let (base_url, server) = create_server(move |_, _, stream| {
             respond(stream, status, body);
+            true
         });
         configure_machine(temp.path(), &base_url);
 
@@ -717,7 +586,7 @@ fn repo_new_retains_the_intent_for_authentication_and_server_failures() {
 fn repo_new_discards_a_name_conflict_and_can_create_after_the_name_is_freed() {
     let temp = tempfile::tempdir().unwrap();
     let response = repository_response("occupied");
-    let (base_url, server) = create_server(2, move |index, _, stream| {
+    let (base_url, server) = create_server(move |index, _, stream| {
         if index == 0 {
             respond(
                 stream,
@@ -727,6 +596,7 @@ fn repo_new_discards_a_name_conflict_and_can_create_after_the_name_is_freed() {
         } else {
             respond(stream, "200 OK", &response);
         }
+        index == 1
     });
     configure_machine(temp.path(), &base_url);
     let config = write_cli_config(temp.path());

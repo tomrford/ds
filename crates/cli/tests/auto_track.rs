@@ -1,76 +1,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
-    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
+    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, RepositoryId,
+    RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
-use jj_lib::settings::UserSettings;
+
+mod support;
+
+use support::{ds, machine_store, settings, stderr, stdout, write_cli_config};
 
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
-
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
-}
-
-fn write_cli_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
-        &path,
-        r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
-            [ui]
-            color = "never"
-        "#,
-    )
-    .unwrap();
-    path
-}
-
-fn machine_store(root: &Path) -> MachineStore {
-    MachineStore::new(root.join("machine-store"))
-}
-
-fn ds(cwd: &Path, config: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ds"))
-        .current_dir(cwd)
-        .env(
-            MACHINE_STORE_OVERRIDE,
-            config.parent().unwrap().join("machine-store"),
-        )
-        .env("JJ_CONFIG", config)
-        .env("DEVSPACE_BOUNDARY_SYNC", "0")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat")
-        .args(args)
-        .output()
-        .unwrap()
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
 
 async fn checkout(root: &Path, config: &Path, name: &str) -> PathBuf {
     let store = machine_store(root);
