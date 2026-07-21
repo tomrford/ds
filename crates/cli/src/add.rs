@@ -72,7 +72,7 @@ struct AddedCheckout<'a> {
 enum AddOutcome {
     Created,
     Rebuilt,
-    AlreadyExists,
+    AlreadyExists { requested_revision_applied: bool },
 }
 
 pub(crate) async fn add_checkout(
@@ -146,21 +146,26 @@ pub(crate) async fn add_checkout(
 
     let (outcome, operation_id) = match (destination_exists, current_workspace_commit) {
         (true, Some(current_id)) => {
-            require_requested_parent(
+            let current = registered_workspace_commit(
                 repository.repo().as_ref(),
                 &workspace_name,
                 &current_id,
-                &base_commit_id,
             )
             .await
             .map_err(user_error)?;
+            let requested_revision_applied = current.parent_ids() == [base_commit_id.clone()];
             record_workspace_destination(
                 &entry.native_repository_path,
                 &workspace_name,
                 &requested_path,
             )
             .map_err(user_error)?;
-            (AddOutcome::AlreadyExists, repository.repo().op_id().clone())
+            (
+                AddOutcome::AlreadyExists {
+                    requested_revision_applied,
+                },
+                repository.repo().op_id().clone(),
+            )
         }
         (true, None) => {
             return Err(user_error(format!(
@@ -234,6 +239,17 @@ pub(crate) async fn add_checkout(
         serde_json::to_writer_pretty(ui.stdout(), &checkout)
             .map_err(|error| user_error(format!("failed to encode checkout identity: {error}")))?;
         writeln!(ui.stdout())?;
+        if matches!(
+            outcome,
+            AddOutcome::AlreadyExists {
+                requested_revision_applied: false
+            }
+        ) {
+            writeln!(
+                ui.status(),
+                "The requested revision was not applied because the existing checkout is at a different working-copy parent."
+            )?;
+        }
     } else {
         match outcome {
             AddOutcome::Created => writeln!(
@@ -248,9 +264,19 @@ pub(crate) async fn add_checkout(
                 workspace_name.as_symbol(),
                 requested_path.display()
             )?,
-            AddOutcome::AlreadyExists => writeln!(
+            AddOutcome::AlreadyExists {
+                requested_revision_applied: true,
+            } => writeln!(
                 ui.status(),
                 "Workspace {} for `{name}` already exists at {}.",
+                workspace_name.as_symbol(),
+                requested_path.display()
+            )?,
+            AddOutcome::AlreadyExists {
+                requested_revision_applied: false,
+            } => writeln!(
+                ui.status(),
+                "Workspace {} for `{name}` already exists at {}; the requested revision was not applied because the existing checkout is at a different working-copy parent.",
                 workspace_name.as_symbol(),
                 requested_path.display()
             )?,
@@ -434,14 +460,12 @@ async fn register_workspace(
     Ok((repo, working_copy_commit))
 }
 
-async fn require_requested_parent(
+async fn registered_workspace_commit(
     repo: &jj_lib::repo::ReadonlyRepo,
     workspace_name: &WorkspaceName,
     current_id: &CommitId,
-    requested_base: &CommitId,
 ) -> Result<Commit, String> {
-    let current = repo
-        .store()
+    repo.store()
         .get_commit_async(current_id)
         .await
         .map_err(|error| {
@@ -449,7 +473,16 @@ async fn require_requested_parent(
                 "failed to load current position of workspace {}: {error}",
                 workspace_name.as_symbol()
             )
-        })?;
+        })
+}
+
+async fn require_requested_parent(
+    repo: &jj_lib::repo::ReadonlyRepo,
+    workspace_name: &WorkspaceName,
+    current_id: &CommitId,
+    requested_base: &CommitId,
+) -> Result<Commit, String> {
+    let current = registered_workspace_commit(repo, workspace_name, current_id).await?;
     if current.parent_ids() == [requested_base.clone()] {
         return Ok(current);
     }

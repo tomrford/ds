@@ -155,15 +155,18 @@ same workspace. The checkout carries a self-describing
 native repository. Its working-copy state stays in the checkout.
 
 `ds add` decides retries from the repository view and destination directory. A
-matching destination, workspace and requested parent is already complete; the
-command refreshes the workspace-path record and succeeds. If the destination is
-absent but that workspace is registered at the requested parent, the command
-rebuilds the checkout at its current working-copy commit. A workspace registered
-at another parent must be requested with that matching revision. Any destination
-without the matching ownership marker is left untouched and rejected. These
-checks defend against accidental collisions, concurrent creators and stale
-leftovers; they are not a security boundary against other local processes,
-which own the same files the checkout does.
+matching destination whose workspace remains registered is already complete,
+regardless of its current parent. The command still resolves the requested
+revision, repairs the workspace-path record and succeeds without touching the
+checkout. If its current parent differs, the status explains that the requested
+revision was not applied. If the destination is absent but that workspace is
+registered at the requested parent, the command rebuilds the checkout at its
+current working-copy commit. A workspace registered at another parent must be
+requested with that matching revision. Any destination without the matching
+ownership marker is left untouched and rejected. These checks defend against
+accidental collisions, concurrent creators and stale leftovers; they are not a
+security boundary against other local processes, which own the same files the
+checkout does.
 
 Fresh creation writes the working-copy commit and workspace registration in one
 repository transaction. The checkout is built from scratch in a deterministic

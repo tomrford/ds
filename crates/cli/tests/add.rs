@@ -374,6 +374,26 @@ async fn only_workspace(repository_path: &Path) -> (WorkspaceNameBuf, jj_lib::ba
     (name.clone(), commit.clone())
 }
 
+async fn forget_workspace_in_repository_view(
+    repository_path: &Path,
+    workspace_name: &WorkspaceName,
+) {
+    let repository = MachineRepository::open(repository_path, &settings())
+        .await
+        .unwrap();
+    let mut transaction = repository.repo().start_transaction();
+    transaction
+        .repo_mut()
+        .remove_wc_commit(workspace_name)
+        .await
+        .unwrap();
+    transaction.repo_mut().rebase_descendants().await.unwrap();
+    transaction
+        .commit("simulate an interrupted workspace removal")
+        .await
+        .unwrap();
+}
+
 fn stored_workspace_path(
     repository_path: &Path,
     workspace_name: &WorkspaceName,
@@ -493,6 +513,94 @@ async fn add_existing_owned_checkout_is_idempotent_and_repairs_workspace_store()
 }
 
 #[tokio::test]
+async fn add_existing_advanced_checkout_keeps_its_position_and_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_name = "advanced-existing";
+    local_repository(temp.path(), repository_name).await;
+    let config = write_cli_config(temp.path());
+    let destination = temp.path().join("checkout");
+    add_json(
+        temp.path(),
+        &config,
+        repository_name,
+        "root()",
+        &destination,
+    );
+    let describe = ds(&destination, &config, &["describe", "-m", "base"]);
+    assert!(describe.status.success(), "{}", stderr(&describe));
+    let new = ds(&destination, &config, &["new", "-m", "current change"]);
+    assert!(new.status.success(), "{}", stderr(&new));
+    fs::write(destination.join("work-in-progress"), "untouched").unwrap();
+    let status = ds(&destination, &config, &["status"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let current_before = commit_id(&destination, &config, "@");
+    let parent_before = commit_id(&destination, &config, "@-");
+
+    let retry = add(
+        temp.path(),
+        &config,
+        repository_name,
+        "root()",
+        &destination,
+    );
+
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    assert!(
+        stderr(&retry).contains("already exists"),
+        "{}",
+        stderr(&retry)
+    );
+    assert!(
+        stderr(&retry).contains("requested revision was not applied"),
+        "{}",
+        stderr(&retry)
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("work-in-progress")).unwrap(),
+        "untouched"
+    );
+    assert_eq!(commit_id(&destination, &config, "@"), current_before);
+    assert_eq!(commit_id(&destination, &config, "@-"), parent_before);
+}
+
+#[tokio::test]
+async fn add_existing_checkout_still_rejects_an_invalid_revision() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_name = "invalid-existing";
+    local_repository(temp.path(), repository_name).await;
+    let config = write_cli_config(temp.path());
+    let destination = temp.path().join("checkout");
+    add_json(
+        temp.path(),
+        &config,
+        repository_name,
+        "root()",
+        &destination,
+    );
+    fs::write(destination.join("keep"), "untouched").unwrap();
+
+    let retry = add(
+        temp.path(),
+        &config,
+        repository_name,
+        "no-such-revision",
+        &destination,
+    );
+
+    assert_eq!(retry.status.code(), Some(1), "{}", stderr(&retry));
+    assert!(
+        stderr(&retry).contains("no-such-revision"),
+        "{}",
+        stderr(&retry)
+    );
+    assert!(!stderr(&retry).contains("already exists"));
+    assert_eq!(
+        fs::read_to_string(destination.join("keep")).unwrap(),
+        "untouched"
+    );
+}
+
+#[tokio::test]
 async fn add_refuses_foreign_destination_then_succeeds_after_removal() {
     let temp = tempfile::tempdir().unwrap();
     let repository_name = "foreign";
@@ -526,6 +634,105 @@ async fn add_refuses_foreign_destination_then_succeeds_after_removal() {
     );
     assert!(added.status.success(), "{}", stderr(&added));
     assert!(destination.join(".jj/repo").is_file());
+}
+
+#[tokio::test]
+async fn add_rejects_owned_destination_conflicts() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_name = "ownership-conflicts";
+    let repository_path = local_repository(temp.path(), repository_name).await;
+    let config = write_cli_config(temp.path());
+    let destination = temp.path().join("checkout");
+    let source = temp.path().join("source");
+    let added = add_json(
+        temp.path(),
+        &config,
+        repository_name,
+        "root()",
+        &destination,
+    );
+    add_json(temp.path(), &config, repository_name, "root()", &source);
+    fs::write(destination.join("keep"), "untouched").unwrap();
+    let marker_path = destination.join(".jj/devspace-checkout-owner");
+    let original_marker = fs::read(&marker_path).unwrap();
+    let original_owner: serde_json::Value = serde_json::from_slice(&original_marker).unwrap();
+
+    for (label, field, value) in [
+        ("repository", "repository_id", "ef".repeat(32)),
+        ("incarnation", "incarnation", "ef".repeat(16)),
+        ("workspace", "workspace_name", "other-workspace".to_owned()),
+    ] {
+        let mut owner = original_owner.clone();
+        owner[field] = serde_json::Value::String(value);
+        fs::write(&marker_path, serde_json::to_vec_pretty(&owner).unwrap()).unwrap();
+        let output = add(
+            temp.path(),
+            &config,
+            repository_name,
+            "root()",
+            &destination,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{label}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("without the matching Devspace ownership marker"),
+            "{label}: {}",
+            stderr(&output)
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("keep")).unwrap(),
+            "untouched"
+        );
+    }
+
+    fs::write(
+        &marker_path,
+        fs::read(source.join(".jj/devspace-checkout-owner")).unwrap(),
+    )
+    .unwrap();
+    let copied = add(
+        temp.path(),
+        &config,
+        repository_name,
+        "root()",
+        &destination,
+    );
+    assert_eq!(copied.status.code(), Some(1), "{}", stderr(&copied));
+    assert!(
+        stderr(&copied).contains("without the matching Devspace ownership marker"),
+        "{}",
+        stderr(&copied)
+    );
+
+    fs::write(&marker_path, original_marker).unwrap();
+    let workspace_name = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
+    forget_workspace_in_repository_view(&repository_path, &workspace_name).await;
+    let unregistered = add(
+        temp.path(),
+        &config,
+        repository_name,
+        "root()",
+        &destination,
+    );
+    assert_eq!(
+        unregistered.status.code(),
+        Some(1),
+        "{}",
+        stderr(&unregistered)
+    );
+    assert!(
+        stderr(&unregistered).contains("is not registered"),
+        "{}",
+        stderr(&unregistered)
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("keep")).unwrap(),
+        "untouched"
+    );
 }
 
 #[tokio::test]
