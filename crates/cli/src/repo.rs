@@ -14,6 +14,7 @@ use crate::context::{ContextArgs, run_context};
 use crate::daemon::{DaemonArgs, run_daemon};
 use crate::init::{InitArgs, init_repository};
 use crate::remove::{RemoveArgs, remove_checkout};
+use crate::skill::{SkillArgs, print_skill};
 use crate::sync::{SyncArgs, run_sync};
 
 #[derive(clap::Subcommand)]
@@ -30,6 +31,8 @@ pub(crate) enum DevspaceCommand {
     Daemon(DaemonArgs),
     /// Manage cloud repositories.
     Repo(RepoArgs),
+    /// Print agent-facing guidance for working with Devspace.
+    Skill(SkillArgs),
     /// Manage machine synchronization.
     Sync(SyncArgs),
 }
@@ -63,6 +66,7 @@ pub(crate) async fn run(
         DevspaceCommand::Repo(RepoArgs {
             command: RepoCommand::New { name },
         }) => create_empty_repository(ui, command, name).await,
+        DevspaceCommand::Skill(args) => print_skill(ui, args),
         DevspaceCommand::Sync(args) => {
             crate::boundary_sync::suppress();
             run_sync(ui, command, args).await

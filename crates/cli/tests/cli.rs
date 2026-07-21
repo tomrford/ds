@@ -278,7 +278,9 @@ fn root_help_is_devspace_first() {
         help.starts_with("Cloudflare-native development workspaces"),
         "{help}"
     );
-    for command in ["add", "init", "remove", "repo", "sync", "git", "status"] {
+    for command in [
+        "add", "init", "remove", "repo", "skill", "sync", "git", "status",
+    ] {
         assert!(
             help.lines()
                 .any(|line| line.trim_start().starts_with(&format!("{command} "))),
@@ -287,6 +289,52 @@ fn root_help_is_devspace_first() {
     }
     assert!(help.contains("ds help jj"), "{help}");
     assert!(!help.contains("  abandon "), "{help}");
+}
+
+#[test]
+fn skill_prints_agent_guidance_without_a_checkout() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_fixture_cli_config(temp.path());
+
+    let output = ds(temp.path(), &config, &["skill"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let guidance = stdout(&output);
+    assert!(guidance.contains("Raw `git` and `jj` commands do not"));
+    assert!(guidance.contains("Git is a projection boundary"));
+    assert!(guidance.contains("It is not an ignore file"));
+}
+
+#[test]
+fn skill_topics_render_without_a_checkout() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_fixture_cli_config(temp.path());
+
+    for (topic, sentinel) in [
+        ("core", "# Devspace"),
+        ("private", "# Private paths with `.dsprivate`"),
+        ("context", "# Pinned repository context"),
+        ("jj", "# Devspace and jj"),
+    ] {
+        let output = ds(temp.path(), &config, &["skill", topic]);
+        assert!(output.status.success(), "{topic}: {}", stderr(&output));
+        assert!(stdout(&output).contains(sentinel), "{topic}");
+    }
+}
+
+#[test]
+fn skill_rejects_unknown_topic_with_available_topics() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_fixture_cli_config(temp.path());
+
+    let output = ds(temp.path(), &config, &["skill", "unknown"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(error.contains("Unknown skill topic `unknown`"), "{error}");
+    for topic in ["core", "private", "context", "jj"] {
+        assert!(error.contains(topic), "missing `{topic}` from: {error}");
+    }
 }
 
 #[test]

@@ -9,6 +9,7 @@ mod git_shim;
 mod init;
 mod remove;
 mod repo;
+mod skill;
 mod sync;
 mod sync_status;
 mod tx;
