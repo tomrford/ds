@@ -1,14 +1,15 @@
 use std::io::Write as _;
 
-use jj_cli::command_error::{CommandError, user_error};
+use jj_cli::command_error::CommandError;
 use jj_cli::ui::Ui;
 
 const CORE: &str = r#"# Devspace
 
 Devspace keeps native jj repositories on your machine and synchronizes them
 through a cloud authority. Git is a projection boundary for sharing selected
-history, not Devspace's source of truth. Raw `git` and `jj` commands do not
-work in a Devspace checkout — both error; everything goes through `ds`.
+history, not Devspace's source of truth. Read-only `git` commands (`status`,
+`log`, `ls-files`, and `diff`) use the checkout's index shim. Git writes and
+all `jj` commands fail; use `ds` for changes.
 
 ## Daily work
 
@@ -134,25 +135,27 @@ signing, Git submodules, and SHA-256 remotes are unsupported on this
 boundary.
 "#;
 
-const TOPICS: &str = "core, private, context, jj";
+#[derive(Clone, clap::ValueEnum)]
+enum SkillTopic {
+    Core,
+    Private,
+    Context,
+    Jj,
+}
 
 #[derive(clap::Args)]
 pub(crate) struct SkillArgs {
     /// Show detailed guidance for a topic.
-    topic: Option<String>,
+    #[arg(value_enum)]
+    topic: Option<SkillTopic>,
 }
 
 pub(crate) fn print_skill(ui: &mut Ui, args: SkillArgs) -> Result<(), CommandError> {
-    let page = match args.topic.as_deref() {
-        None | Some("core") => CORE,
-        Some("private") => PRIVATE,
-        Some("context") => CONTEXT,
-        Some("jj") => JJ,
-        Some(topic) => {
-            return Err(user_error(format!(
-                "Unknown skill topic `{topic}`. Available topics: {TOPICS}."
-            )));
-        }
+    let page = match args.topic {
+        None | Some(SkillTopic::Core) => CORE,
+        Some(SkillTopic::Private) => PRIVATE,
+        Some(SkillTopic::Context) => CONTEXT,
+        Some(SkillTopic::Jj) => JJ,
     };
     write!(ui.stdout(), "{page}")?;
     Ok(())

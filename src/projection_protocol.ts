@@ -224,7 +224,11 @@ export function compareNullableBytes(
 function parseProjection<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
   if (result.success) return result.data;
-  if (result.error.issues.some((issue) => issue.message === "fetch request must include refs or receipts")) {
+  if (
+    result.error.issues.some(
+      (issue) => issue.code === "custom" && issue.path.length === 0,
+    )
+  ) {
     throw new ProjectionProtocolError(
       "fetch request must include refs or receipts",
       "fetch-empty",

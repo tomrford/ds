@@ -11,7 +11,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Context as _, Result, is_valid_alias, write_atomic_str};
+use anyhow::{Context as _, Result, bail};
+
+use super::{is_valid_alias, write_atomic_str};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LockMode {

@@ -3,9 +3,8 @@ use std::io::Write as _;
 
 use devspace_machine::{
     CatalogEntry, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
-    MachineConfig, MachineStore, RepositoryCreationIntent,
-    RepositoryCreationIntentError, RepositoryCreationKey, RepositoryCreationTarget,
-    RepositoryIdentity, RepositoryName,
+    MachineConfig, MachineStore, RepositoryCreationIntent, RepositoryCreationIntentError,
+    RepositoryCreationKey, RepositoryCreationTarget, RepositoryIdentity, RepositoryName,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -16,6 +15,7 @@ use crate::add::{AddArgs, add_checkout};
 use crate::context::{ContextArgs, run_context};
 use crate::daemon::{DaemonArgs, run_daemon};
 use crate::doctor::run_doctor;
+use crate::git::{CLOUD_RUNTIME_ERROR, cloud_runtime, display_error};
 use crate::init::{InitArgs, import_git_repository, init_repository};
 use crate::list::list_workspaces;
 use crate::remove::{RemoveArgs, remove_checkout};
@@ -211,8 +211,7 @@ pub(crate) fn create_cloud_repository(
         // jj-cli drives commands on its own executor. reqwest requires a Tokio
         // reactor, so own that narrow transport runtime here rather than making
         // the embedded command runner or machine-store work Tokio-specific.
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|_| other("failed to start the cloud transport runtime".to_owned()))?;
+        let runtime = cloud_runtime().map_err(|_| other(CLOUD_RUNTIME_ERROR.to_owned()))?;
         let mut retirement_retry_available = true;
         loop {
             if let Some(identity) = intent.identity() {
@@ -288,12 +287,9 @@ pub(crate) fn parse_repository_name(value: String) -> Result<RepositoryName, Com
 fn rename_repository(ui: &mut Ui, old: String, new: String) -> Result<(), CommandError> {
     let old = parse_repository_name(old)?;
     let new = parse_repository_name(new)?;
-    let store = MachineStore::platform_default().map_err(display_error)?;
-    let config = store.load_config().map_err(display_error)?;
-    let client = ControlPlaneClient::new(&config).map_err(display_error)?;
+    let (store, client, runtime) = cloud_client()?;
     let local_old = store.resolve(&old).map_err(display_error)?;
     let local_new = store.resolve(&new).map_err(display_error)?;
-    let runtime = cloud_runtime()?;
     let cloud = match runtime.block_on(client.rename_repository(&old, &new)) {
         Ok(repository) => repository,
         Err(ControlPlaneClientError::Remote {
@@ -342,11 +338,8 @@ async fn remove_repository(
     force: bool,
 ) -> Result<(), CommandError> {
     let name = parse_repository_name(name)?;
-    let store = MachineStore::platform_default().map_err(display_error)?;
-    let config = store.load_config().map_err(display_error)?;
-    let client = ControlPlaneClient::new(&config).map_err(display_error)?;
+    let (store, client, runtime) = cloud_client()?;
     let local = store.resolve(&name).map_err(display_error)?;
-    let runtime = cloud_runtime()?;
     let identity = match &local {
         Some(entry) => entry.identity.clone(),
         None => match runtime.block_on(client.resolve_repository(&name)) {
@@ -364,23 +357,23 @@ async fn remove_repository(
     };
 
     if let Some(entry) = &local {
-        let paths = registered_checkout_paths(entry, command).await?;
-        if !paths.is_empty() {
+        let inventory = workspace_inventory(entry, command).await?;
+        if !inventory.checkout_paths.is_empty() {
             return Err(user_error(format!(
                 "Repository `{name}` has registered checkouts on this machine:\n{}\nRun `ds remove <path>` for each checkout before deleting the repository.",
-                paths
+                inventory
+                    .checkout_paths
                     .iter()
                     .map(|path| format!("  {}", path.display()))
                     .collect::<Vec<_>>()
                     .join("\n")
             )));
         }
-        let remote_workspaces = remote_workspace_names(entry, command).await?;
-        if !remote_workspaces.is_empty() {
+        if !inventory.remote_names.is_empty() {
             writeln!(
                 ui.warning_default(),
                 "Other machines still have workspaces in `{name}`: {}. Deletion will proceed.",
-                remote_workspaces.join(", ")
+                inventory.remote_names.join(", ")
             )?;
         }
     }
@@ -427,10 +420,8 @@ async fn remove_repository(
 }
 
 async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), CommandError> {
-    let store = MachineStore::platform_default().map_err(display_error)?;
-    let config = store.load_config().map_err(display_error)?;
-    let client = ControlPlaneClient::new(&config).map_err(display_error)?;
-    let repositories = cloud_runtime()?
+    let (store, client, runtime) = cloud_client()?;
+    let repositories = runtime
         .block_on(client.list_repositories())
         .map_err(|error| match error {
             ControlPlaneClientError::Request(_) => user_error(
@@ -459,15 +450,16 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
                     ))
                 })?;
         }
-        let paths = registered_checkout_paths(&entry, command).await?;
-        if paths.is_empty() {
+        let inventory = workspace_inventory(&entry, command).await?;
+        if inventory.checkout_paths.is_empty() {
             writeln!(ui.stdout(), "{} (local)", repository.name)?;
         } else {
             writeln!(
                 ui.stdout(),
                 "{} (local: {})",
                 repository.name,
-                paths
+                inventory
+                    .checkout_paths
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
@@ -476,69 +468,63 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
         }
     }
     for entry in local {
-        let paths = registered_checkout_paths(&entry, command).await?;
-        if paths.is_empty() {
-            cleanup_local_repository(ui, &store, &entry)?;
-            writeln!(
-                ui.status(),
-                "Removed local repository `{}` because it was deleted in the cloud.",
-                entry.name
-            )?;
-        } else {
-            writeln!(
-                ui.stdout(),
-                "{} (deleted in cloud; local checkouts remain: {})",
+        match runtime.block_on(client.resolve_repository(&entry.name)) {
+            Err(ControlPlaneClientError::Remote {
+                kind: ControlPlaneRemoteErrorKind::RepositoryNotFound,
+                ..
+            }) => {
+                let inventory = workspace_inventory(&entry, command).await?;
+                if inventory.checkout_paths.is_empty() {
+                    cleanup_local_repository(ui, &store, &entry)?;
+                    writeln!(
+                        ui.status(),
+                        "Removed local repository `{}` because it was deleted in the cloud.",
+                        entry.name
+                    )?;
+                } else {
+                    writeln!(
+                        ui.stdout(),
+                        "{} (deleted in cloud; local checkouts remain: {})",
+                        entry.name,
+                        inventory
+                            .checkout_paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )?;
+                }
+            }
+            Ok(repository) => writeln!(
+                ui.warning_default(),
+                "Repository `{}` was absent from the cloud listing but resolved as `{}`; local data was not changed.",
                 entry.name,
-                paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )?;
+                repository.name
+            )?,
+            Err(error) => writeln!(
+                ui.warning_default(),
+                "Repository `{}` was absent from the cloud listing, but deletion could not be confirmed ({error}); local data was not changed.",
+                entry.name
+            )?,
         }
     }
     Ok(())
 }
 
-async fn registered_checkout_paths(
-    entry: &CatalogEntry,
-    command: &CommandHelper,
-) -> Result<Vec<std::path::PathBuf>, CommandError> {
-    if !entry.native_repository_path.exists() {
-        return Ok(Vec::new());
-    }
-    let repository = devspace_machine::MachineRepository::open(
-        &entry.native_repository_path,
-        command.settings(),
-    )
-    .await
-    .map_err(display_error)?;
-    let workspace_store = SimpleWorkspaceStore::load(&entry.native_repository_path)
-        .map_err(|error| user_error(error.to_string()))?;
-    let mut paths = Vec::new();
-    for workspace in repository.repo().view().wc_commit_ids().keys() {
-        if let Some(path) = workspace_store
-            .get_workspace_path(workspace)
-            .map_err(|error| user_error(error.to_string()))?
-        {
-            let path = if path.is_absolute() {
-                path
-            } else {
-                entry.native_repository_path.join(path)
-            };
-            paths.push(dunce::canonicalize(&path).unwrap_or(path));
-        }
-    }
-    paths.sort();
-    Ok(paths)
+struct WorkspaceInventory {
+    checkout_paths: Vec<std::path::PathBuf>,
+    remote_names: Vec<String>,
 }
 
-async fn remote_workspace_names(
+async fn workspace_inventory(
     entry: &CatalogEntry,
     command: &CommandHelper,
-) -> Result<Vec<String>, CommandError> {
+) -> Result<WorkspaceInventory, CommandError> {
     if !entry.native_repository_path.exists() {
-        return Ok(Vec::new());
+        return Ok(WorkspaceInventory {
+            checkout_paths: Vec::new(),
+            remote_names: Vec::new(),
+        });
     }
     let repository = devspace_machine::MachineRepository::open(
         &entry.native_repository_path,
@@ -548,18 +534,38 @@ async fn remote_workspace_names(
     .map_err(display_error)?;
     let workspace_store = SimpleWorkspaceStore::load(&entry.native_repository_path)
         .map_err(|error| user_error(error.to_string()))?;
-    let mut names = Vec::new();
+    let mut checkout_paths = Vec::new();
+    let mut remote_names = Vec::new();
     for workspace in repository.repo().view().wc_commit_ids().keys() {
-        if workspace_store
+        match workspace_store
             .get_workspace_path(workspace)
             .map_err(|error| user_error(error.to_string()))?
-            .is_none()
         {
-            names.push(workspace.as_str().to_owned());
+            Some(path) => {
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    entry.native_repository_path.join(path)
+                };
+                checkout_paths.push(dunce::canonicalize(&path).unwrap_or(path));
+            }
+            None => remote_names.push(workspace.as_str().to_owned()),
         }
     }
-    names.sort();
-    Ok(names)
+    checkout_paths.sort();
+    remote_names.sort();
+    Ok(WorkspaceInventory {
+        checkout_paths,
+        remote_names,
+    })
+}
+
+fn cloud_client()
+-> Result<(MachineStore, ControlPlaneClient, tokio::runtime::Runtime), CommandError> {
+    let store = MachineStore::platform_default().map_err(display_error)?;
+    let config = store.load_config().map_err(display_error)?;
+    let client = ControlPlaneClient::new(&config).map_err(display_error)?;
+    Ok((store, client, cloud_runtime()?))
 }
 
 fn cleanup_local_repository(
@@ -587,15 +593,6 @@ fn cleanup_local_repository(
         let _ = fs::remove_dir(shard);
     }
     Ok(())
-}
-
-fn cloud_runtime() -> Result<tokio::runtime::Runtime, CommandError> {
-    tokio::runtime::Runtime::new()
-        .map_err(|_| user_error("failed to start the cloud transport runtime"))
-}
-
-fn display_error(error: impl std::fmt::Display) -> CommandError {
-    user_error(error.to_string())
 }
 
 pub(crate) async fn materialize_cloud_repository(

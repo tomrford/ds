@@ -15,14 +15,14 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use devspace_machine::{
-    CatalogEntry, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository,
-    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
+    CatalogEntry, MACHINE_STORE_OVERRIDE, MachineRepository, RepositoryId, RepositoryIdentity,
+    RepositoryIncarnation, RepositoryName,
 };
 use stalling_server::StallingServer;
-use support::{daemon_socket_path, machine_store, poll_until, settings, stderr, write_cli_config};
-
-const MACHINE_ID: &str = "12121212121212121212121212121212";
-const DEVELOPMENT_SECRET: &str = "cli-development-secret";
+use support::{
+    configure_machine, daemon_socket_path, machine_store, poll_until, settings, stderr,
+    write_cli_config,
+};
 
 #[tokio::test]
 async fn daemon_rebinds_stale_socket_is_singleton_and_serves_protocol_privately() {
@@ -212,19 +212,6 @@ async fn local_repository_with_identity(
         .await
         .unwrap();
     entry
-}
-
-fn configure_machine(root: &Path, base_url: &str) {
-    machine_store(root)
-        .write_config(
-            &MachineConfig::new(
-                base_url,
-                MachineId::parse(MACHINE_ID).unwrap(),
-                SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
 }
 
 fn daemon_command(root: &Path, config: &Path, poll_ms: u64, idle_ms: u64) -> Command {

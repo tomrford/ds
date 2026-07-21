@@ -2,7 +2,6 @@
 //! Git metadata without treating Git as Devspace's local VCS surface.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -139,35 +138,6 @@ fn update_git_dir_modes(checkout_root: &Path, f: impl Fn(u32) -> u32 + Copy) -> 
     if !git_dir.exists() {
         return Ok(());
     }
-    update_dir_modes(&git_dir, f)
-}
-
-fn update_dir_modes(dir: &Path, f: impl Fn(u32) -> u32 + Copy) -> Result<(), String> {
-    let metadata =
-        fs::symlink_metadata(dir).map_err(|error| format!("stat {}: {error}", dir.display()))?;
-    if !metadata.is_dir() {
-        return Ok(());
-    }
-
-    let mut permissions = metadata.permissions();
-    let mode = permissions.mode();
-    let next_mode = f(mode);
-    if next_mode != mode {
-        permissions.set_mode(next_mode);
-        fs::set_permissions(dir, permissions)
-            .map_err(|error| format!("chmod {}: {error}", dir.display()))?;
-    }
-
-    for entry in fs::read_dir(dir).map_err(|error| format!("read {}: {error}", dir.display()))? {
-        let entry = entry.map_err(|error| format!("read entry in {}: {error}", dir.display()))?;
-        let child = entry.path();
-        if entry
-            .file_type()
-            .map_err(|error| format!("file type {}: {error}", child.display()))?
-            .is_dir()
-        {
-            update_dir_modes(&child, f)?;
-        }
-    }
-    Ok(())
+    crate::tree_modes::rewrite(&git_dir, |is_dir, mode| is_dir.then(|| f(mode)))
+        .map_err(|error| format!("update modes under {}: {error}", git_dir.display()))
 }

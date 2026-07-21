@@ -7,17 +7,16 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use devspace_machine::{
-    GitProjection, HttpTransport, MachineConfig, MachineId, MachineRepository, MachineStoreError,
-    ProjectionSnapshot, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
-    SharedSecret,
+    GitProjection, HttpTransport, MachineRepository, MachineStoreError, ProjectionSnapshot,
+    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
 };
 
 mod support;
 
 use support::fake_worker::{create_server, read_http_request, respond};
 use support::{
-    ds_command_with_home as ds_command, ds_with_home as ds, machine_store, seal_commit, settings,
-    stderr, stdout, write_cli_config,
+    configure_machine_as as configure_machine, ds_command_with_home as ds_command,
+    ds_with_home as ds, machine_store, seal_commit, settings, stderr, stdout, write_cli_config,
 };
 
 const FIRST_MACHINE_ID: &str = "12121212121212121212121212121212";
@@ -697,19 +696,6 @@ async fn local_checkout(home: &Path, config: &Path, name: &str) -> PathBuf {
     );
     assert!(added.status.success(), "{}", stderr(&added));
     checkout
-}
-
-fn configure_machine(root: &Path, base_url: &str, machine_id: &str, secret: &str) {
-    machine_store(root)
-        .write_config(
-            &MachineConfig::new(
-                base_url,
-                MachineId::parse(machine_id).unwrap(),
-                SharedSecret::new(secret).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
 }
 
 fn set_bookmark(cwd: &Path, home: &Path, config: &Path, name: &str, revision: &str) {

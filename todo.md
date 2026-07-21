@@ -70,6 +70,14 @@
   but pruned by jj's, so hidden matches inside it silently diverge from the
   documented rule. Plumb the same base ignores jj-cli feeds SnapshotOptions
   into `discover_hidden_paths` and pin a golden test.
+- `repository-retired` is structured on the control-plane client but flattened
+  to prose on the sync transport path (wire.rs boxes ErrorResponse into text).
+  When machine-side retirement handling is wanted (stop retrying, prompt the
+  local cleanup `ds repo list` performs), surface the decoded code on a
+  structured transport error first.
+- `GET /repositories` is unpaginated against the client's ~64 KiB directory
+  response bound (~400-500 repositories). Documented scaling limit; page it
+  when anyone approaches that.
 - Worker version gating: clients now send `x-devspace-client`
   (`ds/<version> encoding/<epoch>`); the Worker ignores it. When enrolment or
   the first encoding bump lands, gate stale epochs with an "upgrade ds" error

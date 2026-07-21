@@ -2,29 +2,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use devspace_machine::{
-    CatalogEntry, MachineConfig, MachineId, MachineStore, RepositoryId, RepositoryIdentity,
-    RepositoryIncarnation, RepositoryName, SharedSecret,
+    CatalogEntry, MachineStore, RepositoryId, RepositoryIdentity, RepositoryIncarnation,
+    RepositoryName,
 };
 
 mod support;
 
 use support::fake_worker::{create_server, respond};
-use support::{ds, machine_store, settings, stderr, stdout, write_cli_config};
+use support::{configure_machine, ds, machine_store, settings, stderr, stdout, write_cli_config};
 
 const REPOSITORY_NAME: &str = "removable";
-
-fn configure_machine(root: &Path, base_url: &str) {
-    machine_store(root)
-        .write_config(
-            &MachineConfig::new(
-                base_url,
-                MachineId::parse("12".repeat(16)).unwrap(),
-                SharedSecret::new("repo-remove-secret").unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-}
 
 fn identity() -> RepositoryIdentity {
     RepositoryIdentity::new(
@@ -202,10 +189,20 @@ async fn repo_remove_cleans_local_residue_when_cloud_is_already_deleted() {
 #[tokio::test]
 async fn repo_list_removes_stale_catalog_and_local_data_without_checkouts() {
     let temp = tempfile::tempdir().unwrap();
-    let (base_url, server) = create_server(|_, request, stream| {
-        assert!(request.starts_with("GET /repositories HTTP/1.1"));
-        respond(stream, "200 OK", r#"{"repositories":[]}"#);
-        true
+    let (base_url, server) = create_server(|index, request, stream| {
+        if index == 0 {
+            assert!(request.starts_with("GET /repositories HTTP/1.1"));
+            respond(stream, "200 OK", r#"{"repositories":[]}"#);
+            false
+        } else {
+            assert!(request.starts_with("GET /repositories/removable HTTP/1.1"));
+            respond(
+                stream,
+                "404 Not Found",
+                r#"{"error":"missing","code":"repository-not-found"}"#,
+            );
+            true
+        }
     });
     let entry = local_repository(temp.path(), &base_url).await;
     let store = machine_store(temp.path());
@@ -224,10 +221,20 @@ async fn repo_list_removes_stale_catalog_and_local_data_without_checkouts() {
 #[tokio::test]
 async fn repo_list_preserves_deleted_cloud_repository_with_local_checkouts() {
     let temp = tempfile::tempdir().unwrap();
-    let (base_url, server) = create_server(|_, request, stream| {
-        assert!(request.starts_with("GET /repositories HTTP/1.1"));
-        respond(stream, "200 OK", r#"{"repositories":[]}"#);
-        true
+    let (base_url, server) = create_server(|index, request, stream| {
+        if index == 0 {
+            assert!(request.starts_with("GET /repositories HTTP/1.1"));
+            respond(stream, "200 OK", r#"{"repositories":[]}"#);
+            false
+        } else {
+            assert!(request.starts_with("GET /repositories/removable HTTP/1.1"));
+            respond(
+                stream,
+                "404 Not Found",
+                r#"{"error":"missing","code":"repository-not-found"}"#,
+            );
+            true
+        }
     });
     let entry = local_repository(temp.path(), &base_url).await;
     let config = write_cli_config(temp.path());
@@ -246,6 +253,78 @@ async fn repo_list_preserves_deleted_cloud_repository_with_local_checkouts() {
             .unwrap()
             .identity,
         entry.identity
+    );
+    assert!(entry.native_repository_path.exists());
+}
+
+#[tokio::test]
+async fn repo_list_preserves_local_data_when_an_omitted_repository_still_resolves() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity = identity();
+    let (base_url, server) = create_server(move |index, request, stream| {
+        if index == 0 {
+            assert!(request.starts_with("GET /repositories HTTP/1.1"));
+            respond(stream, "200 OK", r#"{"repositories":[]}"#);
+            false
+        } else {
+            assert!(request.starts_with("GET /repositories/removable HTTP/1.1"));
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "name": REPOSITORY_NAME,
+                    "repositoryId": identity.repository_id.as_str(),
+                    "incarnation": identity.incarnation.as_str(),
+                })
+                .to_string(),
+            );
+            true
+        }
+    });
+    let entry = local_repository(temp.path(), &base_url).await;
+    let config = write_cli_config(temp.path());
+
+    let output = ds(temp.path(), &config, &["repo", "list"]);
+    server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).contains("absent from the cloud listing"));
+    assert!(stderr(&output).contains("local data was not changed"));
+    assert!(
+        machine_store(temp.path())
+            .resolve(&entry.name)
+            .unwrap()
+            .is_some()
+    );
+    assert!(entry.native_repository_path.exists());
+}
+
+#[tokio::test]
+async fn repo_list_preserves_local_data_when_deletion_confirmation_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let (base_url, server) = create_server(|index, request, stream| {
+        if index == 0 {
+            assert!(request.starts_with("GET /repositories HTTP/1.1"));
+            respond(stream, "200 OK", r#"{"repositories":[]}"#);
+            false
+        } else {
+            assert!(request.starts_with("GET /repositories/removable HTTP/1.1"));
+            respond(stream, "503 Service Unavailable", r#"{"error":"offline"}"#);
+            true
+        }
+    });
+    let entry = local_repository(temp.path(), &base_url).await;
+    let config = write_cli_config(temp.path());
+
+    let output = ds(temp.path(), &config, &["repo", "list"]);
+    server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).contains("deletion could not be confirmed"));
+    assert!(stderr(&output).contains("local data was not changed"));
+    assert!(
+        machine_store(temp.path())
+            .resolve(&entry.name)
+            .unwrap()
+            .is_some()
     );
     assert!(entry.native_repository_path.exists());
 }

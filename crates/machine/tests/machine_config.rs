@@ -102,6 +102,27 @@ fn replacement_is_complete_and_secret_is_redacted() {
     assert!(!format!("{:?}", second.shared_secret()).contains("second-sensitive-value"));
 }
 
+#[test]
+fn decode_errors_report_only_the_location() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = MachineStore::new(temp.path());
+    store.write_config(&config("initial-secret")).unwrap();
+    let exposed_secret = "secret-that-must-not-appear";
+    fs::write(
+        store.config_path(),
+        format!(
+            "version = 1\nbase_url = \"https://worker.example.test\"\nmachine_id = \"{}\"\nshared_secret = {exposed_secret}\n",
+            "ab".repeat(16)
+        ),
+    )
+    .unwrap();
+
+    let error = store.load_config().unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("line 4, column"), "{message}");
+    assert!(!message.contains(exposed_secret), "{message}");
+}
+
 #[cfg(unix)]
 #[test]
 fn refuses_to_load_a_group_or_world_readable_secret() {

@@ -3,7 +3,6 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Output;
 
 use devspace_machine::{
     MachineRepository, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
@@ -18,7 +17,7 @@ use jj_lib::simple_op_store::SimpleOpStore;
 
 mod support;
 
-use support::{ds, machine_store, settings, stderr, stdout};
+use support::{ds, ds_with_env, machine_store, settings, stderr, stdout};
 
 const FIXTURE_DESCRIPTION: &str = "bare repository fixture";
 
@@ -88,15 +87,6 @@ fn write_watchman_config(root: &Path) -> PathBuf {
     )
     .unwrap();
     path
-}
-
-fn ds_with_env(cwd: &Path, config: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
-    let mut command = support::ds_command(cwd, config);
-    command.args(args);
-    for (name, value) in environment {
-        command.env(name, value);
-    }
-    command.output().unwrap()
 }
 
 fn repository_identity(repository_name: &str) -> RepositoryIdentity {
@@ -300,7 +290,9 @@ fn skill_prints_agent_guidance_without_a_checkout() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let guidance = stdout(&output);
-    assert!(guidance.contains("Raw `git` and `jj` commands do not"));
+    assert!(guidance.contains("Read-only `git` commands"));
+    assert!(guidance.contains("Git writes and"));
+    assert!(guidance.contains("all `jj` commands"));
     assert!(guidance.contains("Git is a projection boundary"));
     assert!(guidance.contains("It is not an ignore file"));
 }
@@ -329,9 +321,9 @@ fn skill_rejects_unknown_topic_with_available_topics() {
 
     let output = ds(temp.path(), &config, &["skill", "unknown"]);
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     let error = stderr(&output);
-    assert!(error.contains("Unknown skill topic `unknown`"), "{error}");
+    assert!(error.contains("invalid value 'unknown'"), "{error}");
     for topic in ["core", "private", "context", "jj"] {
         assert!(error.contains(topic), "missing `{topic}` from: {error}");
     }
@@ -444,6 +436,7 @@ async fn local_name_log_has_no_network_dependency() {
     let config = write_fixture_cli_config(temp.path());
 
     let output = ds_with_env(
+        temp.path(),
         temp.path(),
         &config,
         &["-R", repository_name, "log", "-r", "main"],
@@ -618,6 +611,7 @@ async fn bare_config_markers_are_rejected_before_loading_or_writing() {
         let before = directory_snapshot(temp.path());
 
         let output = ds_with_env(
+            temp.path(),
             temp.path(),
             &config,
             &["-R", &repository_name, "log"],

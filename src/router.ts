@@ -8,7 +8,6 @@ import type { Repository } from "./repository";
 import {
   cursorStringSchema,
   objectIdStringSchema,
-  repositoryDeletionBodySchema,
 } from "./validation";
 import { z } from "zod";
 
@@ -79,7 +78,12 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
     if (repositoryId === undefined) {
       const directoryMatch = /^\/repositories\/([^/]+)$/.exec(url.pathname);
       if (url.pathname === "/repositories" && request.method === "POST") {
-        const body = await readJsonBody(request, DIRECTORY_REQUEST_BYTES, "repository creation request");
+        const body = await readJsonBody(
+          request,
+          DIRECTORY_REQUEST_BYTES,
+          "repository creation request",
+          "invalid-repository-creation-request",
+        );
         if (body instanceof Response) return body;
         return rpcResponse(await control.createRepository(principal, body));
       }
@@ -109,18 +113,10 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
             request,
             DIRECTORY_REQUEST_BYTES,
             "repository deletion request",
-            "invalid-repository-deletion-request",
+            "invalid-control-plane-request",
           );
           if (body instanceof Response) return body;
-          const parsed = repositoryDeletionBodySchema.safeParse(body);
-          if (!parsed.success) {
-            return errorResponse(
-              400,
-              "invalid repository deletion request",
-              "invalid-repository-deletion-request",
-            );
-          }
-          return rpcResponse(await control.deleteRepository(principal, { ...parsed.data, name }));
+          return rpcResponse(await control.deleteRepository(principal, name, body));
         }
       }
       return errorResponse(404, "not found");
@@ -343,7 +339,7 @@ async function readJsonBody(
   request: Request,
   limit: number,
   label: string,
-  code?: string,
+  code: string,
 ): Promise<unknown | Response> {
   let bytes: Uint8Array;
   try {

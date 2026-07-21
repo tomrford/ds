@@ -65,7 +65,12 @@ describe("cloud identity and repository directory", () => {
         packId,
         new Uint8Array(),
       ),
-    ).toMatchObject({ ok: false, status: 409, error: "repository authority is stale" });
+    ).toMatchObject({
+      ok: false,
+      status: 409,
+      error: "repository authority is stale",
+      code: "repository-authority-stale",
+    });
   });
 
   it("denies missing and invalid secrets and rejects malformed machine IDs", async () => {
@@ -137,6 +142,46 @@ describe("cloud identity and repository directory", () => {
     });
     expect(injectedBody.status).toBe(400);
     expect(await injectedBody.json()).toMatchObject({ code: "invalid-control-plane-request" });
+  });
+
+  it("codes malformed repository names and request bodies", async () => {
+    const machineId = "36".repeat(16);
+
+    const invalidName = await apiRequest(machineId, "/repositories/Invalid");
+    expect({ status: invalidName.status, body: await invalidName.json() }).toMatchObject({
+      status: 400,
+      body: { code: "invalid-repository-name" },
+    });
+
+    const invalidCreation = await apiRequest(machineId, "/repositories", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{",
+    });
+    expect({ status: invalidCreation.status, body: await invalidCreation.json() }).toMatchObject({
+      status: 400,
+      body: { code: "invalid-repository-creation-request" },
+    });
+
+    const invalidRename = await apiRequest(machineId, "/repositories/rename-source", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: "{",
+    });
+    expect({ status: invalidRename.status, body: await invalidRename.json() }).toMatchObject({
+      status: 400,
+      body: { code: "invalid-repository-rename-request" },
+    });
+
+    const invalidDeletion = await apiRequest(machineId, "/repositories/delete-source", {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repositoryId: "not-an-id", incarnation: "not-an-incarnation" }),
+    });
+    expect({ status: invalidDeletion.status, body: await invalidDeletion.json() }).toMatchObject({
+      status: 400,
+      body: { code: "invalid-control-plane-request" },
+    });
   });
 
   it("replays lost create responses and rejects idempotency-key reuse", async () => {
@@ -440,6 +485,31 @@ describe("cloud identity and repository directory", () => {
       { headers: { "x-devspace-incarnation": second.incarnation } },
     );
     expect(current.status).toBe(200);
+  });
+
+  it("codes deletion attempts while repository creation is provisional", async () => {
+    const machineId = "53".repeat(16);
+    const repository = await createRepository(machineId, "provisional-delete", "53".repeat(16));
+    const control = env.CONTROL_PLANE.getByName("directory");
+    await runInDurableObject(control, (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE repositories SET status = 'provisional' WHERE repository_id = ?",
+        repository.repositoryId,
+      );
+    });
+
+    const response = await apiRequest(machineId, "/repositories/provisional-delete", {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repositoryId: repository.repositoryId,
+        incarnation: repository.incarnation,
+      }),
+    });
+    expect({ status: response.status, body: await response.json() }).toMatchObject({
+      status: 409,
+      body: { code: "repository-creation-provisional" },
+    });
   });
 });
 

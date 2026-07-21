@@ -6,7 +6,11 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
-use super::{Context as _, Result, ensure_dir_mode, run_command, unique_path};
+use anyhow::{Context as _, Result, bail};
+use blake2::{Blake2b512, Digest as _};
+use devspace_machine::encode_lower_hex;
+
+use super::{ensure_dir_mode, run_command};
 
 #[derive(Clone, Debug)]
 pub struct Git {
@@ -26,11 +30,8 @@ impl Git {
         }
     }
 
-    /// Stable content key via `git hash-object` (used for cache paths).
-    pub fn hash_string(&self, value: &str) -> Result<String> {
-        let args = vec![OsString::from("hash-object"), OsString::from("--stdin")];
-        let output = run_command(&self.program, &args, Some(value.as_bytes()))?.check()?;
-        Ok(output.stdout.trim().to_string())
+    pub fn hash_string(&self, value: &str) -> String {
+        encode_lower_hex(&Blake2b512::digest(value.as_bytes()))
     }
 
     pub fn ensure_remote_cache(&self, remote_dir: &Path, url: &str) -> Result<()> {
@@ -46,15 +47,13 @@ impl Git {
             remove_path(remote_dir)?;
         }
 
-        let temp_remote_dir = unique_path(parent, ".devspace-remote");
-        if let Err(error) = self.initialize_remote_cache(&temp_remote_dir, url) {
-            let _ = remove_path(&temp_remote_dir);
-            return Err(error);
-        }
-        fs::rename(&temp_remote_dir, remote_dir).with_context(|| {
+        let temp_remote = tempfile::tempdir_in(parent)
+            .with_context(|| format!("create temporary remote cache in {}", parent.display()))?;
+        self.initialize_remote_cache(temp_remote.path(), url)?;
+        fs::rename(temp_remote.path(), remote_dir).with_context(|| {
             format!(
                 "move remote cache into place {} -> {}",
-                temp_remote_dir.display(),
+                temp_remote.path().display(),
                 remote_dir.display()
             )
         })?;
@@ -77,6 +76,7 @@ impl Git {
             [
                 OsString::from("fetch"),
                 OsString::from("--no-tags"),
+                OsString::from("--"),
                 OsString::from("origin"),
                 OsString::from(commit),
             ],
@@ -98,46 +98,45 @@ impl Git {
             .parent()
             .with_context(|| format!("snapshot path has no parent: {}", target_dir.display()))?;
         ensure_dir_mode(parent, 0o700)?;
-        let temp_checkout = unique_path(parent, ".devspace-checkout");
+        let temp_checkout = tempfile::tempdir_in(parent)
+            .with_context(|| format!("create temporary checkout in {}", parent.display()))?;
 
         let clone_args = self.base_args([
             OsString::from("clone"),
             OsString::from("--shared"),
             OsString::from("--no-checkout"),
             OsString::from("--no-tags"),
+            OsString::from("--"),
             remote_dir.as_os_str().to_os_string(),
-            temp_checkout.as_os_str().to_os_string(),
+            temp_checkout.path().as_os_str().to_os_string(),
         ]);
         run_command(&self.program, &clone_args, None)?.check()?;
 
         let checkout_args = self.base_args([
             OsString::from("-C"),
-            temp_checkout.as_os_str().to_os_string(),
+            temp_checkout.path().as_os_str().to_os_string(),
             OsString::from("checkout"),
             OsString::from("--detach"),
             OsString::from("--force"),
+            OsString::from("--end-of-options"),
             OsString::from(commit),
         ]);
-        if let Err(error) = run_command(&self.program, &checkout_args, None)?.check() {
-            let _ = remove_path(&temp_checkout);
-            return Err(error);
-        }
+        run_command(&self.program, &checkout_args, None)?.check()?;
 
-        let git_dir = temp_checkout.join(".git");
+        let git_dir = temp_checkout.path().join(".git");
         fs::remove_dir_all(&git_dir)
-            .with_context(|| format!("strip .git from {}", temp_checkout.display()))?;
+            .with_context(|| format!("strip .git from {}", temp_checkout.path().display()))?;
 
         let final_source = match subdir {
             Some(sub) => {
                 validate_subdir(sub)?;
-                let sub_path = temp_checkout.join(sub);
+                let sub_path = temp_checkout.path().join(sub);
                 if !sub_path.is_dir() {
-                    let _ = remove_path(&temp_checkout);
                     bail!("subdir {sub} is not a directory at commit {commit}");
                 }
                 sub_path
             }
-            None => temp_checkout.clone(),
+            None => temp_checkout.path().to_owned(),
         };
 
         fs::rename(&final_source, target_dir).with_context(|| {
@@ -148,9 +147,6 @@ impl Git {
             )
         })?;
 
-        if subdir.is_some() {
-            let _ = remove_path(&temp_checkout);
-        }
         Ok(())
     }
 
@@ -158,6 +154,7 @@ impl Git {
         let init_args = self.base_args([
             OsString::from("init"),
             OsString::from("--bare"),
+            OsString::from("--"),
             remote_dir.as_os_str().to_os_string(),
         ]);
         run_command(&self.program, &init_args, None)?.check()?;
@@ -168,6 +165,7 @@ impl Git {
             [
                 OsString::from("remote"),
                 OsString::from("add"),
+                OsString::from("--"),
                 OsString::from("origin"),
                 OsString::from(url),
             ],
@@ -199,6 +197,7 @@ impl Git {
                 OsString::from("fetch"),
                 OsString::from("--prune"),
                 OsString::from("--no-tags"),
+                OsString::from("--"),
                 OsString::from("origin"),
                 OsString::from("+HEAD:refs/heads/devspace-head"),
             ],
@@ -209,6 +208,8 @@ impl Git {
             remote_dir,
             [
                 OsString::from("rev-parse"),
+                OsString::from("--verify"),
+                OsString::from("--end-of-options"),
                 OsString::from("refs/heads/devspace-head"),
             ],
         );
@@ -222,6 +223,7 @@ impl Git {
             [
                 OsString::from("fetch"),
                 OsString::from("--no-tags"),
+                OsString::from("--"),
                 OsString::from("origin"),
                 OsString::from(ref_name),
             ],
@@ -230,7 +232,12 @@ impl Git {
 
         let rev_parse_args = self.git_dir_args(
             remote_dir,
-            [OsString::from("rev-parse"), OsString::from("FETCH_HEAD")],
+            [
+                OsString::from("rev-parse"),
+                OsString::from("--verify"),
+                OsString::from("--end-of-options"),
+                OsString::from("FETCH_HEAD"),
+            ],
         );
         let output = run_command(&self.program, &rev_parse_args, None)?.check()?;
         Ok(output.stdout.trim().to_string())
@@ -243,6 +250,7 @@ impl Git {
             [
                 OsString::from("cat-file"),
                 OsString::from("-e"),
+                OsString::from("--"),
                 OsString::from(probe),
             ],
         );
@@ -256,6 +264,8 @@ impl Git {
         let mut args = vec![
             OsString::from("-c"),
             OsString::from("core.hooksPath=/dev/null"),
+            OsString::from("-c"),
+            OsString::from("protocol.ext.allow=never"),
         ];
         args.extend(tail);
         args

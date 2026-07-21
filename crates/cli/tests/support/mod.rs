@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use blake2::{Blake2b512, Digest as _};
-use devspace_machine::{MACHINE_STORE_OVERRIDE, MachineRepository, MachineStore};
+use devspace_machine::{
+    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore, SharedSecret,
+};
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::settings::UserSettings;
@@ -21,6 +23,9 @@ use rustix::net::SocketAddrUnix;
 use rustix::process::getuid;
 
 pub mod fake_worker;
+
+pub const TEST_MACHINE_ID: &str = "12121212121212121212121212121212";
+pub const TEST_SHARED_SECRET: &str = "cli-development-secret";
 
 pub fn settings() -> UserSettings {
     let mut config = StackedConfig::with_defaults();
@@ -69,6 +74,18 @@ pub fn ds_with_home(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Ou
         .unwrap()
 }
 
+pub fn ds_with_env(
+    cwd: &Path,
+    home: &Path,
+    config: &Path,
+    args: &[&str],
+    environment: &[(&str, &str)],
+) -> Output {
+    let mut command = ds_command_with_home(cwd, home, config);
+    command.args(args).envs(environment.iter().copied());
+    command.output().unwrap()
+}
+
 pub fn ds_command(cwd: &Path, config: &Path) -> Command {
     ds_command_with_home(cwd, config.parent().unwrap(), config)
 }
@@ -95,6 +112,50 @@ pub fn stderr(output: &Output) -> String {
 
 pub fn machine_store(root: &Path) -> MachineStore {
     MachineStore::new(root.join("machine-store"))
+}
+
+pub fn configure_machine(root: &Path, base_url: &str) {
+    configure_machine_as(root, base_url, TEST_MACHINE_ID, TEST_SHARED_SECRET);
+}
+
+pub fn configure_machine_as(root: &Path, base_url: &str, machine_id: &str, secret: &str) {
+    write_machine_config(root, base_url, machine_id, secret, None);
+}
+
+pub fn configure_machine_from_env(root: &Path, machine_id: &str) {
+    let base_url = env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
+    let shared_secret = env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
+    configure_machine_as(root, &base_url, machine_id, &shared_secret);
+}
+
+pub fn configure_machine_with_name(root: &Path, base_url: &str, machine_name: Option<&str>) {
+    write_machine_config(
+        root,
+        base_url,
+        TEST_MACHINE_ID,
+        TEST_SHARED_SECRET,
+        machine_name,
+    );
+}
+
+fn write_machine_config(
+    root: &Path,
+    base_url: &str,
+    machine_id: &str,
+    secret: &str,
+    machine_name: Option<&str>,
+) {
+    let config = MachineConfig::new(
+        base_url,
+        MachineId::parse(machine_id).unwrap(),
+        SharedSecret::new(secret).unwrap(),
+    )
+    .unwrap();
+    let config = match machine_name {
+        Some(name) => config.with_machine_name(name).unwrap(),
+        None => config,
+    };
+    machine_store(root).write_config(&config).unwrap();
 }
 
 pub fn seal_commit(cwd: &Path, home: &Path, config: &Path, description: &str) {

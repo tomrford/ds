@@ -11,9 +11,8 @@ use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use devspace_machine::{
-    CatalogEntry, MachineConfig, MachineId, MachineRepository, MachineSyncStore, PendingHeadBatch,
-    PendingHeadTransaction, RepositoryId, RepositoryIdentity, RepositoryIncarnation,
-    RepositoryName, SharedSecret, SyncState,
+    CatalogEntry, MachineRepository, MachineSyncStore, PendingHeadBatch, PendingHeadTransaction,
+    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, SyncState,
 };
 use jj_lib::object_id::ObjectId as _;
 #[cfg(unix)]
@@ -21,8 +20,9 @@ use stalling_server::StallingServer;
 #[cfg(unix)]
 use support::daemon_socket_path;
 use support::{
-    ds_command_with_home as ds_command, ds_with_home as ds, machine_store, operation_heads,
-    poll_until, settings, stderr, stdout, write_cli_config,
+    configure_machine_as as configure_machine, ds_command_with_home as ds_command,
+    ds_with_home as ds, machine_store, operation_heads, poll_until, settings, stderr, stdout,
+    write_cli_config,
 };
 
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
@@ -48,19 +48,6 @@ fn sync_help_lists_status_but_hides_run() {
             .any(|line| line.trim_start().starts_with("run")),
         "{help}"
     );
-}
-
-fn configure_machine(root: &Path, base_url: &str, machine_id: &str, secret: &str) {
-    machine_store(root)
-        .write_config(
-            &MachineConfig::new(
-                base_url,
-                MachineId::parse(machine_id).unwrap(),
-                SharedSecret::new(secret).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
 }
 
 fn ds_boundary(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {

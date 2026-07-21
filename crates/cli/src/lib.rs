@@ -14,6 +14,7 @@ mod repo;
 mod skill;
 mod sync;
 mod sync_status;
+mod tree_modes;
 mod tx;
 mod working_copy;
 

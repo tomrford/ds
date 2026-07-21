@@ -5,7 +5,7 @@
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 
-use super::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 
 pub struct FileLock {
     file: fs::File,

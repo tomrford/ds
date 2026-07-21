@@ -3,29 +3,15 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use devspace_machine::{MachineConfig, MachineId, RepositoryName, SharedSecret};
+use devspace_machine::RepositoryName;
 
 mod support;
 
 use support::fake_worker::{create_server, repository_response, respond};
 use support::{
-    daemon_socket_path, ds, ds_command, machine_store, poll_until, stderr, stdout, write_cli_config,
+    configure_machine, daemon_socket_path, ds, ds_command, machine_store, poll_until, stderr,
+    stdout, write_cli_config,
 };
-
-const DEVELOPMENT_SECRET: &str = "cli-development-secret";
-
-fn configure_machine(root: &Path, base_url: &str) {
-    machine_store(root)
-        .write_config(
-            &MachineConfig::new(
-                base_url,
-                MachineId::parse("12".repeat(16)).unwrap(),
-                SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-}
 
 fn create_git_remote(root: &Path, name: &str) -> std::path::PathBuf {
     let remote = root.join(name);

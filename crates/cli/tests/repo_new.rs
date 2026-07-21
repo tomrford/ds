@@ -1,9 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use devspace_machine::{
-    MachineConfig, MachineId, MachineRepository, MachineStore, RepositoryName, SharedSecret,
-};
+use devspace_machine::{MachineRepository, MachineStore, RepositoryName};
 use jj_lib::default_index::DefaultIndexStore;
 use jj_lib::default_submodule_store::DefaultSubmoduleStore;
 use jj_lib::ref_name::WorkspaceName;
@@ -17,9 +15,10 @@ mod support;
 mod support_fs;
 
 use support::fake_worker::{create_server, repository_response, respond};
-use support::{ds, machine_store, settings, stderr, stdout, write_cli_config};
-
-const DEVELOPMENT_SECRET: &str = "cli-development-secret";
+use support::{
+    TEST_SHARED_SECRET, configure_machine, ds, machine_store, settings, stderr, stdout,
+    write_cli_config,
+};
 
 fn write_unknown_signing_config(root: &Path) -> PathBuf {
     let path = root.join("jj-config.toml");
@@ -39,19 +38,6 @@ fn write_unknown_signing_config(root: &Path) -> PathBuf {
     )
     .unwrap();
     path
-}
-
-fn configure_machine(root: &Path, base_url: &str) {
-    machine_store(root)
-        .write_config(
-            &MachineConfig::new(
-                base_url,
-                MachineId::parse("12".repeat(16)).unwrap(),
-                SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
 }
 
 fn request_json(request: &str) -> serde_json::Value {
@@ -145,7 +131,7 @@ async fn repo_new_replays_a_lost_response_with_the_durable_request_key() {
         "{}",
         stderr(&first)
     );
-    assert!(!stderr(&first).contains(DEVELOPMENT_SECRET));
+    assert!(!stderr(&first).contains(TEST_SHARED_SECRET));
     assert!(!stderr(&first).contains(&base_url));
     let pending = machine_store(temp.path())
         .repository_creation_intent(&RepositoryName::parse("retry-safe").unwrap())
@@ -604,7 +590,7 @@ fn repo_new_discards_a_name_conflict_and_can_create_after_the_name_is_freed() {
     let output = ds(temp.path(), &config, &["repo", "new", "occupied"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("repository name is already in use"));
-    assert!(!stderr(&output).contains(DEVELOPMENT_SECRET));
+    assert!(!stderr(&output).contains(TEST_SHARED_SECRET));
     let store = machine_store(temp.path());
     let name = RepositoryName::parse("occupied").unwrap();
     assert!(store.resolve(&name).unwrap().is_none());

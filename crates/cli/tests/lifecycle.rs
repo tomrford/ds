@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use devspace_machine::{
-    MachineConfig, MachineId, MachineRepository, RepositoryId, RepositoryIdentity,
-    RepositoryIncarnation, RepositoryName, SharedSecret,
+    MachineRepository, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
 };
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
@@ -15,29 +14,9 @@ mod support_fs;
 
 use support::fake_worker::{create_server, repository_response, respond};
 use support::{
-    commit_id, ds, ds_command, machine_store, settings, stderr, stdout, write_cli_config,
+    commit_id, configure_machine, configure_machine_with_name, ds, ds_command, machine_store,
+    settings, stderr, stdout, write_cli_config,
 };
-
-const DEVELOPMENT_SECRET: &str = "cli-development-secret";
-const MACHINE_ID: &str = "12121212121212121212121212121212";
-
-fn configure_machine(root: &Path, base_url: &str) {
-    configure_machine_with_name(root, base_url, None);
-}
-
-fn configure_machine_with_name(root: &Path, base_url: &str, machine_name: Option<&str>) {
-    let config = MachineConfig::new(
-        base_url,
-        MachineId::parse(MACHINE_ID).unwrap(),
-        SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
-    )
-    .unwrap();
-    let config = match machine_name {
-        Some(machine_name) => config.with_machine_name(machine_name).unwrap(),
-        None => config,
-    };
-    machine_store(root).write_config(&config).unwrap();
-}
 
 async fn local_repository(root: &Path, name: &str) -> PathBuf {
     configure_machine(root, "http://127.0.0.1:1");

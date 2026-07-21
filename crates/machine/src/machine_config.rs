@@ -187,8 +187,10 @@ impl MachineStore {
             path: path.clone(),
             source,
         })?;
-        let persisted: PersistedConfig = toml::from_slice(&bytes)
-            .map_err(|source| MachineConfigError::Decode { path, source })?;
+        let persisted: PersistedConfig = toml::from_slice(&bytes).map_err(|error| {
+            let (line, column) = decode_error_position(&bytes, &error);
+            MachineConfigError::Decode { path, line, column }
+        })?;
         if persisted.version != CONFIG_VERSION {
             return Err(MachineConfigError::UnsupportedVersion(persisted.version));
         }
@@ -253,6 +255,21 @@ fn normalize_base_url(value: String) -> Result<String, MachineConfigError> {
     let path = url.path().trim_end_matches('/').to_owned();
     url.set_path(&path);
     Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+fn decode_error_position(bytes: &[u8], error: &toml::de::Error) -> (usize, usize) {
+    let offset = error.span().map_or(0, |span| span.start.min(bytes.len()));
+    let prefix = String::from_utf8_lossy(&bytes[..offset]);
+    let line = prefix
+        .chars()
+        .filter(|character| *character == '\n')
+        .count()
+        + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix.chars().count(), |(_, tail)| tail.chars().count())
+        + 1;
+    (line, column)
 }
 
 #[cfg(unix)]
@@ -369,11 +386,11 @@ pub enum MachineConfigError {
     InsecurePermissions(PathBuf),
     #[error("machine configuration at {0} exceeds the 64 KiB limit")]
     TooLarge(PathBuf),
-    #[error("failed to decode machine configuration at {path}")]
+    #[error("failed to decode machine configuration at {path}, line {line}, column {column}")]
     Decode {
         path: PathBuf,
-        #[source]
-        source: toml::de::Error,
+        line: usize,
+        column: usize,
     },
     #[error("machine configuration version {0} is unsupported")]
     UnsupportedVersion(u32),

@@ -22,6 +22,7 @@ use self::projection_sidecar::open_or_create_projection;
 
 const DEFAULT_REMOTE: &str = "origin";
 const FAILPOINT_ENV: &str = "DEVSPACE_FAILPOINT";
+pub(crate) const CLOUD_RUNTIME_ERROR: &str = "failed to start the cloud transport runtime";
 
 pub(super) struct LockedCheckoutEntry {
     pub(super) store: MachineStore,
@@ -302,12 +303,14 @@ pub(super) fn parse_hex<const N: usize>(value: &str, label: &str) -> Result<[u8;
     })
 }
 
-pub(super) fn cloud_runtime() -> Result<tokio::runtime::Runtime, CommandError> {
-    tokio::runtime::Runtime::new()
-        .map_err(|_| user_error("failed to start the cloud transport runtime"))
+pub(crate) fn cloud_runtime() -> Result<tokio::runtime::Runtime, CommandError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| user_error(CLOUD_RUNTIME_ERROR))
 }
 
-pub(super) fn display_error(error: impl std::fmt::Display) -> CommandError {
+pub(crate) fn display_error(error: impl std::fmt::Display) -> CommandError {
     user_error(error.to_string())
 }
 

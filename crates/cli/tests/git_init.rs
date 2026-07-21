@@ -2,16 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use devspace_machine::{
-    MachineConfig, MachineId, MachineRepository, MachineStore, RepositoryName, SharedSecret,
-};
+use devspace_machine::{MachineRepository, MachineStore, RepositoryName};
 
 mod support;
 
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 use support::{
-    ds_command_with_home as ds_command, ds_with_home as ds, settings, stderr, stdout,
-    write_cli_config,
+    configure_machine_from_env as configure_machine, ds_command_with_home as ds_command,
+    ds_with_home as ds, settings, stderr, stdout, write_cli_config,
 };
 
 const PRIVATE_SENTINEL: &[u8] = b"INIT_PRIVATE_SENTINEL\0\xff";
@@ -97,7 +95,7 @@ async fn init_materializes_history_tracks_head_round_trips_and_converges_a_secon
 
     let second_home = fixture.root.join("second-machine");
     fs::create_dir(&second_home).unwrap();
-    configure_machine(&second_home, "78".repeat(16));
+    configure_machine(&second_home, &"78".repeat(16));
     let second_config = write_cli_config(&second_home);
     let second_checkout = fixture.root.join("second-checkout");
     let added = ds(
@@ -268,7 +266,7 @@ impl LiveFixture {
         let root = temp.path().to_owned();
         let home = root.join("machine");
         fs::create_dir(&home).unwrap();
-        configure_machine(&home, "56".repeat(16));
+        configure_machine(&home, &"56".repeat(16));
         let config = write_cli_config(&home);
         let suffix = root
             .file_name()
@@ -409,22 +407,6 @@ fn git_ls_files(checkout: &Path) -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect()
-}
-
-fn configure_machine(root: &Path, machine_id: String) {
-    let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
-    let shared_secret =
-        std::env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
-    MachineStore::new(root.join("machine-store"))
-        .write_config(
-            &MachineConfig::new(
-                base_url,
-                MachineId::parse(machine_id).unwrap(),
-                SharedSecret::new(shared_secret).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
 }
 
 fn configure_git_identity(worktree: &Path) {

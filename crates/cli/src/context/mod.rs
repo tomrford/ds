@@ -19,39 +19,6 @@
 //! (gc roots, store locks) under the devspace data dir + `context`. Both
 //! remain outside the project checkout.
 
-macro_rules! bail {
-    ($($arg:tt)*) => {
-        return Err(format!($($arg)*))
-    };
-}
-
-pub(crate) type Result<T> = std::result::Result<T, String>;
-
-pub(crate) trait Context<T> {
-    fn context(self, message: impl std::fmt::Display) -> Result<T>;
-    fn with_context(self, message: impl FnOnce() -> String) -> Result<T>;
-}
-
-impl<T, E: std::fmt::Display> Context<T> for std::result::Result<T, E> {
-    fn context(self, message: impl std::fmt::Display) -> Result<T> {
-        self.map_err(|error| format!("{message}: {error}"))
-    }
-
-    fn with_context(self, message: impl FnOnce() -> String) -> Result<T> {
-        self.map_err(|error| format!("{}: {error}", message()))
-    }
-}
-
-impl<T> Context<T> for Option<T> {
-    fn context(self, message: impl std::fmt::Display) -> Result<T> {
-        self.ok_or_else(|| message.to_string())
-    }
-
-    fn with_context(self, message: impl FnOnce() -> String) -> Result<T> {
-        self.ok_or_else(message)
-    }
-}
-
 mod git;
 mod lock;
 mod manifest;
@@ -64,10 +31,12 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 
+use anyhow::{Context as _, Result, bail};
 use devspace_machine::MachineStore;
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
+use jj_lib::file_util::persist_temp_file;
 
 use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
 use git::{Git, ResolveSpec};
@@ -75,23 +44,6 @@ use manifest::{GitLockEntry, LockEntry, LockMode, Lockfile};
 use store::Store;
 
 pub const PROJECT_DIR: &str = ".repos";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SyncMessageKind {
-    Output,
-    Diagnostic,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct SyncMessage {
-    pub kind: SyncMessageKind,
-    pub text: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SyncReport {
-    pub warned: bool,
-}
 
 #[derive(clap::Args)]
 pub(crate) struct ContextArgs {
@@ -158,9 +110,9 @@ pub(crate) async fn run_context(
     read_checkout_owner(checkout_root).map_err(|_| {
         user_error("`ds context` commands are available only inside a Devspace checkout.")
     })?;
-    let app = App::from_dir(checkout_root.to_owned()).map_err(user_error)?;
-    let warned = app.execute(args.command).map_err(user_error)?;
-    app.warn_if_aliases_not_ignored();
+    let app = App::from_dir(checkout_root.to_owned()).map_err(context_error)?;
+    let warned = app.execute(ui, args.command).map_err(context_error)?;
+    app.warn_if_aliases_not_ignored(ui).map_err(context_error)?;
     if warned {
         Err(user_error("context command completed with warnings"))
     } else {
@@ -169,9 +121,9 @@ pub(crate) async fn run_context(
 }
 
 impl App {
-    fn execute(&self, cmd: ContextCommand) -> Result<bool> {
+    fn execute(&self, ui: &mut Ui, cmd: ContextCommand) -> Result<bool> {
         let warned = match cmd {
-            ContextCommand::Init => self.init()?,
+            ContextCommand::Init => self.init(ui)?,
             ContextCommand::Add {
                 alias,
                 url,
@@ -199,6 +151,7 @@ impl App {
                     (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
                 };
                 self.add(
+                    ui,
                     GitLockEntry {
                         alias,
                         url,
@@ -209,36 +162,39 @@ impl App {
                     force,
                 )?
             }
-            ContextCommand::List => self.list()?,
-            ContextCommand::Sync => {
-                self.sync_with(&mut |message| match message.kind {
-                    SyncMessageKind::Output => println!("{}", message.text),
-                    SyncMessageKind::Diagnostic => eprintln!("{}", message.text),
-                })?
-                .warned
-            }
+            ContextCommand::List => self.list(ui)?,
+            ContextCommand::Sync => self.sync(ui)?,
             ContextCommand::Update { aliases } => {
                 for alias in &aliases {
                     validate_alias(alias)?;
                 }
-                self.update(&aliases)?
+                self.update(ui, &aliases)?
             }
             ContextCommand::Remove { aliases } => {
                 for alias in &aliases {
                     validate_alias(alias)?;
                 }
-                self.remove(&aliases)?
+                self.remove(ui, &aliases)?
             }
-            ContextCommand::Gc { verbose } => self.gc(verbose)?,
+            ContextCommand::Gc { verbose } => self.gc(ui, verbose)?,
         };
         Ok(warned)
     }
 }
 
 /// Emit a warning and remember that the run should exit nonzero.
-fn warn(warned: &mut bool, message: impl std::fmt::Display) {
+fn warn(ui: &mut Ui, warned: &mut bool, message: impl std::fmt::Display) -> Result<()> {
     *warned = true;
-    eprintln!("warning: {message}");
+    writeln!(
+        ui.warning_default(),
+        "{}",
+        redact_url_userinfo(&message.to_string())
+    )?;
+    Ok(())
+}
+
+fn context_error(error: anyhow::Error) -> CommandError {
+    user_error(redact_url_userinfo(&format!("{error:#}")))
 }
 
 struct App {
@@ -296,7 +252,7 @@ impl App {
                 .context("cannot determine the platform cache directory")?
                 .join("devspace"),
         };
-        let machine_store = MachineStore::platform_default().map_err(|error| error.to_string())?;
+        let machine_store = MachineStore::platform_default()?;
         let store = Store::new(
             cache_root.join("context"),
             machine_store.root().join("context"),
@@ -308,25 +264,27 @@ impl App {
         })
     }
 
-    fn warn_if_aliases_not_ignored(&self) {
+    fn warn_if_aliases_not_ignored(&self, ui: &mut Ui) -> Result<()> {
         let Some(root) = ProjectRoot::discover(&self.cwd) else {
-            return;
+            return Ok(());
         };
         let Ok(lockfile) = root.load_lockfile() else {
-            return;
+            return Ok(());
         };
         if lockfile.aliases().is_empty() {
-            return;
+            return Ok(());
         }
         let Some(worktree) = root.dir.parent() else {
-            return;
+            return Ok(());
         };
         let path = root.link_path(".devspace-ignore-probe");
         if matches!(path_is_ignored(worktree, &path), Ok(false)) {
-            eprintln!(
-                "warning: .repos/ aliases are not ignored; absolute cache symlinks may be committed (add `.repos/*` and `!.repos/.lock` to .gitignore)"
-            );
+            writeln!(
+                ui.warning_default(),
+                ".repos/ aliases are not ignored; absolute cache symlinks may be committed (add `.repos/*` and `!.repos/.lock` to .gitignore)"
+            )?;
         }
+        Ok(())
     }
 
     fn required_root(&self) -> Result<ProjectRoot> {
@@ -343,7 +301,7 @@ impl App {
         Ok(&self.store)
     }
 
-    fn init(&self) -> Result<bool> {
+    fn init(&self, ui: &mut Ui) -> Result<bool> {
         let existed = self.cwd.join(PROJECT_DIR).join(".lock").is_file();
         let root = ProjectRoot::create_at(&self.cwd)?;
         let store = self.prepared_store()?;
@@ -355,11 +313,11 @@ impl App {
         } else {
             "initialized"
         };
-        println!("{status} {}", root.dir.display());
+        writeln!(ui.stdout(), "{status} {}", root.dir.display())?;
         Ok(false)
     }
 
-    fn add(&self, entry: GitLockEntry, force: bool) -> Result<bool> {
+    fn add(&self, ui: &mut Ui, entry: GitLockEntry, force: bool) -> Result<bool> {
         let root = match ProjectRoot::discover(&self.cwd) {
             Some(root) => root,
             None => ProjectRoot::create_at(&self.cwd)?,
@@ -387,11 +345,16 @@ impl App {
         } else {
             "added"
         };
-        println!("{verb} {} -> {}", realized.alias, snapshot.display());
+        writeln!(
+            ui.stdout(),
+            "{verb} {} -> {}",
+            realized.alias,
+            snapshot.display()
+        )?;
         Ok(false)
     }
 
-    fn list(&self) -> Result<bool> {
+    fn list(&self, ui: &mut Ui) -> Result<bool> {
         let root = self.required_root()?;
         let lockfile = root.load_lockfile()?;
         let mut sections = Vec::new();
@@ -399,7 +362,7 @@ impl App {
             match entry {
                 LockEntry::Git(entry) => {
                     let mut lines = vec![format!("[repos.{}]", entry.alias)];
-                    lines.push(format!("url = {:?}", entry.url));
+                    lines.push(format!("url = {:?}", redact_url_userinfo(&entry.url)));
                     if let Some(subdir) = &entry.subdir {
                         lines.push(format!("subdir = {subdir:?}"));
                     }
@@ -427,12 +390,12 @@ impl App {
             }
         }
         if !sections.is_empty() {
-            println!("{}", sections.join("\n\n"));
+            writeln!(ui.stdout(), "{}", sections.join("\n\n"))?;
         }
         Ok(false)
     }
 
-    fn sync_with(&self, emit: &mut dyn FnMut(SyncMessage)) -> Result<SyncReport> {
+    fn sync(&self, ui: &mut Ui) -> Result<bool> {
         let root = self.required_root()?;
         let store = self.prepared_store()?;
         let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
@@ -445,12 +408,10 @@ impl App {
             let entry = match lockfile.get(&alias) {
                 Some(LockEntry::Git(entry)) => entry.clone(),
                 Some(LockEntry::Foreign(_)) => {
-                    emit(SyncMessage {
-                        kind: SyncMessageKind::Diagnostic,
-                        text: format!(
-                            "note: skipped {alias}: source-bearing entry or unsupported backend"
-                        ),
-                    });
+                    writeln!(
+                        ui.status(),
+                        "note: skipped {alias}: source-bearing entry or unsupported backend"
+                    )?;
                     continue;
                 }
                 None => continue,
@@ -461,39 +422,41 @@ impl App {
                         if realized != entry {
                             dirty = true;
                         }
-                        emit(SyncMessage {
-                            kind: SyncMessageKind::Output,
-                            text: format!("synced {} -> {}", realized.alias, snapshot.display()),
-                        });
+                        writeln!(
+                            ui.stdout(),
+                            "synced {} -> {}",
+                            realized.alias,
+                            snapshot.display()
+                        )?;
                     }
                     Err(error) => {
-                        warned = true;
-                        emit(SyncMessage {
-                            kind: SyncMessageKind::Diagnostic,
-                            text: format!("warning: failed to sync {alias}: {error:#}"),
-                        });
+                        warn(
+                            ui,
+                            &mut warned,
+                            format!("failed to sync {alias}: {error:#}"),
+                        )?;
                     }
                 },
                 Err(error) => {
-                    warned = true;
-                    emit(SyncMessage {
-                        kind: SyncMessageKind::Diagnostic,
-                        text: format!("warning: failed to sync {alias}: {error:#}"),
-                    });
+                    warn(
+                        ui,
+                        &mut warned,
+                        format!("failed to sync {alias}: {error:#}"),
+                    )?;
                 }
             }
         }
 
         let keep: BTreeSet<String> = lockfile.aliases().into_iter().collect();
-        self.prune_leftover_links(&root, &keep)?;
+        self.prune_leftover_links(ui, &root, &keep)?;
         if dirty {
             lockfile.write(&root.lock_path)?;
         }
         store.refresh_root(&self.git, &root.lock_path)?;
-        Ok(SyncReport { warned })
+        Ok(warned)
     }
 
-    fn update(&self, aliases: &[String]) -> Result<bool> {
+    fn update(&self, ui: &mut Ui, aliases: &[String]) -> Result<bool> {
         let root = self.required_root()?;
         let store = self.prepared_store()?;
         let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
@@ -509,9 +472,10 @@ impl App {
                 Some(LockEntry::Git(entry)) => entry.clone(),
                 Some(LockEntry::Foreign(_)) => {
                     if explicit {
-                        eprintln!(
+                        writeln!(
+                            ui.status(),
                             "note: skipped {alias}: source-bearing entry or unsupported backend"
-                        );
+                        )?;
                     }
                     continue;
                 }
@@ -519,7 +483,7 @@ impl App {
             };
             if matches!(entry.mode, LockMode::Exact) {
                 if explicit {
-                    println!("skipped {alias}: exact pin");
+                    writeln!(ui.stdout(), "skipped {alias}: exact pin")?;
                 }
                 continue;
             }
@@ -529,13 +493,26 @@ impl App {
                         if realized != entry {
                             dirty = true;
                         }
-                        println!("updated {} -> {}", realized.alias, snapshot.display());
+                        writeln!(
+                            ui.stdout(),
+                            "updated {} -> {}",
+                            realized.alias,
+                            snapshot.display()
+                        )?;
                     }
                     Err(error) => {
-                        warn(&mut warned, format!("failed to update {alias}: {error:#}"));
+                        warn(
+                            ui,
+                            &mut warned,
+                            format!("failed to update {alias}: {error:#}"),
+                        )?;
                     }
                 },
-                Err(error) => warn(&mut warned, format!("failed to update {alias}: {error:#}")),
+                Err(error) => warn(
+                    ui,
+                    &mut warned,
+                    format!("failed to update {alias}: {error:#}"),
+                )?,
             }
         }
 
@@ -546,7 +523,7 @@ impl App {
         Ok(warned)
     }
 
-    fn remove(&self, aliases: &[String]) -> Result<bool> {
+    fn remove(&self, ui: &mut Ui, aliases: &[String]) -> Result<bool> {
         let root = self.required_root()?;
         let store = self.prepared_store()?;
         let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
@@ -563,14 +540,14 @@ impl App {
         let mut warned = false;
         for alias in &selected {
             match store::remove_managed_symlink(&root.link_path(alias)) {
-                Ok(()) => println!("removed {alias}"),
-                Err(error) => warn(&mut warned, format!("{error:#}")),
+                Ok(()) => writeln!(ui.stdout(), "removed {alias}")?,
+                Err(error) => warn(ui, &mut warned, format!("{error:#}"))?,
             }
         }
         Ok(warned)
     }
 
-    fn gc(&self, verbose: bool) -> Result<bool> {
+    fn gc(&self, ui: &mut Ui, verbose: bool) -> Result<bool> {
         let store = self.prepared_store()?;
         let _store_lock = store.lock_mutation()?;
         let report = store.gc(&self.git)?;
@@ -580,27 +557,28 @@ impl App {
             + report.removed_remotes.len()
             + report.removed_roots.len();
         if total > 0 {
-            println!(
+            writeln!(
+                ui.stdout(),
                 "deleted {} snapshot(s), {} remote(s), {} stale root(s)",
                 report.removed_snapshots.len(),
                 report.removed_remotes.len(),
                 report.removed_roots.len()
-            );
+            )?;
         } else {
-            println!("gc: nothing to remove");
+            writeln!(ui.stdout(), "gc: nothing to remove")?;
         }
         for warning in &report.warnings {
-            warn(&mut warned, warning);
+            warn(ui, &mut warned, warning)?;
         }
         if verbose {
             for path in &report.removed_snapshots {
-                println!("deleted snapshot {}", path.display());
+                writeln!(ui.stdout(), "deleted snapshot {}", path.display())?;
             }
             for path in &report.removed_remotes {
-                println!("deleted remote {}", path.display());
+                writeln!(ui.stdout(), "deleted remote {}", path.display())?;
             }
             for path in &report.removed_roots {
-                println!("deleted stale root {}", path.display());
+                writeln!(ui.stdout(), "deleted stale root {}", path.display())?;
             }
         }
         Ok(warned)
@@ -688,7 +666,12 @@ impl App {
     }
 
     /// Remove managed symlinks whose alias is no longer in the lockfile.
-    fn prune_leftover_links(&self, root: &ProjectRoot, keep: &BTreeSet<String>) -> Result<()> {
+    fn prune_leftover_links(
+        &self,
+        ui: &mut Ui,
+        root: &ProjectRoot,
+        keep: &BTreeSet<String>,
+    ) -> Result<()> {
         for path in store::read_dir_paths(&root.dir)? {
             let Some(name) = path.file_name().and_then(OsStr::to_str) else {
                 continue;
@@ -700,7 +683,7 @@ impl App {
                 .is_some_and(|metadata| metadata.file_type().is_symlink())
             {
                 store::remove_managed_symlink(&path)?;
-                println!("removed {}", path.display());
+                writeln!(ui.stdout(), "removed {}", path.display())?;
             }
         }
         Ok(())
@@ -782,19 +765,13 @@ pub(crate) fn write_atomic_str(path: &Path, contents: &str) -> Result<()> {
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    let temp = unique_path(parent, ".devspace-write");
-    fs::write(&temp, contents).with_context(|| format!("write {}", temp.display()))?;
-    fs::rename(&temp, path)
-        .with_context(|| format!("rename {} to {}", temp.display(), path.display()))
-}
-
-pub(crate) fn unique_path(parent: &Path, prefix: &str) -> PathBuf {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    parent.join(format!("{prefix}-{pid}-{nanos}"))
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary file in {}", parent.display()))?;
+    temp.write_all(contents.as_bytes())
+        .with_context(|| format!("write temporary file for {}", path.display()))?;
+    persist_temp_file(temp, path)
+        .with_context(|| format!("persist temporary file as {}", path.display()))?;
+    Ok(())
 }
 
 pub(crate) struct CommandOutput {
@@ -809,11 +786,11 @@ impl CommandOutput {
         if self.status.success() {
             return Ok(self);
         }
-        let stderr = self.stderr.trim();
+        let stderr = redact_url_userinfo(self.stderr.trim());
         let detail = if stderr.is_empty() {
             format!("status {}", self.status)
         } else {
-            stderr.to_string()
+            stderr
         };
         bail!("{} failed: {detail}", self.cmd);
     }
@@ -828,7 +805,7 @@ pub(crate) fn run_command(
         "{} {}",
         program.to_string_lossy(),
         args.iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
+            .map(|arg| redact_url_userinfo(&arg.to_string_lossy()))
             .collect::<Vec<_>>()
             .join(" ")
     );
@@ -858,4 +835,44 @@ pub(crate) fn run_command(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+fn redact_url_userinfo(value: &str) -> String {
+    let mut redacted = value.to_owned();
+    let mut search_from = 0;
+    while let Some(relative_scheme_end) = redacted[search_from..].find("://") {
+        let authority_start = search_from + relative_scheme_end + 3;
+        let authority_end = redacted[authority_start..]
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '/' | '\\' | '?' | '#')
+            })
+            .map_or(redacted.len(), |offset| authority_start + offset);
+        let Some(relative_at) = redacted[authority_start..authority_end].rfind('@') else {
+            search_from = authority_end;
+            continue;
+        };
+        let at = authority_start + relative_at;
+        redacted.replace_range(authority_start..=at, "");
+        search_from = authority_start;
+    }
+    redacted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_url_userinfo;
+
+    #[test]
+    fn strips_url_userinfo_from_commands_and_diagnostics() {
+        assert_eq!(
+            redact_url_userinfo(
+                "fatal: unable to access 'https://user:secret@example.test/repository': denied"
+            ),
+            "fatal: unable to access 'https://example.test/repository': denied"
+        );
+        assert_eq!(
+            redact_url_userinfo("git@example.test:repository"),
+            "git@example.test:repository"
+        );
+    }
 }

@@ -25,6 +25,7 @@ use crate::checkout::{
     destination_hash, ensure_destination_parent, owned_directory_matches,
     reject_unsupported_global_options, workspace_name,
 };
+use crate::git::cloud_runtime;
 use crate::sync::wait_for_repository_sync_lock;
 use crate::tx::{
     MaterializeCheckoutError, RepoTransactionError, commit_repo_transaction, materialize_checkout,
@@ -91,25 +92,22 @@ pub(crate) async fn add_checkout(
     let machine = store
         .load_config()
         .map_err(|error| user_error(error.to_string()))?;
-    let (entry, config) = match store
+    let entry = match store
         .resolve(&name)
         .map_err(|error| user_error(error.to_string()))?
     {
-        Some(entry) => (entry, None),
+        Some(entry) => entry,
         None => {
-            let config = store
-                .load_config()
-                .map_err(|error| user_error(error.to_string()))?;
-            let repository = resolve_cloud_repository(&config, &name)?;
+            let repository = resolve_cloud_repository(&machine, &name)?;
             let entry = store
                 .register_repository(repository.name, repository.identity)
                 .map_err(|error| user_error(error.to_string()))?;
             failpoint("after_clone_registration");
-            (entry, Some(config))
+            entry
         }
     };
     if !entry.native_repository_path.exists() {
-        clone_repository(ui, command, &store, &entry, config).await?;
+        clone_repository(ui, command, &store, &entry, &machine).await?;
     } else if !is_stock_bare_repository(&entry.native_repository_path) {
         return Err(user_error(format!(
             "Repository `{name}` is registered locally, but its native repository is invalid."
@@ -266,8 +264,7 @@ fn resolve_cloud_repository(
     name: &RepositoryName,
 ) -> Result<devspace_machine::CloudRepository, CommandError> {
     let client = ControlPlaneClient::new(config).map_err(|error| user_error(error.to_string()))?;
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|_| user_error("failed to start the cloud transport runtime"))?;
+    let runtime = cloud_runtime()?;
     match runtime.block_on(client.resolve_repository(name)) {
         Ok(repository) => Ok(repository),
         Err(ControlPlaneClientError::Request(error)) => Err(user_error(format!(
@@ -288,7 +285,7 @@ async fn clone_repository(
     command: &CommandHelper,
     store: &MachineStore,
     entry: &CatalogEntry,
-    config: Option<MachineConfig>,
+    config: &MachineConfig,
 ) -> Result<(), CommandError> {
     let name = &entry.name;
     let Some(sync_guard) = wait_for_repository_sync_lock(ui, store, entry).map_err(user_error)?
@@ -307,12 +304,6 @@ async fn clone_repository(
         )));
     }
 
-    let config = match config {
-        Some(config) => config,
-        None => store
-            .load_config()
-            .map_err(|error| user_error(error.to_string()))?,
-    };
     let (settings, _) = command.settings_for_new_workspace(ui, &entry.native_repository_path)?;
     let Some(mut staging) = store
         .stage_repository_clone(sync_guard, name, &entry.identity, &settings)
@@ -329,7 +320,7 @@ async fn clone_repository(
     let sync_path = staging.sync_path().to_owned();
     let packs_path = staging.packs_path().to_owned();
     crate::sync::run_sync_engine(
-        &config,
+        config,
         &entry.identity,
         staging.repository_mut(),
         &sync_path,

@@ -2,18 +2,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use devspace_machine::{
-    HttpTransport, MachineConfig, MachineId, MachineRepository, ProjectionSnapshot, RepositoryName,
-    SharedSecret,
-};
+use devspace_machine::{HttpTransport, MachineRepository, ProjectionSnapshot, RepositoryName};
 
 mod support;
 
 use jj_lib::ref_name::RefName;
 use jj_lib::repo::Repo as _;
 use support::{
-    ds_command_with_home as ds_command, ds_with_home as ds, machine_store, settings, stderr,
-    stdout, write_cli_config,
+    configure_machine_as, ds_command_with_home as ds_command, ds_with_home as ds, machine_store,
+    settings, stderr, stdout, write_cli_config,
 };
 
 const MACHINE_ID: &str = "56565656565656565656565656565656";
@@ -249,16 +246,7 @@ impl LiveFixture {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("machine");
         fs::create_dir_all(&home).unwrap();
-        machine_store(&home)
-            .write_config(
-                &MachineConfig::new(
-                    base_url,
-                    MachineId::parse(MACHINE_ID).unwrap(),
-                    SharedSecret::new(shared_secret).unwrap(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
+        configure_machine_as(&home, &base_url, MACHINE_ID, &shared_secret);
         let config = write_cli_config(&home);
         let repository_name = unique_repository_name(temp.path(), label);
         let created = ds(&home, &home, &config, &["repo", "new", &repository_name]);

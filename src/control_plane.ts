@@ -16,7 +16,6 @@ const createRepositorySchema = z.strictObject({
 });
 const renameRepositorySchema = z.strictObject({ newName: repositoryNameSchema });
 const deleteRepositorySchema = z.strictObject({
-  name: repositoryNameSchema,
   repositoryId: repositoryIdSchema,
   incarnation: incarnationSchema,
 });
@@ -429,11 +428,13 @@ export class ControlPlane extends DurableObject<Env> {
     }
   }
 
-  async deleteRepository(identityValue: unknown, value: unknown) {
+  async deleteRepository(identityValue: unknown, nameValue: unknown, value: unknown) {
     let identity: AuthenticatedPrincipal;
-    let request: { name: string; repositoryId: string; incarnation: string };
+    let name: string;
+    let request: { repositoryId: string; incarnation: string };
     try {
       identity = decodeIdentity(identityValue);
+      name = requireRepositoryName(nameValue);
       request = decodeDeleteRepository(value);
     } catch (error) {
       return failure(error, 400);
@@ -444,7 +445,7 @@ export class ControlPlane extends DurableObject<Env> {
         const repository = this.repositoryById(identity.userId, request.repositoryId);
         if (
           repository === undefined ||
-          repository.name !== request.name ||
+          repository.name !== name ||
           repository.incarnation !== request.incarnation
         ) {
           throw new ControlPlaneError("repository not found", 404, REPOSITORY_NOT_FOUND);

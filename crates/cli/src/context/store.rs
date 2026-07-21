@@ -4,13 +4,14 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
+use super::ensure_dir_mode;
 use super::git::Git;
 use super::lock::{FileLock, MutationLock};
 use super::manifest::{LockEntry, Lockfile};
-use super::{Context as _, Result, ensure_dir_mode};
+use anyhow::{Context as _, Result, bail};
 
 pub struct Store {
     cache_root: PathBuf,
@@ -77,7 +78,7 @@ impl Store {
         let canonical = project_dir
             .canonicalize()
             .with_context(|| format!("canonicalize {}", project_dir.display()))?;
-        let key = git.hash_string(&canonical.display().to_string())?;
+        let key = git.hash_string(&canonical.display().to_string());
         let path = self.locks_dir().join(format!("{key}.mutate.lock"));
         MutationLock::acquire(&path, project_dir)
     }
@@ -88,7 +89,7 @@ impl Store {
         url: &str,
         f: impl FnOnce(&Path) -> Result<T>,
     ) -> Result<T> {
-        let remote_key = git.hash_string(url)?;
+        let remote_key = git.hash_string(url);
         self.with_remote_cache_for_key(git, url, &remote_key, f)
     }
 
@@ -101,7 +102,7 @@ impl Store {
         commit: &str,
         subdir: Option<&str>,
     ) -> Result<PathBuf> {
-        let remote_key = git.hash_string(url)?;
+        let remote_key = git.hash_string(url);
         let snapshot_key = self.snapshot_key(git, url, commit, subdir)?;
         Ok(self.snapshot_dir_for_keys(&remote_key, &snapshot_key))
     }
@@ -113,7 +114,7 @@ impl Store {
         commit: &str,
         subdir: Option<&str>,
     ) -> Result<PathBuf> {
-        let remote_key = git.hash_string(url)?;
+        let remote_key = git.hash_string(url);
         let snapshot_key = self.snapshot_key(git, url, commit, subdir)?;
         let snapshot_dir = self.snapshot_dir_for_keys(&remote_key, &snapshot_key);
         self.with_remote_cache_for_key(git, url, &remote_key, |remote_dir| {
@@ -132,7 +133,7 @@ impl Store {
         let canonical = lock_path
             .canonicalize()
             .with_context(|| format!("canonicalize {}", lock_path.display()))?;
-        let root_key = git.hash_string(&canonical.display().to_string())?;
+        let root_key = git.hash_string(&canonical.display().to_string());
         let root_link = self.roots_dir().join(format!("{root_key}.lock"));
         if root_link.exists() {
             fs::remove_file(&root_link)
@@ -188,7 +189,7 @@ impl Store {
                 let Some(commit) = &git_entry.commit else {
                     continue;
                 };
-                let remote_key = git.hash_string(&git_entry.url)?;
+                let remote_key = git.hash_string(&git_entry.url);
                 let snapshot_key =
                     self.snapshot_key(git, &git_entry.url, commit, git_entry.subdir.as_deref())?;
                 reachable_snapshots.insert(self.snapshot_dir_for_keys(&remote_key, &snapshot_key));
@@ -237,7 +238,7 @@ impl Store {
         subdir: Option<&str>,
     ) -> Result<String> {
         let payload = format!("{url}\n{commit}\n{}", subdir.unwrap_or(""));
-        git.hash_string(&payload)
+        Ok(git.hash_string(&payload))
     }
 
     fn remote_dir_for_key(&self, remote_key: &str) -> PathBuf {
@@ -299,49 +300,25 @@ pub fn remove_managed_symlink(path: &Path) -> Result<()> {
 }
 
 fn make_read_only(root: &Path) -> Result<()> {
-    rewrite_tree_modes(root, |is_dir, mode| {
-        if is_dir || mode & 0o100 != 0 {
+    crate::tree_modes::rewrite(root, |is_dir, mode| {
+        Some(if is_dir || mode & 0o100 != 0 {
             0o500
         } else {
             0o400
-        }
+        })
     })
+    .with_context(|| format!("make {} read-only", root.display()))
 }
 
 fn make_writable(root: &Path) -> Result<()> {
-    rewrite_tree_modes(root, |is_dir, mode| {
-        if is_dir || mode & 0o100 != 0 {
+    crate::tree_modes::rewrite(root, |is_dir, mode| {
+        Some(if is_dir || mode & 0o100 != 0 {
             0o700
         } else {
             0o600
-        }
+        })
     })
-}
-
-fn rewrite_tree_modes(root: &Path, rewrite: impl Fn(bool, u32) -> u32) -> Result<()> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(path) = stack.pop() {
-        let metadata =
-            fs::symlink_metadata(&path).with_context(|| format!("inspect {}", path.display()))?;
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            continue;
-        }
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(rewrite(file_type.is_dir(), permissions.mode()));
-        fs::set_permissions(&path, permissions)
-            .with_context(|| format!("set permissions on {}", path.display()))?;
-        if file_type.is_dir() {
-            for entry in fs::read_dir(&path).with_context(|| format!("read {}", path.display()))? {
-                stack.push(
-                    entry
-                        .with_context(|| format!("read {}", path.display()))?
-                        .path(),
-                );
-            }
-        }
-    }
-    Ok(())
+    .with_context(|| format!("make {} writable", root.display()))
 }
 
 pub fn read_dir_paths(path: &Path) -> Result<Vec<PathBuf>> {

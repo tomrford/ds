@@ -6,30 +6,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use devspace_machine::{
-    MachineConfig, MachineId, MachineRepository, RepositoryId, RepositoryIdentity,
-    RepositoryIncarnation, RepositoryName, SharedSecret,
+    MachineRepository, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
 };
 
 mod support;
 
 use support::{
-    commit_id, ds, ds_command, machine_store, settings, stderr, stdout, write_cli_config,
+    commit_id, configure_machine, ds, ds_command, machine_store, settings, stderr, stdout,
+    write_cli_config,
 };
 
-const DEVELOPMENT_SECRET: &str = "cli-development-secret";
-
 async fn owned_checkout(root: &Path, config: &Path, name: &str, checkout: &Path) {
+    configure_machine(root, "http://127.0.0.1:1");
     let store = machine_store(root);
-    store
-        .write_config(
-            &MachineConfig::new(
-                "http://127.0.0.1:1",
-                MachineId::parse("12".repeat(16)).unwrap(),
-                SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
     let entry = store
         .register_repository(
             RepositoryName::parse(name).unwrap(),
@@ -272,4 +261,59 @@ fn context_help_keeps_the_v1_subcommand_surface() {
     for command in ["init", "add", "list", "sync", "update", "remove", "gc"] {
         assert!(help.contains(command), "missing {command} in:\n{help}");
     }
+}
+
+#[tokio::test]
+async fn context_rejects_ext_transport_without_running_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    let cache = temp.path().join("cache");
+    let checkout = temp.path().join("checkout");
+    owned_checkout(temp.path(), &config, "ext-transport", &checkout).await;
+    fs::write(checkout.join(".gitignore"), ".repos/*\n!.repos/.lock\n").unwrap();
+    let marker = temp.path().join("ext-ran");
+    let script = temp.path().join("ext-helper");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let url = format!("ext::{}", script.display());
+
+    let output = context(
+        &checkout,
+        &config,
+        &cache,
+        &["add", "reference", "--url", &url],
+    );
+
+    assert!(!output.status.success());
+    assert!(!marker.exists());
+    assert!(
+        stderr(&output).contains("transport 'ext' not allowed"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[tokio::test]
+async fn context_list_redacts_url_userinfo() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    let cache = temp.path().join("cache");
+    let checkout = temp.path().join("checkout");
+    owned_checkout(temp.path(), &config, "url-redaction", &checkout).await;
+    fs::create_dir(checkout.join(".repos")).unwrap();
+    fs::write(
+        checkout.join(".repos/.lock"),
+        "[repos.reference]\nurl = \"https://user:secret@example.test/repository\"\nmode = \"default\"\n",
+    )
+    .unwrap();
+
+    let output = context(&checkout, &config, &cache, &["list"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("secret"));
+    assert!(stdout(&output).contains("https://example.test/repository"));
 }

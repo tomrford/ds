@@ -7,6 +7,7 @@ use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
 
 use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
+use crate::git::{CLOUD_RUNTIME_ERROR, cloud_runtime};
 
 pub(crate) async fn run_doctor(ui: &mut Ui, command: &CommandHelper) -> Result<(), CommandError> {
     reject_unsupported_global_options(command, "doctor")?;
@@ -108,8 +109,7 @@ pub(crate) async fn run_doctor(ui: &mut Ui, command: &CommandHelper) -> Result<(
 
 fn check_cloud(config: &MachineConfig) -> Result<usize, String> {
     let client = ControlPlaneClient::new(config).map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|_| "failed to start the cloud transport runtime".to_owned())?;
+    let runtime = cloud_runtime().map_err(|_| CLOUD_RUNTIME_ERROR.to_owned())?;
     runtime
         .block_on(client.list_repositories())
         .map(|repositories| repositories.len())

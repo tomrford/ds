@@ -5,8 +5,8 @@ use std::process::{Child, Output, Stdio};
 use std::thread;
 
 use devspace_machine::{
-    MachineConfig, MachineId, MachineRepository, PackOptions, RepositoryId, RepositoryIdentity,
-    RepositoryIncarnation, RepositoryName, SharedSecret, build_packs,
+    MachineRepository, PackOptions, RepositoryId, RepositoryIdentity, RepositoryIncarnation,
+    RepositoryName, build_packs,
 };
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{StoreFactories, StoreLoadError};
@@ -17,23 +17,10 @@ mod support;
 mod support_fs;
 
 use support::fake_worker::{create_server, repository_response, respond, respond_bytes};
-use support::{commit_id, ds, ds_command, machine_store, settings, stderr, write_cli_config};
-
-const DEVELOPMENT_SECRET: &str = "cli-development-secret";
-const MACHINE_ID: &str = "12121212121212121212121212121212";
-
-fn configure_machine(root: &Path, base_url: &str) {
-    machine_store(root)
-        .write_config(
-            &MachineConfig::new(
-                base_url,
-                MachineId::parse(MACHINE_ID).unwrap(),
-                SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-}
+use support::{
+    TEST_MACHINE_ID, commit_id, configure_machine, ds, ds_command, machine_store, settings, stderr,
+    write_cli_config,
+};
 
 async fn local_repository(root: &Path, repository_name: &str) -> PathBuf {
     let store = machine_store(root);
@@ -423,8 +410,8 @@ async fn add_fresh_creates_deterministic_owned_workspace() {
     );
     let canonical_destination = dunce::canonicalize(temp.path()).unwrap().join("checkout");
     let workspace_id = added["workspace_id"].as_str().unwrap();
-    assert!(workspace_id.starts_with(&format!("{MACHINE_ID}-")));
-    assert_eq!(workspace_id.len(), MACHINE_ID.len() + 1 + 24);
+    assert!(workspace_id.starts_with(&format!("{TEST_MACHINE_ID}-")));
+    assert_eq!(workspace_id.len(), TEST_MACHINE_ID.len() + 1 + 24);
     assert_eq!(added["root"], canonical_destination.to_str().unwrap());
     assert!(canonical_destination.join(".jj/repo").is_file());
     let owner: serde_json::Value = serde_json::from_slice(

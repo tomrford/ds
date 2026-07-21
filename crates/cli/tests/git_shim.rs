@@ -6,28 +6,18 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use devspace_machine::{
-    MachineConfig, MachineId, MachineRepository, RepositoryId, RepositoryIdentity,
-    RepositoryIncarnation, RepositoryName, SharedSecret,
+    MachineRepository, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
 };
 
 mod support;
 
-use support::{ds, ds_command, machine_store, settings, stderr, write_cli_config};
-
-const DEVELOPMENT_SECRET: &str = "cli-development-secret";
+use support::{
+    configure_machine, ds, ds_command, machine_store, settings, stderr, write_cli_config,
+};
 
 async fn local_repository(root: &Path, name: &str) {
+    configure_machine(root, "http://127.0.0.1:1");
     let store = machine_store(root);
-    store
-        .write_config(
-            &MachineConfig::new(
-                "http://127.0.0.1:1",
-                MachineId::parse("12".repeat(16)).unwrap(),
-                SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
     let entry = store
         .register_repository(
             RepositoryName::parse(name).unwrap(),

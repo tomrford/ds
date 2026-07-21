@@ -3,19 +3,17 @@ mod support;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore,
-    MachineSyncStore, RepositoryName, SharedSecret,
-};
+use devspace_machine::{MachineRepository, MachineStore, MachineSyncStore, RepositoryName};
 #[cfg(unix)]
 use support::daemon_socket_path;
 use support::{
-    commit_id_with_home as commit_id, ds_with_home as ds, machine_store, operation_heads,
-    poll_until, repository_commit_ids, seal_commit, settings, stderr, stdout, write_cli_config,
+    commit_id_with_home as commit_id, configure_machine_as as configure_machine,
+    ds_command_with_home, ds_with_home as ds, machine_store, operation_heads, poll_until,
+    repository_commit_ids, seal_commit, settings, stderr, stdout, write_cli_config,
 };
 
 const FIRST_MACHINE_ID: &str = "12121212121212121212121212121212";
@@ -666,44 +664,21 @@ async fn daemon_restart_drains_one_offline_commit_exactly_once() {
     drop(restarted);
 }
 
-fn configure_machine(root: &Path, base_url: &str, machine_id: &str, secret: &str) {
-    machine_store(root)
-        .write_config(
-            &MachineConfig::new(
-                base_url,
-                MachineId::parse(machine_id).unwrap(),
-                SharedSecret::new(secret).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-}
-
 fn ds_boundary(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ds"))
-        .current_dir(cwd)
-        .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
-        .env("JJ_CONFIG", config)
+    ds_command_with_home(cwd, home, config)
         .env("DEVSPACE_BOUNDARY_SYNC", "1")
         .env("DEVSPACE_DAEMON_TEST_HOOKS", "1")
         .env("DEVSPACE_DAEMON_TEST_POLL_MS", "10000")
         .env("DEVSPACE_DAEMON_TEST_IDLE_MS", "250")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat")
         .args(args)
         .output()
         .unwrap()
 }
 
 fn ds_degraded(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ds"))
-        .current_dir(cwd)
-        .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
-        .env("JJ_CONFIG", config)
+    ds_command_with_home(cwd, home, config)
         .env("DEVSPACE_BOUNDARY_SYNC", "1")
         .env("DEVSPACE_DAEMON", "0")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat")
         .args(args)
         .output()
         .unwrap()
@@ -712,16 +687,11 @@ fn ds_degraded(cwd: &Path, home: &Path, config: &Path, args: &[&str]) -> Output 
 #[cfg(unix)]
 fn start_daemon(home: &Path, config: &Path) -> DaemonProcess {
     let socket = daemon_socket_path(machine_store(home).root());
-    let child = Command::new(env!("CARGO_BIN_EXE_ds"))
-        .current_dir(home)
-        .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
-        .env("JJ_CONFIG", config)
+    let child = ds_command_with_home(home, home, config)
         .env("DEVSPACE_BOUNDARY_SYNC", "0")
         .env("DEVSPACE_DAEMON_TEST_HOOKS", "1")
         .env("DEVSPACE_DAEMON_TEST_POLL_MS", "100")
         .env("DEVSPACE_DAEMON_TEST_IDLE_MS", "60000")
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat")
         .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

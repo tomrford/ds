@@ -15,6 +15,7 @@ use jj_cli::ui::Ui;
 use jj_lib::settings::UserSettings;
 
 use crate::checkout::reject_unsupported_global_options;
+use crate::git::{CLOUD_RUNTIME_ERROR, cloud_runtime};
 
 const FOREGROUND_SYNC_LOCK_WAIT: Duration = Duration::from_secs(60);
 const SYNC_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -208,8 +209,7 @@ pub(crate) fn run_sync_engine(
     let incarnation = parse_incarnation(identity.incarnation.as_str());
     let mut transport = HttpTransport::new(config, identity.repository_id.as_str(), incarnation)
         .map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|_| "failed to start the cloud transport runtime".to_owned())?;
+    let runtime = cloud_runtime().map_err(|_| CLOUD_RUNTIME_ERROR.to_owned())?;
     runtime
         .block_on(SyncEngine::new(repository, &state, packs_path, &mut transport).run())
         .map(|_| ())
