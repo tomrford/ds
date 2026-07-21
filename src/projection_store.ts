@@ -1,4 +1,5 @@
 import { KIND, KIND_BY_NUMBER, Kernel, equalBytes, exactBuffer, toHex } from "./kernel";
+import { findMissingReachableObject, markClosureComplete } from "./closure_authority";
 import {
   BeginProjectionBatchRequest,
   MAX_PROJECTION_STATES,
@@ -117,11 +118,6 @@ interface ActiveLineageRow extends Record<string, SqlStorageValue> {
   git_oid: ArrayBuffer;
   canonical_commit_id: ArrayBuffer;
   hidden_set_id: ArrayBuffer | null;
-}
-
-interface MissingObjectRow extends Record<string, SqlStorageValue> {
-  kind: number;
-  id: ArrayBuffer;
 }
 
 const REPLAY_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -1018,7 +1014,7 @@ export class ProjectionStore {
       );
     }
     const commitId = exactBuffer(id);
-    const missing = this.findMissingReachableObject(commitId);
+    const missing = findMissingReachableObject(this.sql, KIND.commit, commitId, [KIND.commit]);
     if (missing !== undefined) {
       const missingId = toHex(new Uint8Array(missing.id));
       if (missing.kind === KIND.commit && missingId === toHex(id)) {
@@ -1034,55 +1030,7 @@ export class ProjectionStore {
         code ?? "projection-commit-not-durable",
       );
     }
-    this.markClosureComplete(commitId);
-  }
-
-  private findMissingReachableObject(commitId: ArrayBuffer): MissingObjectRow | undefined {
-    return this.sql
-      .exec<MissingObjectRow>(
-        `WITH RECURSIVE reachable(kind, id) AS (
-           VALUES (${KIND.commit}, ?)
-           UNION
-           SELECT edges.referenced_kind, edges.referenced_id
-           FROM reachable
-           JOIN object_references AS edges
-             ON edges.object_kind = reachable.kind
-            AND edges.object_id = reachable.id
-           LEFT JOIN complete_object_closures AS complete
-             ON complete.kind = reachable.kind AND complete.id = reachable.id
-           WHERE complete.id IS NULL
-         )
-         SELECT reachable.kind, reachable.id
-         FROM reachable
-         LEFT JOIN objects
-           ON objects.kind = reachable.kind AND objects.id = reachable.id
-         WHERE objects.id IS NULL
-           AND NOT (reachable.kind = ${KIND.commit} AND reachable.id = zeroblob(64))
-         ORDER BY reachable.kind, reachable.id
-         LIMIT 1`,
-        commitId,
-      )
-      .toArray()[0];
-  }
-
-  private markClosureComplete(commitId: ArrayBuffer) {
-    this.sql.exec(
-      `INSERT OR IGNORE INTO complete_object_closures
-       WITH RECURSIVE reachable(kind, id) AS (
-         VALUES (${KIND.commit}, ?)
-         UNION
-         SELECT edges.referenced_kind, edges.referenced_id
-         FROM reachable
-         JOIN object_references AS edges
-           ON edges.object_kind = reachable.kind
-          AND edges.object_id = reachable.id
-         LEFT JOIN complete_object_closures AS complete
-           ON complete.kind = reachable.kind AND complete.id = reachable.id
-         WHERE complete.id IS NULL
-       )
-       SELECT kind, id FROM reachable`,
-      commitId,
-    );
+    markClosureComplete(this.sql, KIND.commit, commitId);
   }
 
   private storeReceipt(gitOid: Uint8Array, publicCommitId: Uint8Array) {

@@ -7,6 +7,7 @@ import {
 } from "./head_protocol";
 import { KIND, KIND_BY_NUMBER, Kernel, equalBytes, exactBuffer, toHex } from "./kernel";
 import { RepositoryAuthority } from "./control_plane";
+import { findMissingReachableObject, markClosureComplete } from "./closure_authority";
 
 interface RepositoryStateRow extends Record<string, SqlStorageValue> {
   incarnation: ArrayBuffer;
@@ -21,11 +22,6 @@ interface HeadTransactionRow extends Record<string, SqlStorageValue> {
 }
 
 interface HeadRow extends Record<string, SqlStorageValue> {
-  id: ArrayBuffer;
-}
-
-interface MissingObjectRow extends Record<string, SqlStorageValue> {
-  kind: number;
   id: ArrayBuffer;
 }
 
@@ -167,7 +163,11 @@ export class HeadStore {
         }
 
         const newHead = exactBuffer(request.newHead);
-        const missing = this.findMissingReachableObject(newHead);
+        const missing = findMissingReachableObject(this.sql, KIND.operation, newHead, [
+          KIND.commit,
+          KIND.view,
+          KIND.operation,
+        ]);
         if (missing !== undefined) {
           throw new HeadTransactionError(
             `head closure is missing ${objectLabel(missing.kind)} ${toHex(new Uint8Array(missing.id))}`,
@@ -190,7 +190,7 @@ export class HeadStore {
             "head-observation-stale",
           );
         }
-        this.markClosureComplete(newHead);
+        markClosureComplete(this.sql, KIND.operation, newHead);
         for (const observed of request.observedHeads) {
           this.sql.exec(
             "DELETE FROM operation_heads WHERE id = ?",
@@ -365,57 +365,6 @@ export class HeadStore {
       )
       .toArray()
       .map((row) => toHex(new Uint8Array(row.id)));
-  }
-
-  private findMissingReachableObject(head: ArrayBuffer): MissingObjectRow | undefined {
-    return this.sql
-      .exec<MissingObjectRow>(
-        `WITH RECURSIVE reachable(kind, id) AS (
-           VALUES (${KIND.operation}, ?)
-           UNION
-           SELECT edges.referenced_kind, edges.referenced_id
-           FROM reachable
-           JOIN object_references AS edges
-             ON edges.object_kind = reachable.kind
-            AND edges.object_id = reachable.id
-           LEFT JOIN complete_object_closures AS complete
-             ON complete.kind = reachable.kind AND complete.id = reachable.id
-           WHERE complete.id IS NULL
-         )
-         SELECT reachable.kind, reachable.id
-         FROM reachable
-         LEFT JOIN objects
-           ON objects.kind = reachable.kind AND objects.id = reachable.id
-         WHERE objects.id IS NULL
-           AND NOT (
-             reachable.kind IN (${KIND.commit}, ${KIND.view}, ${KIND.operation})
-             AND reachable.id = zeroblob(64)
-           )
-         ORDER BY reachable.kind, reachable.id
-         LIMIT 1`,
-        head,
-      )
-      .toArray()[0];
-  }
-
-  private markClosureComplete(head: ArrayBuffer) {
-    this.sql.exec(
-      `INSERT OR IGNORE INTO complete_object_closures
-       WITH RECURSIVE reachable(kind, id) AS (
-         VALUES (${KIND.operation}, ?)
-         UNION
-         SELECT edges.referenced_kind, edges.referenced_id
-         FROM reachable
-         JOIN object_references AS edges
-           ON edges.object_kind = reachable.kind
-          AND edges.object_id = reachable.id
-         LEFT JOIN complete_object_closures AS complete
-           ON complete.kind = reachable.kind AND complete.id = reachable.id
-         WHERE complete.id IS NULL
-       )
-       SELECT kind, id FROM reachable`,
-      head,
-    );
   }
 
   private findObservedHeadOutsideAncestry(head: ArrayBuffer): HeadRow | undefined {
