@@ -139,6 +139,9 @@ impl<'a, T: SyncTransport> SyncEngine<'a, T> {
             .operation_heads
             .iter()
             .filter(|head| !observed_heads.contains(*head))
+            // The implicit root operation exists in every store; a virgin
+            // repository (empty operation log) has nothing to transact.
+            .filter(|head| **head != [0; 64])
             .copied()
             .collect::<Vec<_>>();
         if new_heads.is_empty() {

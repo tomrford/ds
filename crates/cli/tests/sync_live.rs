@@ -177,6 +177,69 @@ async fn two_machine_cli_sync_converges_through_a_live_worker() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
+async fn virgin_repository_syncs_and_clones_before_any_checkout_exists() {
+    let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
+    let shared_secret =
+        std::env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
+    let temp = tempfile::tempdir().unwrap();
+    let home_a = temp.path().join("machine-a");
+    let home_b = temp.path().join("machine-b");
+    fs::create_dir_all(&home_a).unwrap();
+    fs::create_dir_all(&home_b).unwrap();
+    configure_machine(&home_a, &base_url, FIRST_MACHINE_ID, &shared_secret);
+    configure_machine(&home_b, &base_url, SECOND_MACHINE_ID, &shared_secret);
+    let config_a = write_cli_config(&home_a);
+    let config_b = write_cli_config(&home_b);
+    let repository_name = unique_repository_name(temp.path());
+
+    let created = ds(
+        &home_a,
+        &home_a,
+        &config_a,
+        &["repo", "new", &repository_name],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let synced = ds(
+        &home_a,
+        &home_a,
+        &config_a,
+        &["sync", "run", "--repository", &repository_name],
+    );
+    assert!(synced.status.success(), "{}", stderr(&synced));
+
+    let checkout_b = home_b.join("checkout");
+    let added_b = ds(
+        &home_b,
+        &home_b,
+        &config_b,
+        &[
+            "add",
+            &repository_name,
+            "-r",
+            "root()",
+            checkout_b.to_str().unwrap(),
+        ],
+    );
+    assert!(added_b.status.success(), "{}", stderr(&added_b));
+    fs::write(checkout_b.join("from-b.txt"), "machine B\n").unwrap();
+    seal_commit(&checkout_b, &home_b, &config_b, "first commit from B");
+
+    let removed = ds(
+        &home_a,
+        &home_a,
+        &config_a,
+        &["repo", "remove", &repository_name, "--force"],
+    );
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(
+        stderr(&removed).contains(&format!("Deleted repository `{repository_name}`.")),
+        "{}",
+        stderr(&removed)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
 async fn boundary_sync_uploads_machine_a_without_explicit_sync() {
     let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
     let shared_secret =
