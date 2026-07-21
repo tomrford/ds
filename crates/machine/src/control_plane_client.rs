@@ -35,6 +35,18 @@ struct CreateRepositoryRequest {
     idempotency_key: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameRepositoryRequest {
+    new_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryListResponse {
+    repositories: Vec<RepositoryResponse>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RepositoryResponse {
@@ -93,6 +105,37 @@ impl ControlPlaneClient {
         self.send_repository(request, name).await
     }
 
+    pub async fn list_repositories(&self) -> Result<Vec<CloudRepository>, ControlPlaneClientError> {
+        let request = self
+            .authenticated(self.client.get(format!("{}/repositories", self.base_url)))
+            .build()?;
+        let bytes = self.send(request).await?;
+        let response: RepositoryListResponse = serde_json::from_slice(&bytes)?;
+        response
+            .repositories
+            .into_iter()
+            .map(decode_repository)
+            .collect()
+    }
+
+    pub async fn rename_repository(
+        &self,
+        old_name: &RepositoryName,
+        new_name: &RepositoryName,
+    ) -> Result<CloudRepository, ControlPlaneClientError> {
+        let request = self
+            .authenticated(self.client.patch(format!(
+                "{}/repositories/{}",
+                self.base_url,
+                old_name.as_str()
+            )))
+            .json(&RenameRepositoryRequest {
+                new_name: new_name.as_str().to_owned(),
+            })
+            .build()?;
+        self.send_repository(request, new_name).await
+    }
+
     fn create_repository_request(
         &self,
         name: &RepositoryName,
@@ -118,6 +161,15 @@ impl ControlPlaneClient {
         request: reqwest::Request,
         expected_name: &RepositoryName,
     ) -> Result<CloudRepository, ControlPlaneClientError> {
+        let bytes = self.send(request).await?;
+        let repository = decode_repository(serde_json::from_slice(&bytes)?)?;
+        if &repository.name != expected_name {
+            return Err(ControlPlaneClientError::UnexpectedRepositoryName);
+        }
+        Ok(repository)
+    }
+
+    async fn send(&self, request: reqwest::Request) -> Result<Vec<u8>, ControlPlaneClientError> {
         let response = self.client.execute(request).await?;
         let status = response.status();
         let bytes = read_bounded_directory(response, MAX_DIRECTORY_RESPONSE_BYTES).await?;
@@ -139,25 +191,26 @@ impl ControlPlaneClient {
                 error,
             });
         }
-        let response: RepositoryResponse = serde_json::from_slice(&bytes)?;
-        let repository = CloudRepository {
-            name: RepositoryName::parse(response.name).map_err(Box::new)?,
-            identity: RepositoryIdentity::new(
-                RepositoryId::parse(response.repository_id).map_err(Box::new)?,
-                RepositoryIncarnation::parse(response.incarnation).map_err(Box::new)?,
-            ),
-        };
-        if &repository.name != expected_name {
-            return Err(ControlPlaneClientError::UnexpectedRepositoryName);
-        }
-        Ok(repository)
+        Ok(bytes)
     }
+}
+
+fn decode_repository(
+    response: RepositoryResponse,
+) -> Result<CloudRepository, ControlPlaneClientError> {
+    Ok(CloudRepository {
+        name: RepositoryName::parse(response.name).map_err(Box::new)?,
+        identity: RepositoryIdentity::new(
+            RepositoryId::parse(response.repository_id).map_err(Box::new)?,
+            RepositoryIncarnation::parse(response.incarnation).map_err(Box::new)?,
+        ),
+    })
 }
 
 fn classify_remote_error(code: Option<&str>) -> ControlPlaneRemoteErrorKind {
     match code {
         Some("repository-not-found") => ControlPlaneRemoteErrorKind::RepositoryNotFound,
-        Some("name-in-use") => ControlPlaneRemoteErrorKind::RepositoryNameInUse,
+        Some("repository-name-taken") => ControlPlaneRemoteErrorKind::RepositoryNameInUse,
         Some("creation-retired") => ControlPlaneRemoteErrorKind::RepositoryCreationRetired,
         Some("creation-retiring") => ControlPlaneRemoteErrorKind::RepositoryCreationRetiring,
         Some("idempotency-key-reused") => ControlPlaneRemoteErrorKind::IdempotencyKeyReused,
@@ -273,7 +326,7 @@ mod tests {
             ControlPlaneRemoteErrorKind::RepositoryNotFound
         );
         assert_eq!(
-            classify_remote_error(Some("name-in-use")),
+            classify_remote_error(Some("repository-name-taken")),
             ControlPlaneRemoteErrorKind::RepositoryNameInUse
         );
         assert_eq!(
@@ -306,7 +359,7 @@ mod tests {
             let (mut connection, _) = listener.accept().unwrap();
             let mut request = [0; 4096];
             let _ = connection.read(&mut request).unwrap();
-            let body = r#"{"error":"conflict mentions remote-error-secret","code":"name-in-use"}"#;
+            let body = r#"{"error":"conflict mentions remote-error-secret","code":"repository-name-taken"}"#;
             write!(
                 connection,
                 "HTTP/1.1 409 Conflict\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",

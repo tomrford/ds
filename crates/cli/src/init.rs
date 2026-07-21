@@ -3,9 +3,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use devspace_machine::{
-    CatalogEntry, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
-    GitProcessEnvironment, MachineRepository, MachineStore, MachineStoreError, RemoteUrl,
-    RepositoryName,
+    CatalogEntry, GitProcessEnvironment, MachineRepository, MachineStore, MachineStoreError,
+    RemoteUrl, RepositoryName,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -21,7 +20,10 @@ use crate::checkout::{
     reject_unsupported_global_options, workspace_name,
 };
 use crate::git::display_error;
-use crate::repo::{create_cloud_repository, materialize_cloud_repository};
+use crate::repo::{
+    CloudRepositoryCreationError, PendingRepositoryCreation, create_cloud_repository,
+    materialize_cloud_repository,
+};
 use crate::tx::{commit_repo_transaction, materialize_checkout};
 use crate::working_copy::devspace_working_copy_factories;
 
@@ -30,8 +32,8 @@ const AFTER_CLOUD_REGISTRATION_FAILPOINT: &str = "after_init_cloud_registration"
 
 #[derive(clap::Args)]
 pub(crate) struct InitArgs {
-    /// Git remote URL to import.
-    git_url: String,
+    /// Git remote URL to import, or a directory for a new blank repository.
+    source: Option<String>,
 
     /// Directory to create the checkout at (defaults to ./<name>).
     #[arg(value_hint = clap::ValueHint::DirPath)]
@@ -49,112 +51,235 @@ pub(crate) async fn init_repository(
 ) -> Result<(), CommandError> {
     reject_unsupported_global_options(command, "init")?;
     crate::boundary_sync::suppress();
-
-    let name = RepositoryName::parse(
-        args.name
-            .unwrap_or_else(|| repository_name_from_url(&args.git_url)),
-    )
-    .map_err(|error| user_error(format!(
-        "Cannot derive a valid repository name from the Git URL: {error}. Use `ds init --name <name>`."
-    )))?;
-    let requested = args
-        .directory
-        .unwrap_or_else(|| PathBuf::from(name.as_str()));
-    let checkout_path = preflight_destination(command.cwd(), &requested)?;
-
-    let store = MachineStore::platform_default().map_err(display_error)?;
-    if store.resolve(&name).map_err(display_error)?.is_some() {
-        return Err(user_error(format!(
-            "Repository `{name}` is already registered in this machine's local catalog."
-        )));
-    }
-    ensure_cloud_name_available(&store, &name)?;
-
-    let remote_url = RemoteUrl::new(args.git_url.clone());
-    let head = devspace_machine::ls_remote_head(&remote_url, &GitProcessEnvironment::default())
-        .map_err(display_error)?
-        .ok_or_else(|| {
-            user_error(
-                "The Git remote has no history yet; use `ds repo new` for a repository with no history yet.",
+    let mode = classify_init(command.cwd(), args)?;
+    match mode {
+        InitMode::Blank { requested } => init_blank(ui, command, requested).await,
+        InitMode::Import {
+            git_url,
+            directory,
+            name,
+        } => {
+            let derived = crate::repo::parse_repository_name(
+                name.clone()
+                    .unwrap_or_else(|| repository_name_from_url(&git_url)),
+            )?;
+            let requested = directory.unwrap_or_else(|| PathBuf::from(derived.as_str()));
+            let checkout_path = preflight_destination(command.cwd(), &requested)?;
+            let imported = import_git_repository(ui, command, git_url, name).await?;
+            let incomplete = format!(
+                "Repository `{}` was imported, but its first checkout at {} is incomplete.",
+                imported.name,
+                checkout_path.display()
+            );
+            add_checkout(
+                ui,
+                command,
+                AddArgs::for_init(&imported.name, checkout_path.clone()),
             )
-        })?;
+            .await
+            .map_err(|error| post_registration_error(error, &incomplete))?;
+            position_checkout(
+                command,
+                &imported.store,
+                &imported.entry,
+                &checkout_path,
+                &imported.head_branch,
+            )
+            .await
+            .map_err(|error| post_registration_error(user_error(error), &incomplete))?;
+            sync_repository(
+                &imported.config,
+                &imported.store,
+                &imported.entry,
+                command.settings(),
+            )
+            .await
+            .map_err(|error| post_registration_error(user_error(error), &incomplete))?;
+            crate::git_shim::ensure(&checkout_path);
+            imported.write_summary(ui)?;
+            writeln!(ui.status(), "Checkout: {}", checkout_path.display())?;
+            Ok(())
+        }
+    }
+}
 
-    let pending = create_cloud_repository(name.clone()).map_err(user_error)?;
-    failpoint(AFTER_CLOUD_REGISTRATION_FAILPOINT);
-    let incomplete = || {
-        format!(
-            "Repository `{name}` was created in the cloud. Clean it up with `ds repo`, then re-run `ds init`."
-        )
+pub(crate) struct ImportedRepository {
+    name: RepositoryName,
+    git_url: String,
+    head_branch: String,
+    fetched: Vec<String>,
+    store: MachineStore,
+    config: devspace_machine::MachineConfig,
+    entry: CatalogEntry,
+}
+
+impl ImportedRepository {
+    pub(crate) fn write_summary(&self, ui: &mut Ui) -> Result<(), CommandError> {
+        writeln!(ui.status(), "Repository: {}", self.name)?;
+        writeln!(ui.status(), "Remote: {ORIGIN} -> {}", self.git_url)?;
+        writeln!(
+            ui.status(),
+            "Fetched bookmarks: {}",
+            fetched_bookmarks(&self.fetched)
+        )?;
+        Ok(())
+    }
+}
+
+pub(crate) async fn import_git_repository(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    git_url: String,
+    requested_name: Option<String>,
+) -> Result<ImportedRepository, CommandError> {
+    reject_unsupported_global_options(command, "repo add")?;
+    crate::boundary_sync::suppress();
+    let name = crate::repo::parse_repository_name(
+        requested_name.unwrap_or_else(|| repository_name_from_url(&git_url)),
+    )?;
+    let remote_url = RemoteUrl::new(git_url.clone());
+    // Decide resume-vs-collision from the local catalog BEFORE any remote
+    // observation: a name collision must fail fast (and a resume proceed)
+    // without depending on the requested remote being reachable or sane.
+    let locally_registered = MachineStore::platform_default()
+        .map_err(display_error)?
+        .resolve(&name)
+        .map_err(display_error)?
+        .is_some_and(|entry| entry.native_repository_path.is_dir());
+    let observe_head = || {
+        devspace_machine::ls_remote_head(&remote_url, &GitProcessEnvironment::default())
+            .map_err(display_error)?
+            .ok_or_else(|| {
+                user_error(
+                    "The Git remote has no history yet; use `ds repo new` for a repository with no history yet.",
+                )
+            })
     };
-    let sync_guard = pending
-        .store
-        .try_lock_repository_sync(&pending.identity)
+    let (repository, head) = if locally_registered {
+        let repository =
+            resume_registered_import(&name, &git_url, crate::repo::name_taken_error(&name))?;
+        (repository, observe_head()?)
+    } else {
+        // The empty-remote preflight must precede cloud creation so a bad
+        // URL never mints a repository.
+        let head = observe_head()?;
+        let repository = match create_cloud_repository(name.clone()) {
+            Ok(pending) => ImportRepository::Pending(pending),
+            Err(error @ CloudRepositoryCreationError::NameTaken(_)) => {
+                resume_registered_import(&name, &git_url, error)?
+            }
+            Err(error) => return Err(user_error(error.to_string())),
+        };
+        (repository, head)
+    };
+    failpoint(AFTER_CLOUD_REGISTRATION_FAILPOINT);
+    let incomplete = format!(
+        "Repository `{name}` was created in the cloud, but its local Git import is incomplete."
+    );
+    let (store, config, identity) = match &repository {
+        ImportRepository::Pending(pending) => (&pending.store, &pending.config, &pending.identity),
+        ImportRepository::Registered {
+            store,
+            config,
+            entry,
+        } => (store, config, &entry.identity),
+    };
+    let sync_guard = store
+        .try_lock_repository_sync(identity)
         .map_err(|error| match error {
             MachineStoreError::RepositorySyncAlreadyLocked { .. } => post_registration_error(
                 user_error(format!(
-                    "Repository `{name}` is already being initialized or synchronized; retry after it finishes."
+                    "Repository `{name}` is already being imported or synchronized; retry after it finishes."
                 )),
-                &incomplete(),
+                &incomplete,
             ),
-            error => post_registration_error(display_error(error), &incomplete()),
+            error => post_registration_error(display_error(error), &incomplete),
         })?;
-
-    let provisional_entry = CatalogEntry {
-        name: name.clone(),
-        identity: pending.identity.clone(),
-        native_repository_path: pending.store.native_repository_path(&pending.identity),
+    let provisional_entry = match &repository {
+        ImportRepository::Pending(_) => CatalogEntry {
+            name: name.clone(),
+            identity: identity.clone(),
+            native_repository_path: store.native_repository_path(identity),
+        },
+        ImportRepository::Registered { entry, .. } => entry.clone(),
     };
-    crate::git::register_remote(&pending.config, &provisional_entry, ORIGIN, &args.git_url)
-        .map_err(|error| post_registration_error(error, &incomplete()))?;
-    let entry = materialize_cloud_repository(ui, command, &pending)
-        .await
-        .map_err(|error| post_registration_error(error, &incomplete()))?;
-
-    add_checkout(ui, command, AddArgs::for_init(&name, checkout_path.clone()))
-        .await
-        .map_err(|error| post_registration_error(error, &incomplete()))?;
-
-    sync_repository(&pending, &entry, command.settings())
-        .await
-        .map_err(|error| post_registration_error(user_error(error), &incomplete()))?;
+    crate::git::register_remote(config, &provisional_entry, ORIGIN, &git_url)
+        .map_err(|error| post_registration_error(error, &incomplete))?;
+    let entry = match &repository {
+        ImportRepository::Pending(pending) => materialize_cloud_repository(ui, command, pending)
+            .await
+            .map_err(|error| post_registration_error(error, &incomplete))?,
+        ImportRepository::Registered { entry, .. } => entry.clone(),
+    };
     let fetched = crate::git::fetch::fetch_entry(
         ui,
         command.settings(),
-        &pending.store,
+        store,
         &entry,
         Vec::new(),
         ORIGIN.to_owned(),
     )
     .await
-    .map_err(|error| post_registration_error(error, &incomplete()))?;
-    position_checkout(
-        command,
-        &pending.store,
-        &entry,
-        &checkout_path,
-        &head.branch,
-    )
-    .await
-    .map_err(|error| post_registration_error(user_error(error), &incomplete()))?;
-    sync_repository(&pending, &entry, command.settings())
+    .map_err(|error| post_registration_error(error, &incomplete))?;
+    sync_repository(config, store, &entry, command.settings())
         .await
-        .map_err(|error| post_registration_error(user_error(error), &incomplete()))?;
+        .map_err(|error| post_registration_error(user_error(error), &incomplete))?;
     drop(sync_guard);
-    crate::git_shim::ensure(&checkout_path);
+    let (store, config) = match repository {
+        ImportRepository::Pending(pending) => (pending.store, pending.config),
+        ImportRepository::Registered { store, config, .. } => (store, config),
+    };
+    Ok(ImportedRepository {
+        name,
+        git_url,
+        head_branch: head.branch,
+        fetched,
+        store,
+        config,
+        entry,
+    })
+}
 
-    writeln!(ui.status(), "Repository: {name}")?;
-    writeln!(ui.status(), "Remote: {ORIGIN} -> {}", args.git_url)?;
-    writeln!(
-        ui.status(),
-        "Fetched bookmarks: {}",
-        fetched_bookmarks(&fetched)
-    )?;
-    writeln!(ui.status(), "Checkout: {}", checkout_path.display())?;
-    Ok(())
+enum ImportRepository {
+    Pending(PendingRepositoryCreation),
+    Registered {
+        store: MachineStore,
+        config: devspace_machine::MachineConfig,
+        entry: CatalogEntry,
+    },
+}
+
+fn resume_registered_import(
+    name: &RepositoryName,
+    git_url: &str,
+    creation_error: CloudRepositoryCreationError,
+) -> Result<ImportRepository, CommandError> {
+    let store = MachineStore::platform_default().map_err(display_error)?;
+    let Some(entry) = store.resolve(name).map_err(display_error)? else {
+        return Err(user_error(creation_error.to_string()));
+    };
+    if !entry.native_repository_path.is_dir() {
+        return Err(user_error(creation_error.to_string()));
+    }
+    let config = store.load_config().map_err(display_error)?;
+    let remotes = crate::git::list_registered_remotes(&config, &entry)?;
+    match remotes.iter().find(|remote| remote.name == ORIGIN) {
+        Some(origin) if origin.url == git_url => Ok(ImportRepository::Registered {
+            store,
+            config,
+            entry,
+        }),
+        Some(origin) => Err(user_error(format!(
+            "{creation_error}; existing origin is {}",
+            origin.url
+        ))),
+        None => Err(user_error(creation_error.to_string())),
+    }
 }
 
 async fn sync_repository(
-    pending: &crate::repo::PendingRepositoryCreation,
+    config: &devspace_machine::MachineConfig,
+    store: &MachineStore,
     entry: &CatalogEntry,
     settings: &jj_lib::settings::UserSettings,
 ) -> Result<(), String> {
@@ -162,11 +287,11 @@ async fn sync_repository(
         .await
         .map_err(|error| error.to_string())?;
     crate::sync::run_sync_engine(
-        &pending.config,
+        config,
         &entry.identity,
         &mut repository,
-        &pending.store.repository_sync_path(&entry.identity),
-        &pending.store.repository_packs_path(&entry.identity),
+        &store.repository_sync_path(&entry.identity),
+        &store.repository_packs_path(&entry.identity),
     )
 }
 
@@ -183,6 +308,92 @@ fn repository_name_from_url(url: &str) -> String {
                 .unwrap_or_default()
         })
         .to_owned()
+}
+
+enum InitMode {
+    Blank {
+        requested: PathBuf,
+    },
+    Import {
+        git_url: String,
+        directory: Option<PathBuf>,
+        name: Option<String>,
+    },
+}
+
+fn classify_init(cwd: &Path, args: InitArgs) -> Result<InitMode, CommandError> {
+    match (args.source, args.directory) {
+        (None, None) => {
+            if args.name.is_some() {
+                return Err(user_error(
+                    "`ds init --name` requires a Git URL; blank repositories are named after their directory",
+                ));
+            }
+            Ok(InitMode::Blank {
+                requested: cwd.to_owned(),
+            })
+        }
+        (Some(source), Some(directory)) => Ok(InitMode::Import {
+            git_url: source,
+            directory: Some(directory),
+            name: args.name,
+        }),
+        (Some(source), None) if looks_like_git_remote(cwd, &source) => Ok(InitMode::Import {
+            git_url: source,
+            directory: None,
+            name: args.name,
+        }),
+        (Some(directory), None) => {
+            if args.name.is_some() {
+                return Err(user_error(
+                    "`ds init --name` requires a Git URL; blank repositories are named after their directory",
+                ));
+            }
+            Ok(InitMode::Blank {
+                requested: PathBuf::from(directory),
+            })
+        }
+        (None, Some(_)) => unreachable!("a second positional cannot exist without the first"),
+    }
+}
+
+fn looks_like_git_remote(cwd: &Path, value: &str) -> bool {
+    let path = absolute_path(cwd, Path::new(value));
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => fs::read_dir(&path)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(true),
+        Ok(_) => true,
+        Err(_) => {
+            value.contains("://")
+                || value.ends_with(".git")
+                || value
+                    .split_once(':')
+                    .is_some_and(|(host, path)| host.contains('@') && !path.is_empty())
+        }
+    }
+}
+
+async fn init_blank(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    requested: PathBuf,
+) -> Result<(), CommandError> {
+    let requested = absolute_path(command.cwd(), &requested);
+    let directory_name = requested
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| user_error("init directory has no UTF-8 directory name"))?;
+    let name = crate::repo::parse_repository_name(directory_name.to_owned())?;
+    let checkout_path = preflight_destination(command.cwd(), &requested)?;
+    let pending =
+        create_cloud_repository(name.clone()).map_err(|error| user_error(error.to_string()))?;
+    let entry = materialize_cloud_repository(ui, command, &pending).await?;
+    add_checkout(ui, command, AddArgs::for_init(&name, checkout_path.clone())).await?;
+    crate::boundary_sync::record(&entry);
+    writeln!(ui.status(), "Repository: {name}")?;
+    writeln!(ui.status(), "Checkout: {}", checkout_path.display())?;
+    Ok(())
 }
 
 fn preflight_destination(cwd: &Path, requested: &Path) -> Result<PathBuf, CommandError> {
@@ -219,33 +430,6 @@ fn preflight_destination(cwd: &Path, requested: &Path) -> Result<PathBuf, Comman
     }
     ensure_destination_parent(&requested)?;
     canonical_destination_path(&requested)
-}
-
-fn ensure_cloud_name_available(
-    store: &MachineStore,
-    name: &RepositoryName,
-) -> Result<(), CommandError> {
-    if store
-        .repository_creation_intent(name)
-        .map_err(display_error)?
-        .is_some()
-    {
-        return Ok(());
-    }
-    let config = store.load_config().map_err(display_error)?;
-    let client = ControlPlaneClient::new(&config).map_err(display_error)?;
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|_| user_error("failed to start the cloud transport runtime"))?;
-    match runtime.block_on(client.resolve_repository(name)) {
-        Ok(_) => Err(user_error(format!(
-            "Repository `{name}` is already registered in the cloud directory."
-        ))),
-        Err(ControlPlaneClientError::Remote {
-            kind: ControlPlaneRemoteErrorKind::RepositoryNotFound,
-            ..
-        }) => Ok(()),
-        Err(error) => Err(display_error(error)),
-    }
 }
 
 async fn position_checkout(

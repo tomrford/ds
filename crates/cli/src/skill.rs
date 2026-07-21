@@ -18,10 +18,12 @@ work in a Devspace checkout — both error; everything goes through `ds`.
   `ds git push -b <name>`
 - fetch collaborator work with `ds git fetch [--remote <name>] [-b <bookmark>]`
 - create another checkout with `ds add <repo> -r <revision> <path>`
+- list every workspace for this repository with `ds list`
 - remove a checkout, but retain its repository, with `ds remove <path>`
-- import a Git remote into a new Devspace repository with
-  `ds init <git-url> [<directory>]`
-- create an empty cloud repository with `ds repo new <name>`
+- import a Git remote without a checkout with `ds repo add <git-url>`
+- create a repository and its first checkout with `ds init [<git-url>] [<path>]`
+- create an empty cloud repository without a checkout with `ds repo new [<name>]`
+- inspect machine, cloud, daemon, Git and checkout health with `ds doctor`
 
 ## Private paths
 

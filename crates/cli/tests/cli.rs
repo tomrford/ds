@@ -279,7 +279,7 @@ fn root_help_is_devspace_first() {
         "{help}"
     );
     for command in [
-        "add", "init", "remove", "repo", "skill", "sync", "git", "status",
+        "add", "init", "list", "doctor", "remove", "repo", "skill", "sync", "git", "status",
     ] {
         assert!(
             help.lines()

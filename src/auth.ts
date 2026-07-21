@@ -13,7 +13,7 @@ export interface DevelopmentSecretEnv {
 
 type AuthenticationResult =
   | { ok: true; principal: AuthenticatedPrincipal }
-  | { ok: false; status: number; error: string };
+  | { ok: false; status: number; error: string; code?: string };
 
 /**
  * Development-only HTTP trust boundary. The shared secret selects one fixed
@@ -32,12 +32,17 @@ export async function authenticateDevelopmentRequest(
     expected.length === 0 ||
     !(await secretsMatch(provided, expected))
   ) {
-    return { ok: false, status: 401, error: "unauthorized" };
+    return { ok: false, status: 401, error: "unauthorized", code: "unauthorized" };
   }
 
   const machineId = request.headers.get("x-devspace-machine-id");
   if (machineId === null || !MACHINE_ID_PATTERN.test(machineId)) {
-    return { ok: false, status: 400, error: "invalid machine ID" };
+    return {
+      ok: false,
+      status: 400,
+      error: "invalid machine ID",
+      code: "invalid-machine-id",
+    };
   }
   const userId = env.DEVSPACE_DEVELOPMENT_USER_ID;
   if (!USER_ID_PATTERN.test(userId)) {

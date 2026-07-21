@@ -122,10 +122,27 @@ async fn init_materializes_history_tracks_head_round_trips_and_converges_a_secon
     let first_main = fixture.ds(&checkout, &["log", "-r", "main", "-T", "commit_id"]);
     assert_eq!(stdout(&second_main), stdout(&first_main));
 
+    let resumed_path = fixture.root.join("resumed");
+    let resumed = fixture.init(&remote, &resumed_path, None);
+    assert!(resumed.status.success(), "{}", stderr(&resumed));
+    assert_eq!(
+        fs::read(resumed_path.join("visible.txt")).unwrap(),
+        b"main\n"
+    );
+    assert_checkout_tracks_origin_head(&fixture, &resumed_path);
+
     let collision_path = fixture.root.join("collision");
-    let collision = fixture.init(&remote, &collision_path, None);
+    let collision = fixture.init(&collaborator, &collision_path, None);
     assert_eq!(collision.status.code(), Some(1));
-    assert!(stderr(&collision).contains("already registered in this machine's local catalog"));
+    assert!(
+        stderr(&collision).contains(&format!(
+            "repository-name-taken: repository {} already exists on this machine; existing origin is {}",
+            fixture.name,
+            remote.display()
+        )),
+        "{}",
+        stderr(&collision)
+    );
     assert!(!collision_path.exists());
 }
 
@@ -220,22 +237,21 @@ fn init_imports_deep_history_through_receipt_pages_and_retries_after_page_crash(
         .output()
         .unwrap();
     assert_eq!(failed.status.code(), Some(86), "{}", stderr(&failed));
+    assert!(!retry_checkout.exists());
 
-    let mut retried = ds_command(&retry_checkout, &retry_fixture.home, &retry_fixture.config);
+    let mut retried = retry_fixture.init_command(&retry_remote, &retry_checkout, None);
     let retried = retried
         .env("DEVSPACE_HTTP_TEST_HOOKS", "1")
         .env("DEVSPACE_TEST_RECEIPT_PAGE_SIZE", "16")
-        .args(["git", "fetch"])
         .output()
         .unwrap();
     assert!(retried.status.success(), "{}", stderr(&retried));
     assert_history_count(&retry_fixture, &retry_checkout, COMMITS);
-    let positioned = retry_fixture.ds(&retry_checkout, &["new", "main@origin"]);
-    assert!(positioned.status.success(), "{}", stderr(&positioned));
     assert_eq!(
         fs::read(retry_checkout.join("visible.txt")).unwrap(),
         b"history\n"
     );
+    assert_checkout_tracks_origin_head(&retry_fixture, &retry_checkout);
 }
 
 struct LiveFixture {
@@ -361,6 +377,24 @@ fn assert_history_count(fixture: &LiveFixture, checkout: &Path, expected: usize)
     );
     assert!(log.status.success(), "{}", stderr(&log));
     assert_eq!(stdout(&log).lines().count(), expected, "{}", stdout(&log));
+}
+
+fn assert_checkout_tracks_origin_head(fixture: &LiveFixture, checkout: &Path) {
+    let working_copy_parent = fixture.ds(
+        checkout,
+        &["log", "--no-graph", "-r", "@-", "-T", "commit_id"],
+    );
+    assert!(
+        working_copy_parent.status.success(),
+        "{}",
+        stderr(&working_copy_parent)
+    );
+    let origin_head = fixture.ds(
+        checkout,
+        &["log", "--no-graph", "-r", "main@origin", "-T", "commit_id"],
+    );
+    assert!(origin_head.status.success(), "{}", stderr(&origin_head));
+    assert_eq!(stdout(&working_copy_parent), stdout(&origin_head));
 }
 
 fn git_ls_files(checkout: &Path) -> Vec<String> {

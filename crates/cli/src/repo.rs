@@ -2,17 +2,20 @@ use std::io::Write as _;
 
 use devspace_machine::{
     CatalogEntry, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
-    MachineConfig, MachineStore, RepositoryCreationIntent, RepositoryCreationKey,
-    RepositoryCreationTarget, RepositoryIdentity, RepositoryName,
+    MachineConfig, MachineStore, RepositoryCreationIntent, RepositoryCreationIntentError,
+    RepositoryCreationKey, RepositoryCreationTarget, RepositoryIdentity, RepositoryName,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
+use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
 use crate::add::{AddArgs, add_checkout};
 use crate::context::{ContextArgs, run_context};
 use crate::daemon::{DaemonArgs, run_daemon};
-use crate::init::{InitArgs, init_repository};
+use crate::doctor::run_doctor;
+use crate::init::{InitArgs, import_git_repository, init_repository};
+use crate::list::list_workspaces;
 use crate::remove::{RemoveArgs, remove_checkout};
 use crate::skill::{SkillArgs, print_skill};
 use crate::sync::{SyncArgs, run_sync};
@@ -23,6 +26,10 @@ pub(crate) enum DevspaceCommand {
     Add(AddArgs),
     /// Initialize a Devspace repository from a Git remote.
     Init(InitArgs),
+    /// List every workspace of the current repository.
+    List,
+    /// Check this machine's Devspace setup.
+    Doctor,
     /// Pin read-only Git reference repos under .repos/.
     Context(ContextArgs),
     /// Remove a disposable checkout while preserving its repository.
@@ -46,7 +53,17 @@ pub(crate) struct RepoArgs {
 #[derive(clap::Subcommand)]
 enum RepoCommand {
     /// Create an empty repository in the cloud and on this machine.
-    New { name: String },
+    New { name: Option<String> },
+    /// Import a Git remote into the cloud without creating a checkout.
+    Add {
+        git_url: String,
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Rename a cloud repository and its local catalog entry.
+    Rename { old: String, new: String },
+    /// List active cloud repositories.
+    List,
 }
 
 pub(crate) async fn run(
@@ -57,15 +74,15 @@ pub(crate) async fn run(
     match args {
         DevspaceCommand::Add(args) => add_checkout(ui, command, args).await,
         DevspaceCommand::Init(args) => init_repository(ui, command, args).await,
+        DevspaceCommand::List => list_workspaces(ui, command).await,
+        DevspaceCommand::Doctor => run_doctor(ui, command).await,
         DevspaceCommand::Context(args) => run_context(ui, command, args).await,
         DevspaceCommand::Remove(args) => remove_checkout(ui, command, args).await,
         DevspaceCommand::Daemon(args) => {
             crate::boundary_sync::suppress();
             run_daemon(ui, command, args).await
         }
-        DevspaceCommand::Repo(RepoArgs {
-            command: RepoCommand::New { name },
-        }) => create_empty_repository(ui, command, name).await,
+        DevspaceCommand::Repo(args) => run_repo(ui, command, args).await,
         DevspaceCommand::Skill(args) => print_skill(ui, args),
         DevspaceCommand::Sync(args) => {
             crate::boundary_sync::suppress();
@@ -74,18 +91,74 @@ pub(crate) async fn run(
     }
 }
 
+async fn run_repo(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: RepoArgs,
+) -> Result<(), CommandError> {
+    match args.command {
+        RepoCommand::New { name } => create_empty_repository(ui, command, name).await,
+        RepoCommand::Add { git_url, name } => {
+            let imported = import_git_repository(ui, command, git_url, name).await?;
+            imported.write_summary(ui)
+        }
+        RepoCommand::Rename { old, new } => rename_repository(ui, old, new),
+        RepoCommand::List => list_repositories(ui, command).await,
+    }
+}
+
 async fn create_empty_repository(
     ui: &mut Ui,
     command: &CommandHelper,
-    name: String,
+    requested_name: Option<String>,
 ) -> Result<(), CommandError> {
-    let name = RepositoryName::parse(name).map_err(|error| user_error(error.to_string()))?;
-    let pending = create_cloud_repository(name).map_err(|error| user_error(error.to_string()))?;
+    const DEFAULT_NAME: &str = "new-repo";
+    const MAX_DEFAULT_ATTEMPTS: usize = 20;
+    let explicit = requested_name.is_some();
+    let base = requested_name.unwrap_or_else(|| DEFAULT_NAME.to_owned());
+    let mut pending = None;
+    for attempt in 1..=MAX_DEFAULT_ATTEMPTS {
+        let candidate = if attempt == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let name = parse_repository_name(candidate)?;
+        match create_cloud_repository(name) {
+            Ok(created) => {
+                pending = Some(created);
+                break;
+            }
+            Err(CloudRepositoryCreationError::NameTaken(error)) if !explicit => {
+                if attempt == MAX_DEFAULT_ATTEMPTS {
+                    return Err(user_error(format!(
+                        "{error}; exhausted {MAX_DEFAULT_ATTEMPTS} default repository names"
+                    )));
+                }
+            }
+            Err(error) => return Err(user_error(error.to_string())),
+        }
+    }
+    let pending = pending.expect("bounded creation loop returns or records a repository");
     let entry = materialize_cloud_repository(ui, command, &pending).await?;
     crate::boundary_sync::record(&entry);
 
     writeln!(ui.status(), "Created repository `{}`.", entry.name)?;
     Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) enum CloudRepositoryCreationError {
+    NameTaken(String),
+    Other(String),
+}
+
+impl std::fmt::Display for CloudRepositoryCreationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NameTaken(message) | Self::Other(message) => formatter.write_str(message),
+        }
+    }
 }
 
 pub(crate) struct PendingRepositoryCreation {
@@ -95,16 +168,32 @@ pub(crate) struct PendingRepositoryCreation {
     pub identity: RepositoryIdentity,
 }
 
+pub(crate) fn name_taken_error(name: &RepositoryName) -> CloudRepositoryCreationError {
+    CloudRepositoryCreationError::NameTaken(format!(
+        "repository-name-taken: repository {name} already exists on this machine"
+    ))
+}
+
 pub(crate) fn create_cloud_repository(
     name: RepositoryName,
-) -> Result<PendingRepositoryCreation, String> {
-    let store = MachineStore::platform_default().map_err(|error| error.to_string())?;
-    let config = store.load_config().map_err(|error| error.to_string())?;
-    let client = ControlPlaneClient::new(&config).map_err(|error| error.to_string())?;
+) -> Result<PendingRepositoryCreation, CloudRepositoryCreationError> {
+    let other = |message| CloudRepositoryCreationError::Other(message);
+    let store = MachineStore::platform_default().map_err(|error| other(error.to_string()))?;
+    let config = store
+        .load_config()
+        .map_err(|error| other(error.to_string()))?;
+    let client = ControlPlaneClient::new(&config).map_err(|error| other(error.to_string()))?;
     let target = RepositoryCreationTarget::from_config(&config);
     let mut intent = store
-        .begin_repository_creation(name.clone(), target.clone(), new_creation_key()?)
-        .map_err(|error| error.to_string())?;
+        .begin_repository_creation(
+            name.clone(),
+            target.clone(),
+            new_creation_key().map_err(other)?,
+        )
+        .map_err(|error| match error {
+            RepositoryCreationIntentError::AlreadyRegistered(_) => name_taken_error(&name),
+            error => other(error.to_string()),
+        })?;
 
     let identity = if let Some(identity) = intent.identity() {
         identity.clone()
@@ -113,7 +202,7 @@ pub(crate) fn create_cloud_repository(
         // reactor, so own that narrow transport runtime here rather than making
         // the embedded command runner or machine-store work Tokio-specific.
         let runtime = tokio::runtime::Runtime::new()
-            .map_err(|_| "failed to start the cloud transport runtime".to_owned())?;
+            .map_err(|_| other("failed to start the cloud transport runtime".to_owned()))?;
         let mut retirement_retry_available = true;
         loop {
             if let Some(identity) = intent.identity() {
@@ -123,7 +212,7 @@ pub(crate) fn create_cloud_repository(
                 Ok(repository) => {
                     intent = store
                         .record_repository_created(&intent, repository.identity)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| other(error.to_string()))?;
                 }
                 Err(error) => {
                     let terminal_kind = match &error {
@@ -137,16 +226,16 @@ pub(crate) fn create_cloud_repository(
                         ) => {
                             store
                                 .discard_repository_creation(&intent)
-                                .map_err(|error| error.to_string())?;
+                                .map_err(|error| other(error.to_string()))?;
                             if retirement_retry_available {
                                 retirement_retry_available = false;
                                 intent = store
                                     .begin_repository_creation(
                                         name.clone(),
                                         target.clone(),
-                                        new_creation_key()?,
+                                        new_creation_key().map_err(other)?,
                                     )
-                                    .map_err(|error| error.to_string())?;
+                                    .map_err(|error| other(error.to_string()))?;
                                 continue;
                             }
                         }
@@ -156,7 +245,7 @@ pub(crate) fn create_cloud_repository(
                         ) => {
                             store
                                 .discard_repository_creation(&intent)
-                                .map_err(|error| error.to_string())?;
+                                .map_err(|error| other(error.to_string()))?;
                         }
                         Some(
                             ControlPlaneRemoteErrorKind::RepositoryNotFound
@@ -164,7 +253,10 @@ pub(crate) fn create_cloud_repository(
                         )
                         | None => {}
                     }
-                    return Err(error.to_string());
+                    if terminal_kind == Some(ControlPlaneRemoteErrorKind::RepositoryNameInUse) {
+                        return Err(CloudRepositoryCreationError::NameTaken(error.to_string()));
+                    }
+                    return Err(other(error.to_string()));
                 }
             }
         }
@@ -176,6 +268,154 @@ pub(crate) fn create_cloud_repository(
         intent,
         identity,
     })
+}
+
+pub(crate) fn parse_repository_name(value: String) -> Result<RepositoryName, CommandError> {
+    RepositoryName::parse(value)
+        .map_err(|error| user_error(format!("invalid-repository-name: {error}")))
+}
+
+fn rename_repository(ui: &mut Ui, old: String, new: String) -> Result<(), CommandError> {
+    let old = parse_repository_name(old)?;
+    let new = parse_repository_name(new)?;
+    let store = MachineStore::platform_default().map_err(display_error)?;
+    let config = store.load_config().map_err(display_error)?;
+    let client = ControlPlaneClient::new(&config).map_err(display_error)?;
+    let local_old = store.resolve(&old).map_err(display_error)?;
+    let local_new = store.resolve(&new).map_err(display_error)?;
+    let runtime = cloud_runtime()?;
+    let cloud = match runtime.block_on(client.rename_repository(&old, &new)) {
+        Ok(repository) => repository,
+        Err(ControlPlaneClientError::Remote {
+            kind: ControlPlaneRemoteErrorKind::RepositoryNotFound,
+            ..
+        }) => {
+            let resolved = runtime.block_on(client.resolve_repository(&new));
+            match resolved {
+                Ok(repository)
+                    if local_old
+                        .as_ref()
+                        .or(local_new.as_ref())
+                        .is_some_and(|entry| entry.identity == repository.identity) =>
+                {
+                    repository
+                }
+                _ => {
+                    return Err(user_error(format!(
+                        "repository-not-found: repository `{old}` was not found in the control plane"
+                    )));
+                }
+            }
+        }
+        Err(error) => return Err(display_error(error)),
+    };
+
+    if let Some(entry) = local_old {
+        store
+            .rename_repository(&old, cloud.name.clone(), &entry.identity)
+            .map_err(display_error)?;
+    } else if let Some(entry) = local_new
+        && entry.identity != cloud.identity
+    {
+        return Err(user_error(format!(
+            "Local repository `{new}` has a different cloud identity; the cloud rename succeeded but the local catalog was not changed."
+        )));
+    }
+    writeln!(ui.status(), "Renamed repository `{old}` to `{new}`.")?;
+    Ok(())
+}
+
+async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), CommandError> {
+    let store = MachineStore::platform_default().map_err(display_error)?;
+    let config = store.load_config().map_err(display_error)?;
+    let client = ControlPlaneClient::new(&config).map_err(display_error)?;
+    let repositories = cloud_runtime()?
+        .block_on(client.list_repositories())
+        .map_err(|error| match error {
+            ControlPlaneClientError::Request(_) => user_error(
+                "control-plane-unreachable: cannot list repositories while the control plane is offline",
+            ),
+            error => display_error(error),
+        })?;
+    let mut local = store.entries().map_err(display_error)?;
+    for repository in repositories {
+        let matching = local
+            .iter()
+            .position(|entry| entry.identity == repository.identity);
+        let Some(index) = matching else {
+            writeln!(ui.stdout(), "{}", repository.name)?;
+            continue;
+        };
+        if local[index].name != repository.name {
+            let old_name = local[index].name.clone();
+            local[index] = store
+                .rename_repository(&old_name, repository.name.clone(), &repository.identity)
+                .map_err(|error| {
+                    user_error(format!(
+                        "local-catalog-rename-failed: cloud calls this repository `{}`, but the local catalog could not self-heal: {error}",
+                        repository.name
+                    ))
+                })?;
+        }
+        let paths = registered_checkout_paths(&local[index], command).await?;
+        if paths.is_empty() {
+            writeln!(ui.stdout(), "{} (local)", repository.name)?;
+        } else {
+            writeln!(
+                ui.stdout(),
+                "{} (local: {})",
+                repository.name,
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn registered_checkout_paths(
+    entry: &CatalogEntry,
+    command: &CommandHelper,
+) -> Result<Vec<std::path::PathBuf>, CommandError> {
+    if !entry.native_repository_path.exists() {
+        return Ok(Vec::new());
+    }
+    let repository = devspace_machine::MachineRepository::open(
+        &entry.native_repository_path,
+        command.settings(),
+    )
+    .await
+    .map_err(display_error)?;
+    let workspace_store = SimpleWorkspaceStore::load(&entry.native_repository_path)
+        .map_err(|error| user_error(error.to_string()))?;
+    let mut paths = Vec::new();
+    for workspace in repository.repo().view().wc_commit_ids().keys() {
+        if let Some(path) = workspace_store
+            .get_workspace_path(workspace)
+            .map_err(|error| user_error(error.to_string()))?
+        {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                entry.native_repository_path.join(path)
+            };
+            paths.push(dunce::canonicalize(&path).unwrap_or(path));
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn cloud_runtime() -> Result<tokio::runtime::Runtime, CommandError> {
+    tokio::runtime::Runtime::new()
+        .map_err(|_| user_error("failed to start the cloud transport runtime"))
+}
+
+fn display_error(error: impl std::fmt::Display) -> CommandError {
+    user_error(error.to_string())
 }
 
 pub(crate) async fn materialize_cloud_repository(

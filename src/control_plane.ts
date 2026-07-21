@@ -14,6 +14,7 @@ const createRepositorySchema = z.strictObject({
   name: repositoryNameSchema,
   idempotencyKey: idempotencyKeySchema,
 });
+const renameRepositorySchema = z.strictObject({ newName: repositoryNameSchema });
 const deleteRepositorySchema = z.strictObject({
   name: repositoryNameSchema,
   repositoryId: repositoryIdSchema,
@@ -21,14 +22,14 @@ const deleteRepositorySchema = z.strictObject({
 });
 const PROVISIONAL_RETENTION_MS = 24 * 60 * 60 * 1_000;
 const RETIREMENT_RECOVERY_BATCH = 64;
-const NAME_IN_USE = "name-in-use";
+const REPOSITORY_NAME_TAKEN = "repository-name-taken";
 const CREATION_RETIRED = "creation-retired";
 const CREATION_RETIRING = "creation-retiring";
 const IDEMPOTENCY_KEY_REUSED = "idempotency-key-reused";
 const REPOSITORY_NOT_FOUND = "repository-not-found";
 
 type ControlPlaneErrorCode =
-  | typeof NAME_IN_USE
+  | typeof REPOSITORY_NAME_TAKEN
   | typeof CREATION_RETIRED
   | typeof CREATION_RETIRING
   | typeof IDEMPOTENCY_KEY_REUSED
@@ -196,7 +197,11 @@ export class ControlPlane extends DurableObject<Env> {
           )
           .one().count;
         if (occupied !== 0) {
-          throw new ControlPlaneError("repository name is already in use", 409, NAME_IN_USE);
+          throw new ControlPlaneError(
+            "repository name is already in use",
+            409,
+            REPOSITORY_NAME_TAKEN,
+          );
         }
 
         const repositoryId = this.env.REPOSITORIES.newUniqueId().toString();
@@ -299,6 +304,96 @@ export class ControlPlane extends DurableObject<Env> {
       repositoryId: repository.repository_id,
       incarnation: repository.incarnation,
     };
+  }
+
+  listRepositories(identityValue: unknown) {
+    let identity: AuthenticatedPrincipal;
+    try {
+      identity = decodeIdentity(identityValue);
+    } catch (error) {
+      return failure(error, 400);
+    }
+    const repositories = this.ctx.storage.sql
+      .exec<RepositoryRow>(
+        `SELECT repository_id, user_id, name, incarnation, status FROM repositories
+         WHERE user_id = ? AND status = 'active' ORDER BY name`,
+        identity.userId,
+      )
+      .toArray()
+      .map((repository) => ({
+        name: repository.name,
+        repositoryId: repository.repository_id,
+        incarnation: repository.incarnation,
+      }));
+    return { ok: true as const, repositories };
+  }
+
+  renameRepository(identityValue: unknown, oldNameValue: unknown, value: unknown) {
+    let identity: AuthenticatedPrincipal;
+    let oldName: string;
+    let request: { newName: string };
+    try {
+      identity = decodeIdentity(identityValue);
+      oldName = requireRepositoryName(oldNameValue);
+      request = renameRepositorySchema.parse(value);
+    } catch (error) {
+      return failure(error, 400);
+    }
+    try {
+      return this.ctx.storage.transactionSync(() => {
+        const repository = this.ctx.storage.sql
+          .exec<RepositoryRow>(
+            `SELECT repository_id, user_id, name, incarnation, status FROM repositories
+             WHERE user_id = ? AND name = ? AND status = 'active'`,
+            identity.userId,
+            oldName,
+          )
+          .toArray()[0];
+        if (repository === undefined) {
+          throw new ControlPlaneError("repository not found", 404, REPOSITORY_NOT_FOUND);
+        }
+        if (oldName === request.newName) {
+          return creationSuccess(
+            { ...identity, repositoryId: repository.repository_id, incarnation: repository.incarnation },
+            oldName,
+          );
+        }
+        const occupied = this.ctx.storage.sql
+          .exec<{ count: number }>(
+            `SELECT count(*) AS count FROM repositories
+             WHERE user_id = ? AND name = ? AND status != 'deleted'`,
+            identity.userId,
+            request.newName,
+          )
+          .one().count;
+        if (occupied !== 0) {
+          throw new ControlPlaneError(
+            "repository name is already in use",
+            409,
+            REPOSITORY_NAME_TAKEN,
+          );
+        }
+        const changed = this.ctx.storage.sql
+          .exec<{ repository_id: string }>(
+            `UPDATE repositories SET name = ?
+             WHERE user_id = ? AND repository_id = ? AND status = 'active'
+             RETURNING repository_id`,
+            request.newName,
+            identity.userId,
+            repository.repository_id,
+          )
+          .toArray();
+        if (changed.length !== 1) {
+          throw new Error("repository rename did not change exactly one active row");
+        }
+        return creationSuccess(
+          { ...identity, repositoryId: repository.repository_id, incarnation: repository.incarnation },
+          request.newName,
+        );
+      });
+    } catch (error) {
+      return expectedFailure(error);
+    }
   }
 
   /** Test-only lifecycle seam. It has no Worker route. */

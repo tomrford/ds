@@ -8,7 +8,7 @@ use std::path::Path;
 use clap::parser::ValueSource;
 use devspace_machine::{
     CatalogEntry, GitOid, GitProjection, HttpTransport, LowerHexError, MachineRepository,
-    MachineStore, RepositorySyncGuard, decode_lower_hex,
+    MachineStore, RegisteredRemote, RepositorySyncGuard, decode_lower_hex,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -183,8 +183,19 @@ async fn remote_list(ui: &mut Ui, command: &CommandHelper) -> Result<(), Command
     let entry = checkout_entry(ui, command).await?;
     let store = MachineStore::platform_default().map_err(display_error)?;
     let config = store.load_config().map_err(display_error)?;
+    let remotes = list_registered_remotes(&config, &entry)?;
+    for remote in remotes {
+        writeln!(ui.stdout(), "{} {}", remote.name, remote.url)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn list_registered_remotes(
+    config: &devspace_machine::MachineConfig,
+    entry: &CatalogEntry,
+) -> Result<Vec<RegisteredRemote>, CommandError> {
     let transport = HttpTransport::new(
-        &config,
+        config,
         entry.identity.repository_id.as_str(),
         parse_hex(
             entry.identity.incarnation.as_str(),
@@ -195,10 +206,7 @@ async fn remote_list(ui: &mut Ui, command: &CommandHelper) -> Result<(), Command
     let remotes = cloud_runtime()?
         .block_on(transport.list_remotes())
         .map_err(display_error)?;
-    for remote in remotes {
-        writeln!(ui.stdout(), "{} {}", remote.name, remote.url)?;
-    }
-    Ok(())
+    Ok(remotes)
 }
 
 async fn checkout_entry(ui: &Ui, command: &CommandHelper) -> Result<CatalogEntry, CommandError> {

@@ -122,6 +122,43 @@ fn catalog_rejects_conflicting_names_identities_and_stale_incarnations() {
     assert!(store.resolve(&first_name).unwrap().is_none());
 }
 
+#[test]
+fn catalog_rename_is_atomic_idempotent_and_identity_checked() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = MachineStore::new(temp.path());
+    let old_name = name("rename-old");
+    let new_name = name("rename-new");
+    let current = identity(0x21, 0x22);
+    let occupied = identity(0x31, 0x32);
+    store
+        .register_repository(old_name.clone(), current.clone())
+        .unwrap();
+    store
+        .register_repository(name("occupied"), occupied)
+        .unwrap();
+
+    assert!(matches!(
+        store.rename_repository(&old_name, name("occupied"), &current),
+        Err(MachineStoreError::ConflictingName { .. })
+    ));
+    assert!(matches!(
+        store.rename_repository(&old_name, new_name.clone(), &identity(0x21, 0x23)),
+        Err(MachineStoreError::StaleRename { .. })
+    ));
+    let renamed = store
+        .rename_repository(&old_name, new_name.clone(), &current)
+        .unwrap();
+    assert_eq!(renamed.name, new_name);
+    assert!(store.resolve(&old_name).unwrap().is_none());
+    assert_eq!(store.resolve(&new_name).unwrap(), Some(renamed.clone()));
+    assert_eq!(
+        store
+            .rename_repository(&new_name, new_name.clone(), &current)
+            .unwrap(),
+        renamed
+    );
+}
+
 #[tokio::test]
 async fn materialization_requires_the_current_binding_and_unregister_does_not_prune() {
     let temp = tempfile::tempdir().unwrap();

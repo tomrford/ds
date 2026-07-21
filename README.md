@@ -94,11 +94,11 @@ a short daemon `ping`; it never contacts the Worker. `ds sync run --repository
 <name>` remains the plumbing command used by degraded boundary sync and manual
 recovery.
 
-`ds repo new` requires connectivity because reserving a tenant-local name is a
-global operation on the directory. Offline repository creation is outside the
-current boundary; names are directory bindings rather than repository
-identities, so a future offline path can create under a provisional local
-identity and bind the name at first contact.
+`ds repo new`, `ds repo add`, `ds repo rename` and `ds repo list` require
+connectivity. They reserve, import, rename or list tenant-local directory
+entries. `ds init` also requires connectivity because it composes repository
+creation or import with a first checkout. Existing checkout work, including
+`ds list`, remains local and offline.
 
 The native machine crate initializes and reloads stock jj repositories. It
 rejects repositories whose backend, operation store, operation-head store,
@@ -121,7 +121,7 @@ data directory and Windows uses the local application-data directory.
 `DEVSPACE_MACHINE_STORE_DIR` is a bring-up and test-only root override.
 
 The `ds` binary embeds jj-cli 0.42 as its parser and command engine. `ds repo
-new <name>` durably records a random 128-bit idempotency key before claiming the
+new [<name>]` durably records a random 128-bit idempotency key before claiming the
 cloud name. A retry replays only that exact request, persists the returned
 opaque identity, registers it in the catalog and atomically publishes an empty
 stock-format bare repository. Network, authentication and server failures leave

@@ -36,7 +36,9 @@ export default {
 
 async function route(request: Request, env: WorkerEnv): Promise<Response> {
     const authentication = await authenticateDevelopmentRequest(request, env);
-    if (!authentication.ok) return errorResponse(authentication.status, authentication.error);
+    if (!authentication.ok) {
+      return errorResponse(authentication.status, authentication.error, authentication.code);
+    }
     const principal = authentication.principal;
     const control = env.CONTROL_PLANE.getByName(CONTROL_PLANE_NAME);
     const url = new URL(request.url);
@@ -81,13 +83,26 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
         if (body instanceof Response) return body;
         return rpcResponse(await control.createRepository(principal, body));
       }
+      if (url.pathname === "/repositories" && request.method === "GET") {
+        return rpcResponse(await control.listRepositories(principal));
+      }
       if (directoryMatch !== null) {
         const name = directoryMatch[1];
         if (!repositoryNameSchema.safeParse(name).success) {
-          return errorResponse(400, "invalid repository name");
+          return errorResponse(400, "invalid repository name", "invalid-repository-name");
         }
         if (request.method === "GET") {
           return rpcResponse(await control.resolveRepository(principal, name));
+        }
+        if (request.method === "PATCH") {
+          const body = await readJsonBody(
+            request,
+            DIRECTORY_REQUEST_BYTES,
+            "repository rename request",
+            "invalid-repository-rename-request",
+          );
+          if (body instanceof Response) return body;
+          return rpcResponse(await control.renameRepository(principal, name, body));
         }
         if (request.method === "DELETE") {
           const body = await readJsonBody(request, DIRECTORY_REQUEST_BYTES, "repository deletion request");

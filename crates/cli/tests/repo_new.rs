@@ -591,7 +591,7 @@ fn repo_new_discards_a_name_conflict_and_can_create_after_the_name_is_freed() {
             respond(
                 stream,
                 "409 Conflict",
-                r#"{"error":"repository name is already in use","code":"name-in-use"}"#,
+                r#"{"error":"repository name is already in use","code":"repository-name-taken"}"#,
             );
         } else {
             respond(stream, "200 OK", &response);

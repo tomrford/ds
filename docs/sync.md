@@ -13,9 +13,12 @@ local machine repository or resolves and clones it on first use. `ds remove`
 discards a checkout while retaining its machine repository. `ds git fetch` and
 `ds git push` own the explicit public Git boundary.
 
-Two creation commands are online-only: `ds repo new <name>` creates an empty
-cloud repository, and `ds init <git-url> [<directory>]` creates one by importing
-an existing Git remote. `ds init` does not convert a local Git working copy.
+Repository directory commands are online-only. `ds repo new [<name>]` creates
+an empty cloud repository. `ds repo add <git-url> [--name <name>]` imports a Git
+remote without a checkout. `ds repo rename` and `ds repo list` update or read
+the cloud directory. `ds init [<git-url>] [<directory>]` composes repository
+creation or import with a first checkout. It does not convert a local Git
+working copy.
 
 ## Native repository boundary
 
@@ -242,7 +245,7 @@ key for another name fails. Activation is a compare-and-set transition from
 provisional to active; a receipt whose repository is retiring or deleted can
 never reactivate it.
 
-`ds repo new <name>` writes its name, control-plane target, machine ID and
+`ds repo new [<name>]` writes its name, control-plane target, machine ID and
 random 128-bit key to the machine-store creation journal before sending that
 request. A lost response reuses the recorded key. Once a response is available,
 the command durably records its opaque repository ID and incarnation before

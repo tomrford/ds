@@ -378,6 +378,47 @@ impl MachineStore {
         })
     }
 
+    pub fn rename_repository(
+        &self,
+        old_name: &RepositoryName,
+        new_name: RepositoryName,
+        expected: &RepositoryIdentity,
+    ) -> Result<CatalogEntry, MachineStoreError> {
+        self.with_catalog_lock(true, |catalog| {
+            let persisted = catalog
+                .repositories
+                .get(old_name.as_str())
+                .ok_or_else(|| MachineStoreError::RepositoryNotRegistered(old_name.clone()))?;
+            let registered = parse_identity(persisted)?;
+            if &registered != expected {
+                return Err(MachineStoreError::StaleRename {
+                    name: old_name.clone(),
+                    registered,
+                    requested: expected.clone(),
+                });
+            }
+            if old_name == &new_name {
+                return Ok(self.entry(new_name, expected.clone()));
+            }
+            if let Some(occupied) = catalog.repositories.get(new_name.as_str()) {
+                return Err(MachineStoreError::ConflictingName {
+                    name: new_name,
+                    registered: parse_identity(occupied)?,
+                    requested: expected.clone(),
+                });
+            }
+            let persisted = catalog
+                .repositories
+                .remove(old_name.as_str())
+                .expect("registered repository remains present under the catalog lock");
+            catalog
+                .repositories
+                .insert(new_name.as_str().to_owned(), persisted);
+            self.persist_catalog(catalog)?;
+            Ok(self.entry(new_name, expected.clone()))
+        })
+    }
+
     pub async fn materialize_repository(
         &self,
         name: &RepositoryName,
@@ -752,6 +793,14 @@ pub enum MachineStoreError {
         "repository {name} cannot be unregistered as {requested:?}; the catalog contains {registered:?}"
     )]
     StaleRemoval {
+        name: RepositoryName,
+        registered: RepositoryIdentity,
+        requested: RepositoryIdentity,
+    },
+    #[error(
+        "repository {name} cannot be renamed as {requested:?}; the catalog contains {registered:?}"
+    )]
+    StaleRename {
         name: RepositoryName,
         registered: RepositoryIdentity,
         requested: RepositoryIdentity,

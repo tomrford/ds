@@ -71,7 +71,7 @@ describe("cloud identity and repository directory", () => {
       }),
     );
     expect(missing.status).toBe(401);
-    expect(await missing.json()).toEqual({ error: "unauthorized" });
+    expect(await missing.json()).toEqual({ error: "unauthorized", code: "unauthorized" });
 
     const invalid = await exports.default.fetch(
       new Request("https://example.com/repositories/test", {
@@ -82,11 +82,14 @@ describe("cloud identity and repository directory", () => {
       }),
     );
     expect(invalid.status).toBe(401);
-    expect(await invalid.json()).toEqual({ error: "unauthorized" });
+    expect(await invalid.json()).toEqual({ error: "unauthorized", code: "unauthorized" });
 
     const malformedMachine = await apiRequest("not-a-machine", "/repositories/test");
     expect(malformedMachine.status).toBe(400);
-    expect(await malformedMachine.json()).toEqual({ error: "invalid machine ID" });
+    expect(await malformedMachine.json()).toEqual({
+      error: "invalid machine ID",
+      code: "invalid-machine-id",
+    });
   });
 
   it("does not let request fields or headers select a user", async () => {
@@ -158,8 +161,71 @@ describe("cloud identity and repository directory", () => {
     expect(nameConflict.status).toBe(409);
     expect(await nameConflict.json()).toEqual({
       error: "repository name is already in use",
-      code: "name-in-use",
+      code: "repository-name-taken",
     });
+  });
+
+  it("lists only active repositories and requires authentication", async () => {
+    const machineId = "47".repeat(16);
+    const active = await createRepository(machineId, "listed-active", "47".repeat(16));
+    const retired = await createRepository(machineId, "listed-retired", "48".repeat(16));
+    const control = env.CONTROL_PLANE.getByName("directory");
+    expect(
+      await control.beginTestRepositoryRetirement(
+        { userId: env.DEVSPACE_DEVELOPMENT_USER_ID, machineId },
+        retired.repositoryId,
+      ),
+    ).toEqual({ ok: true, retiring: true });
+
+    const response = await apiRequest(machineId, "/repositories");
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { repositories: Array<{ name: string }> };
+    expect(body.repositories).toEqual(expect.arrayContaining([active]));
+    expect(body.repositories.map((repository) => repository.name)).not.toContain(
+      "listed-retired",
+    );
+    const unauthorized = await exports.default.fetch(
+      new Request("https://example.com/repositories"),
+    );
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).toEqual({ error: "unauthorized", code: "unauthorized" });
+  });
+
+  it("renames repositories, rejects collisions, and frees the old name", async () => {
+    const machineId = "49".repeat(16);
+    const renamed = await createRepository(machineId, "rename-source", "49".repeat(16));
+    await createRepository(machineId, "rename-taken", "4a".repeat(16));
+
+    const collision = await apiRequest(machineId, "/repositories/rename-source", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ newName: "rename-taken" }),
+    });
+    expect(collision.status).toBe(409);
+    expect(await collision.json()).toEqual({
+      error: "repository name is already in use",
+      code: "repository-name-taken",
+    });
+
+    const response = await apiRequest(machineId, "/repositories/rename-source", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ newName: "rename-target" }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ...renamed, name: "rename-target" });
+    expect((await apiRequest(machineId, "/repositories/rename-source")).status).toBe(404);
+
+    const noOp = await apiRequest(machineId, "/repositories/rename-target", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ newName: "rename-target" }),
+    });
+    expect(noOp.status).toBe(200);
+    expect(await noOp.json()).toEqual({ ...renamed, name: "rename-target" });
+
+    const replacement = await createRepository(machineId, "rename-source", "4b".repeat(16));
+    expect(replacement.repositoryId).not.toBe(renamed.repositoryId);
   });
 
   it("recovers a persisted retirement before recreating its name", async () => {

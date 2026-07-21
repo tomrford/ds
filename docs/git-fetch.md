@@ -18,30 +18,38 @@ names. With no bookmark arguments, fetch imports every advertised remote head.
 The command runs ordinary repository sync first and holds the repository sync
 lock through transport, journal mutation and native view update.
 
-## Initialize from a remote
+## Import from a remote
 
-`ds init` creates a cloud repository and checkout from an existing Git remote:
+`ds repo add` imports an existing Git remote without creating a checkout:
+
+```text
+ds repo add <git-url> [--name <name>]
+```
+
+The name defaults to the remote URL basename without a trailing `.git`.
+`ds init` uses the same import path and adds the first checkout:
 
 ```text
 ds init <git-url> [<directory>] [--name <name>]
 ```
 
-The command is remote-only and online-only. It does not convert an existing
-local Git repository in place. The repository name defaults to the remote URL
-basename without a trailing `.git`, and the checkout directory defaults to
-`./<name>`.
+Both commands are online-only. They do not convert an existing local Git
+repository in place. The checkout directory defaults to `./<name>`.
 
-Initialization composes the repository creation, remote registry, empty native
-materialization, checkout creation and fetch paths. It discovers the symbolic
-remote HEAD with `git ls-remote --symref`, imports every advertised head, tracks
-the HEAD bookmark at `origin`, and leaves a new empty working-copy change on
-top. Empty remotes use `ds repo new` instead. SHA-256 Git remotes are not
-supported.
+Import composes the repository creation, remote registry, empty native
+materialization and fetch paths. Initialization adds checkout creation. Both
+discover the symbolic remote HEAD with `git ls-remote --symref`, import every
+advertised head and track the HEAD bookmark at `origin`. Initialization leaves
+a new empty working-copy change on top. Empty remotes use `ds repo new`
+instead. SHA-256 Git remotes are not supported.
+
+Without a Git URL, `ds init [<directory>]` creates a blank repository named
+after the directory and creates its first checkout there.
 
 Repository creation uses the same durable idempotency intent as `ds repo new`.
 A retry after a lost cloud response resumes that intent. A later failure keeps
-the created cloud repository visible in the error; clean it up with `ds repo`
-before rerunning `ds init`.
+the created cloud repository visible in the error and reports that the local
+Git import is incomplete.
 
 ## Seed selection
 

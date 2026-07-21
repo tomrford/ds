@@ -4,9 +4,11 @@ mod boundary_sync;
 mod checkout;
 mod context;
 mod daemon;
+mod doctor;
 mod git;
 mod git_shim;
 mod init;
+mod list;
 mod remove;
 mod repo;
 mod skill;
@@ -22,7 +24,7 @@ use std::io::{self, Write as _};
 use std::mem;
 use std::process::ExitCode;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bare_workspace::{
     DevspaceWorkspaceLoaderFactory, MultipleOperationHeads, ParsedRepositoryArgs,
@@ -36,6 +38,7 @@ use jj_lib::config::{ConfigMigrationRule, ConfigSource};
 use jj_lib::op_heads_store::OpHeadsStoreError;
 
 static REPOSITORY_SELECTOR: OnceLock<Arc<RepositorySelector>> = OnceLock::new();
+static SHADOWED_ALIASES: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
 const APP_ABOUT: &str = "Cloudflare-native development workspaces backed by Jujutsu";
 const JJ_HELP_HINT: &str =
     "ds embeds Jujutsu. Run `ds help jj` for the full Jujutsu command reference.";
@@ -71,10 +74,7 @@ pub fn run() -> ExitCode {
 }
 
 fn devspace_alias_migration() -> ConfigMigrationRule {
-    let command_names = repo::DevspaceCommand::augment_subcommands(clap::Command::new("ds"))
-        .get_subcommands()
-        .map(|command| command.get_name().to_owned())
-        .collect::<Vec<_>>();
+    let command_names = devspace_command_names();
     let names_to_match = command_names.clone();
     let migration_active = Rc::new(Cell::new(true));
 
@@ -83,15 +83,26 @@ fn devspace_alias_migration() -> ConfigMigrationRule {
             if !migration_active.get() {
                 return false;
             }
-            let matches = names_to_match.iter().any(|name| {
-                layer
-                    .look_up_item(["aliases", name.as_str()])
-                    .is_ok_and(|item| item.is_some())
-            });
+            let matches = names_to_match
+                .iter()
+                .filter(|name| {
+                    layer
+                        .look_up_item(["aliases", name.as_str()])
+                        .is_ok_and(|item| item.is_some())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !matches.is_empty() {
+                SHADOWED_ALIASES
+                    .get_or_init(Default::default)
+                    .lock()
+                    .expect("shadowed alias set lock is not poisoned")
+                    .extend(matches.iter().cloned());
+            }
             if layer.source == ConfigSource::EnvOverrides {
                 migration_active.set(false);
             }
-            matches
+            !matches.is_empty()
         },
         move |layer| {
             for name in &command_names {
@@ -100,6 +111,23 @@ fn devspace_alias_migration() -> ConfigMigrationRule {
             Ok("aliases colliding with Devspace commands are ignored".to_owned())
         },
     )
+}
+
+fn devspace_command_names() -> Vec<String> {
+    repo::DevspaceCommand::augment_subcommands(clap::Command::new("ds"))
+        .get_subcommands()
+        .map(|command| command.get_name().to_owned())
+        .collect()
+}
+
+pub(crate) fn shadowed_aliases() -> Vec<String> {
+    SHADOWED_ALIASES
+        .get_or_init(Default::default)
+        .lock()
+        .expect("shadowed alias set lock is not poisoned")
+        .iter()
+        .cloned()
+        .collect()
 }
 
 fn intercept_help(args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Option<ExitCode> {
