@@ -256,7 +256,7 @@ async fn position_checkout(
     head_branch: &str,
 ) -> Result<(), String> {
     let config = store.load_config().map_err(|error| error.to_string())?;
-    let workspace_name = workspace_name(config.machine_id().as_str(), checkout_path);
+    let workspace_name = workspace_name(&config, checkout_path);
     let repository = MachineRepository::open(&entry.native_repository_path, command.settings())
         .await
         .map_err(|error| error.to_string())?;

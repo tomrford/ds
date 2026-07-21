@@ -120,7 +120,7 @@ pub(crate) async fn add_checkout(
     ensure_destination_parent(&requested_path)?;
     let requested_path = canonical_destination_path(&requested_path)?;
     let destination_hash = destination_hash(&requested_path);
-    let workspace_name = workspace_name(machine.machine_id().as_str(), &requested_path);
+    let workspace_name = workspace_name(&machine, &requested_path);
     let owner = CheckoutOwner::new(
         entry.identity.repository_id.as_str(),
         entry.identity.incarnation.as_str(),

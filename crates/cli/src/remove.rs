@@ -62,7 +62,7 @@ pub(crate) async fn remove_checkout(
     let machine = store
         .load_config()
         .map_err(|error| user_error(error.to_string()))?;
-    let expected_workspace = workspace_name(machine.machine_id().as_str(), &path);
+    let expected_workspace = workspace_name(&machine, &path);
     let target = match fs::symlink_metadata(&path) {
         Ok(_) => target_from_marker(&store, &path, &expected_workspace)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -156,7 +156,10 @@ fn target_from_marker(
 ) -> Result<RemovalTarget, CommandError> {
     let owner = read_checkout_owner(path).map_err(|_| not_checkout(path))?;
     if owner.workspace_name() != expected_workspace.as_str() {
-        return Err(not_checkout(path));
+        return Err(user_error(format!(
+            "Checkout {} no longer matches its machine name or path; renaming the machine or moving the checkout requires `ds remove` before the change and `ds add` afterward; nothing was touched",
+            path.display()
+        )));
     }
     let entry = store
         .entries()

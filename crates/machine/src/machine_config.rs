@@ -68,6 +68,7 @@ impl MachineId {
 pub struct MachineConfig {
     base_url: String,
     machine_id: MachineId,
+    machine_name: Option<String>,
     shared_secret: SharedSecret,
 }
 
@@ -81,8 +82,19 @@ impl MachineConfig {
         Ok(Self {
             base_url,
             machine_id,
+            machine_name: None,
             shared_secret,
         })
+    }
+
+    pub fn with_machine_name(
+        mut self,
+        machine_name: impl Into<String>,
+    ) -> Result<Self, MachineConfigError> {
+        let machine_name = machine_name.into();
+        validate_machine_name(&machine_name)?;
+        self.machine_name = Some(machine_name);
+        Ok(self)
     }
 
     pub fn base_url(&self) -> &str {
@@ -91,6 +103,10 @@ impl MachineConfig {
 
     pub fn machine_id(&self) -> &MachineId {
         &self.machine_id
+    }
+
+    pub fn machine_name(&self) -> Option<&str> {
+        self.machine_name.as_deref()
     }
 
     pub fn shared_secret(&self) -> &SharedSecret {
@@ -176,11 +192,15 @@ impl MachineStore {
         if persisted.version != CONFIG_VERSION {
             return Err(MachineConfigError::UnsupportedVersion(persisted.version));
         }
-        MachineConfig::new(
+        let mut config = MachineConfig::new(
             persisted.base_url,
             MachineId::parse(persisted.machine_id)?,
             SharedSecret::new(persisted.shared_secret)?,
-        )
+        )?;
+        if let Some(machine_name) = persisted.machine_name {
+            config = config.with_machine_name(machine_name)?;
+        }
+        Ok(config)
     }
 }
 
@@ -190,6 +210,8 @@ struct PersistedConfig {
     version: u32,
     base_url: String,
     machine_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_name: Option<String>,
     shared_secret: String,
 }
 
@@ -199,9 +221,22 @@ impl From<&MachineConfig> for PersistedConfig {
             version: CONFIG_VERSION,
             base_url: config.base_url.clone(),
             machine_id: config.machine_id.0.clone(),
+            machine_name: config.machine_name.clone(),
             shared_secret: config.shared_secret.0.clone(),
         }
     }
+}
+
+fn validate_machine_name(value: &str) -> Result<(), MachineConfigError> {
+    if value.is_empty()
+        || value.len() > 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(MachineConfigError::InvalidMachineName);
+    }
+    Ok(())
 }
 
 fn normalize_base_url(value: String) -> Result<String, MachineConfigError> {
@@ -281,6 +316,8 @@ pub enum MachineConfigError {
     InvalidSharedSecret,
     #[error("machine ID must be exactly 32 lowercase hexadecimal characters")]
     InvalidMachineId,
+    #[error("machine name must be 1-32 ASCII letters, digits, '_' or '-'")]
+    InvalidMachineName,
     #[error(
         "Worker base URL must be an HTTP(S) origin or path without credentials, query, or fragment"
     )]

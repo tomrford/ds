@@ -11,6 +11,10 @@ fn config(secret: &str) -> MachineConfig {
     .unwrap()
 }
 
+fn named_config(secret: &str, name: &str) -> MachineConfig {
+    config(secret).with_machine_name(name).unwrap()
+}
+
 #[test]
 fn config_round_trips_through_an_atomic_private_file() {
     let temp = tempfile::tempdir().unwrap();
@@ -22,6 +26,11 @@ fn config_round_trips_through_an_atomic_private_file() {
     assert_eq!(store.load_config().unwrap(), expected);
     assert_eq!(expected.base_url(), "https://worker.example.test/api");
     assert_eq!(expected.machine_id().as_str(), "ab".repeat(16));
+    assert_eq!(expected.machine_name(), None);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.config_path()).unwrap()).unwrap();
+    assert_eq!(persisted["version"], 1);
+    assert!(persisted.get("machine_name").is_none());
     assert_eq!(
         fs::read_dir(&root)
             .unwrap()
@@ -44,6 +53,40 @@ fn config_round_trips_through_an_atomic_private_file() {
         assert_eq!(
             fs::metadata(&root).unwrap().permissions().mode() & 0o777,
             0o700
+        );
+    }
+}
+
+#[test]
+fn named_config_round_trips_without_changing_the_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = MachineStore::new(temp.path());
+    let expected = named_config("local-development-secret", "Tom-Mac_1");
+
+    store.write_config(&expected).unwrap();
+
+    assert_eq!(store.load_config().unwrap(), expected);
+    assert_eq!(expected.machine_name(), Some("Tom-Mac_1"));
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.config_path()).unwrap()).unwrap();
+    assert_eq!(persisted["version"], 1);
+    assert_eq!(persisted["machine_name"], "Tom-Mac_1");
+}
+
+#[test]
+fn machine_name_accepts_only_the_configured_length_and_ascii_set() {
+    let longest_valid = "a".repeat(32);
+    for valid in ["a", "-", "machine_01", longest_valid.as_str()] {
+        assert!(config("secret").with_machine_name(valid).is_ok(), "{valid}");
+    }
+    let too_long = "a".repeat(33);
+    for invalid in ["", "has space", "dot.name", "mächine", too_long.as_str()] {
+        assert!(
+            matches!(
+                config("secret").with_machine_name(invalid),
+                Err(MachineConfigError::InvalidMachineName)
+            ),
+            "{invalid}"
         );
     }
 }

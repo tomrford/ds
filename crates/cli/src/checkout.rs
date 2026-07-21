@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use std::io::Read as _;
 
 use blake2::{Blake2b512, Digest as _};
-use devspace_machine::{RepositoryId, RepositoryIncarnation, encode_lower_hex};
+use devspace_machine::{MachineConfig, RepositoryId, RepositoryIncarnation, encode_lower_hex};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_lib::ref_name::WorkspaceNameBuf;
 
 pub(crate) const CHECKOUT_OWNER_FILE: &str = "devspace-checkout-owner";
 const DESTINATION_HASH_BYTES: usize = 12;
+const NAMED_WORKSPACE_HASH_BYTES: usize = 6;
 const MAX_OWNER_MARKER_BYTES: u64 = 16 * 1024;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, Eq, PartialEq)]
@@ -135,8 +136,20 @@ pub(crate) fn destination_hash(path: &Path) -> String {
     encode_lower_hex(&digest[..DESTINATION_HASH_BYTES])
 }
 
-pub(crate) fn workspace_name(machine_id: &str, path: &Path) -> WorkspaceNameBuf {
-    WorkspaceNameBuf::from(format!("{machine_id}-{}", destination_hash(path)))
+pub(crate) fn workspace_name(config: &MachineConfig, path: &Path) -> WorkspaceNameBuf {
+    let machine_id = config.machine_id().as_str();
+    let Some(machine_name) = config.machine_name() else {
+        return WorkspaceNameBuf::from(format!("{machine_id}-{}", destination_hash(path)));
+    };
+    let encoded_path = encode_path(path);
+    let mut hasher = Blake2b512::new();
+    hasher.update(machine_id.as_bytes());
+    hasher.update(encoded_path.as_bytes());
+    let digest = hasher.finalize();
+    WorkspaceNameBuf::from(format!(
+        "{machine_name}-{}",
+        encode_lower_hex(&digest[..NAMED_WORKSPACE_HASH_BYTES])
+    ))
 }
 
 pub(crate) fn read_checkout_owner(path: &Path) -> Result<CheckoutOwner, String> {
@@ -261,4 +274,58 @@ fn encode_path(path: &Path) -> String {
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
     format!("windows:{}", encode_lower_hex(&bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use devspace_machine::{MachineId, SharedSecret};
+
+    fn config(machine_id: &str, machine_name: Option<&str>) -> MachineConfig {
+        let config = MachineConfig::new(
+            "https://worker.example.test",
+            MachineId::parse(machine_id).unwrap(),
+            SharedSecret::new("development-secret").unwrap(),
+        )
+        .unwrap();
+        match machine_name {
+            Some(machine_name) => config.with_machine_name(machine_name).unwrap(),
+            None => config,
+        }
+    }
+
+    #[test]
+    fn unnamed_workspace_keeps_the_full_machine_and_path_hash_form() {
+        let machine_id = "12121212121212121212121212121212";
+        let path = Path::new("/tmp/checkout");
+
+        assert_eq!(
+            workspace_name(&config(machine_id, None), path).as_str(),
+            format!("{machine_id}-{}", destination_hash(path))
+        );
+    }
+
+    #[test]
+    fn named_workspace_is_deterministic_and_mixes_the_machine_id() {
+        let path = Path::new("/tmp/checkout");
+        let first = config("12121212121212121212121212121212", Some("shared-name"));
+        let second = config("34343434343434343434343434343434", Some("shared-name"));
+
+        let first_name = workspace_name(&first, path);
+        assert_eq!(first_name, workspace_name(&first, path));
+        assert!(first_name.as_str().starts_with("shared-name-"));
+        assert_eq!(first_name.as_str().len(), "shared-name-".len() + 12);
+        assert_ne!(first_name, workspace_name(&second, path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_workspace_hash_has_a_stable_vector() {
+        let config = config("12121212121212121212121212121212", Some("macbook"));
+
+        assert_eq!(
+            workspace_name(&config, Path::new("/tmp/checkout")).as_str(),
+            "macbook-28954720fc48"
+        );
+    }
 }

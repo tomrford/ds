@@ -88,16 +88,21 @@ fn machine_store(root: &Path) -> MachineStore {
 }
 
 fn configure_machine(root: &Path, base_url: &str) {
-    machine_store(root)
-        .write_config(
-            &MachineConfig::new(
-                base_url,
-                MachineId::parse(MACHINE_ID).unwrap(),
-                SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+    configure_machine_with_name(root, base_url, None);
+}
+
+fn configure_machine_with_name(root: &Path, base_url: &str, machine_name: Option<&str>) {
+    let config = MachineConfig::new(
+        base_url,
+        MachineId::parse(MACHINE_ID).unwrap(),
+        SharedSecret::new(DEVELOPMENT_SECRET).unwrap(),
+    )
+    .unwrap();
+    let config = match machine_name {
+        Some(machine_name) => config.with_machine_name(machine_name).unwrap(),
+        None => config,
+    };
+    machine_store(root).write_config(&config).unwrap();
 }
 
 async fn local_repository(root: &Path, name: &str) -> PathBuf {
@@ -424,6 +429,52 @@ async fn remove_refuses_an_unmarked_directory() {
     assert!(stderr(&output).contains("not a Devspace checkout"));
     assert_eq!(fs::read_to_string(path.join("keep")).unwrap(), "untouched");
     assert!(!temp.path().join("machine-store/locks/checkouts").exists());
+}
+
+#[tokio::test]
+async fn named_workspace_ownership_validates_with_unchanged_config() {
+    let temp = tempfile::tempdir().unwrap();
+    local_repository(temp.path(), "named-owner").await;
+    configure_machine_with_name(temp.path(), "http://127.0.0.1:1", Some("macbook"));
+    let config = write_cli_config(temp.path());
+    let path = temp.path().join("checkout");
+
+    let first = add_checkout(temp.path(), &config, "named-owner", "root()", &path);
+    let second = add_checkout(temp.path(), &config, "named-owner", "root()", &path);
+    assert_eq!(first["workspace_id"], second["workspace_id"]);
+    assert!(
+        first["workspace_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("macbook-")
+    );
+
+    let removed = remove_checkout(temp.path(), &config, &path);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn renaming_machine_invalidates_existing_checkout_with_recovery_guidance() {
+    let temp = tempfile::tempdir().unwrap();
+    local_repository(temp.path(), "renamed-owner").await;
+    configure_machine_with_name(temp.path(), "http://127.0.0.1:1", Some("before"));
+    let config = write_cli_config(temp.path());
+    let path = temp.path().join("checkout");
+    add_checkout(temp.path(), &config, "renamed-owner", "root()", &path);
+
+    configure_machine_with_name(temp.path(), "http://127.0.0.1:1", Some("after"));
+    let removed = remove_checkout(temp.path(), &config, &path);
+
+    assert_eq!(removed.status.code(), Some(1));
+    let error = stderr(&removed);
+    assert!(
+        error.contains("renaming the machine or moving the checkout"),
+        "{error}"
+    );
+    assert!(error.contains("`ds remove`"), "{error}");
+    assert!(error.contains("`ds add`"), "{error}");
+    assert!(path.join(".jj/devspace-checkout-owner").is_file());
 }
 
 #[tokio::test]
