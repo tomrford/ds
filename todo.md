@@ -1,10 +1,16 @@
 # Open items
 
-- Alias-collision residue: suppression shipped (config-migration rule +
-  pin test). Still open: `ds doctor` reporting shadowed aliases on demand
-  (verb name pending taxonomy), and the ~10-line upstream jj-cli PR
-  (`suppress_alias_override_warning(names)`) so the self-disarming trick
-  can retire at a future bump.
+- `ds sync run` is the one ds verb that still prints jj's
+  "Cannot define an alias that overrides the built-in command" warning
+  (reproducible from any cwd, daemon running or not). The config-migration
+  suppression covers every other verb; find which config-load path sync run
+  takes that skips it and close the gap.
+
+- Default branch per repo: `ds add` requires an explicit `-r`. jj has no
+  stored default-branch concept (`trunk()` just guesses main/master/trunk),
+  but import already reads the remote HEAD symref — persist it as a
+  committed `devspace.toml` default (overridable there), seed `main` for
+  `ds repo new`, and let `ds add` fall back to it when `-r` is omitted.
 - `ds git push` races the boundary sync its own preceding commands spawn:
   the per-repo sync lock makes push error "already being synchronized;
   retry" seconds after any ds command. Push (and fetch) should wait
@@ -14,24 +20,15 @@
   gh-style device-flow handshake registers the CLI, server issues the
   machine identity (replacing client-generated machine_id) and holds the
   display name. Current design threads a principal type end-to-end so this
-  is a swap, not a rework. Pairs with retiring the shared secret.
-- CLI verb taxonomy under review: inventory + rename options in
-  ~/code/devspace-command-inventory.md (outside checkout, Tom editing).
-  `ds repo list` implementation HELD until verbs are decided.
-- `ds init` overload: bare `ds init` in a directory should create a blank
-  cloud repo named after it plus the first checkout in place (repo new +
-  add composed) — the "start working here" verb. `ds init <git-url>` keeps
-  its bring-in-from-remote meaning.
+  is a swap, not a rework. Pairs with retiring the shared secret. Until it
+  lands, machine `config.toml` is written by hand at machine-add time — no
+  interim `ds setup` verb (ruled: login replaces it, don't build the stopgap).
 - Signed public history: canonical commits can carry jj signatures today
   (byte-exact sync), but projected public Git commits go out unsigned.
   Projection happens locally at export, so running the configured jj
   signing backend over freshly built public commits is feasible — design
   how signing config maps across the boundary and sign at projection time.
 
-- No `ds setup`/`ds login` verb: machine `config.toml` (platform data dir,
-  0600, `{version, base_url, machine_id, machine_name, shared_secret}`) is written by hand.
-  Needs a verb that generates the machine id, validates the URL/secret against
-  the Worker, and writes the file atomically.
 - Release binaries built inside `nix develop` link libiconv from the build
   machine's nix store and fail on hosts without it. Fixed today by
   `install_name_tool -change ... /usr/lib/libiconv.2.dylib` + ad-hoc codesign;
@@ -57,9 +54,6 @@
   batch, and a fetch begun against the old URL can be recorded as history from
   the new registration (cursor-less refs especially). Remote-generation
   binding validated transactionally fixes both; production hardening.
-- `ds context` (grepo parity): external-context management inside ds-managed
-  repos; v1 has it, v3 does not. Keeps grepo's existing committed `.repos` /
-  `.lock` files and syntax; not folded into any devspace config file.
 - `devspace.toml` (committed, public): run-on-add commands (`pnpm install`)
   and similar repo conventions. Ruling: config lifecycles stay separate —
   committed `devspace.toml` (public conventions), `.repos`/`.lock` (context,
@@ -71,8 +65,6 @@
   one user — every devspace collaborator sees all private content. Multiuser
   needs a third boundary between public and private (share some secrets with
   some collaborators, not all). Design item, unscheduled.
-- `ds skill` surface (v1 parity): agent-facing usage docs incl. the private-file
-  model, once docs stabilise. Needed before T3 dogfooding.
 - Auto-track discovery walk never sees jj's base ignores (global
   `core.excludesFile`): a globally-ignored directory is descended by our walk
   but pruned by jj's, so hidden matches inside it silently diverge from the
