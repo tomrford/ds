@@ -64,6 +64,27 @@ fn write_cli_config(root: &Path) -> PathBuf {
     path
 }
 
+fn write_colliding_alias_config(root: &Path) -> PathBuf {
+    let path = root.join("jj-config.toml");
+    fs::write(
+        &path,
+        r#"
+            [user]
+            name = "Devspace Test"
+            email = "devspace@example.invalid"
+
+            [aliases]
+            init = ["git", "init"]
+            unrelated = ["version"]
+
+            [ui]
+            color = "never"
+        "#,
+    )
+    .unwrap();
+    path
+}
+
 fn write_watchman_config(root: &Path) -> PathBuf {
     let path = root.join("watchman-config.toml");
     fs::write(
@@ -336,6 +357,30 @@ fn embedded_jj_command_help_still_works() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("Show revision history"));
+}
+
+#[test]
+fn colliding_alias_is_silenced_without_affecting_other_aliases_or_devspace_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_colliding_alias_config(temp.path());
+
+    let alias = ds(temp.path(), &config, &["unrelated"]);
+    assert!(alias.status.success(), "{}", stderr(&alias));
+    assert!(stdout(&alias).contains("ds 0.1.0"), "{}", stdout(&alias));
+
+    let init_help = ds(temp.path(), &config, &["init", "--help"]);
+    assert!(init_help.status.success(), "{}", stderr(&init_help));
+    assert!(
+        stdout(&init_help).contains("Initialize a Devspace repository from a Git remote"),
+        "{}",
+        stdout(&init_help)
+    );
+
+    for output in [alias, init_help] {
+        let stderr = stderr(&output);
+        assert!(!stderr.contains("Cannot define an alias"), "{stderr}");
+        assert!(!stderr.contains("Deprecated"), "{stderr}");
+    }
 }
 
 #[tokio::test]

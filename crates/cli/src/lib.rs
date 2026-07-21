@@ -13,11 +13,13 @@ mod sync_status;
 mod tx;
 mod working_copy;
 
+use std::cell::Cell;
 use std::env;
 use std::ffi::OsStr;
 use std::io::{self, Write as _};
 use std::mem;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use bare_workspace::{
@@ -28,6 +30,7 @@ use clap::Subcommand as _;
 use jj_cli::cli_util::{CliRunner, CommandHelper};
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
+use jj_lib::config::{ConfigMigrationRule, ConfigSource};
 use jj_lib::op_heads_store::OpHeadsStoreError;
 
 static REPOSITORY_SELECTOR: OnceLock<Arc<RepositorySelector>> = OnceLock::new();
@@ -50,6 +53,7 @@ pub fn run() -> ExitCode {
         .set_workspace_loader_factory(Box::new(DevspaceWorkspaceLoaderFactory::new(
             repository_selector,
         )))
+        .add_extra_config_migration(devspace_alias_migration())
         .add_subcommand::<repo::DevspaceCommand, _>(repo::run)
         .add_global_args::<ParsedRepositoryArgs, _>(move |_ui, args| {
             selector_for_args.set_parsed_repository(args.repository);
@@ -62,6 +66,38 @@ pub fn run() -> ExitCode {
         boundary_sync::spawn_recorded();
     }
     exit_code
+}
+
+fn devspace_alias_migration() -> ConfigMigrationRule {
+    let command_names = repo::DevspaceCommand::augment_subcommands(clap::Command::new("ds"))
+        .get_subcommands()
+        .map(|command| command.get_name().to_owned())
+        .collect::<Vec<_>>();
+    let names_to_match = command_names.clone();
+    let migration_active = Rc::new(Cell::new(true));
+
+    ConfigMigrationRule::custom(
+        move |layer| {
+            if !migration_active.get() {
+                return false;
+            }
+            let matches = names_to_match.iter().any(|name| {
+                layer
+                    .look_up_item(["aliases", name.as_str()])
+                    .is_ok_and(|item| item.is_some())
+            });
+            if layer.source == ConfigSource::EnvOverrides {
+                migration_active.set(false);
+            }
+            matches
+        },
+        move |layer| {
+            for name in &command_names {
+                layer.delete_value(["aliases", name.as_str()])?;
+            }
+            Ok("aliases colliding with Devspace commands are ignored".to_owned())
+        },
+    )
 }
 
 fn intercept_help(args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Option<ExitCode> {
