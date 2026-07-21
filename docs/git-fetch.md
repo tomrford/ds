@@ -201,11 +201,3 @@ closed. Hidden-path conflicts present as ordinary jj conflicts; the boundary
 error names the hidden path. The exporter change the fetch path requires is
 therefore mapping-aware traversal plus path-aware rejection, not conflict-term
 filtering.
-
-## Open items
-
-- Hidden disagreement between lifted parents needs dedicated coverage.
-- Non-UTF-8 names, case collisions and paths that cannot materialize on a
-  client platform have no defined handling.
-- Annotated tags, replace refs, shallow history, partial clones and Git notes
-  are out of scope for the native surface.

@@ -230,11 +230,12 @@ cursors and fenced pending batches. A second machine can recover a remote ref
 move after the first machine omits finalisation, then rebuild an empty sidecar
 from cloud objects and accepted mappings.
 
-The warm local repository-open wrapper measures 1.297 to 1.300 times stock jj in
+The warm local repository-open wrapper measures 1.304 to 1.309 times stock jj in
 the release-only probe against a 64-operation fixture repository and cannot
-issue cloud requests. The end-to-end read-command probe measured at most
-1.0135 times its stock jj-lib equivalent; the `ds` runner preserves that direct
-bare-repository shape.
+issue cloud requests. A supporting process probe of the direct bare-repository
+shape measured at most 1.0135 times an equivalent stock jj-lib program. It did
+not compare the public `ds` and `jj` CLIs; that no-pain smoke check remains
+[open](https://github.com/tomrford/ds/issues/22).
 
 When cloud operation objects have been installed locally, the machine validates
 their complete closure before adding them to jj's stock operation-head store.
@@ -245,6 +246,5 @@ See [`docs/kernel.md`](docs/kernel.md) for the validation kernel contract,
 [`docs/sync.md`](docs/sync.md) for synchronization and convergence, and
 [`docs/git-projection.md`](docs/git-projection.md) for Git projection.
 [`docs/hidden.md`](docs/hidden.md), [`docs/git-push.md`](docs/git-push.md)
-and [`docs/git-fetch.md`](docs/git-fetch.md) specify the hidden-file model
-and the Git transport surfaces for the product build-out; probe reports
-backing them are archived under [`docs/archive/`](docs/archive/).
+and [`docs/git-fetch.md`](docs/git-fetch.md) specify the current hidden-file
+model and Git transport contracts.

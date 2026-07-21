@@ -1,8 +1,10 @@
 # devspace
 
-Cloudflare-native devspace. Plan:
-`../devspace-v2-ref-and-docs/docs/specs/cloudflare-v3.md` (the old server is a
-loose behavioural reference only; nothing canonical may depend on it).
+Cloudflare-native devspace. The current contract is in `README.md` and
+`docs/kernel.md`, `docs/sync.md`, `docs/hidden.md`,
+`docs/git-projection.md`, `docs/git-push.md` and `docs/git-fetch.md`.
+The legacy `tomrford/devspace` repository is a historical behavioural
+reference only; nothing canonical depends on it.
 
 This is a ds checkout — use `ds`, never git or jj directly.
 

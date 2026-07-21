@@ -113,25 +113,11 @@ and bookmark names are bounded to 256 UTF-8 bytes. Mapping reads page 256 rows
 under one fixed activation high-water. These are current safety limits, not
 settled production quotas.
 
-The projection path does not run during warm repository open. The release-only
-comparison remains inside the 2 times budget; 3 current local runs measure
-1.300, 1.297 and 1.297 times stock jj. The embedded command runner connects
-checkout `ds git push` execution to the projection journal while warm
+The projection path does not run during warm repository open. A release-only
+comparison measured the Devspace wrapper at 1.304 to 1.309 times stock jj,
+inside the 2 times budget for that shared subpath. The embedded command runner
+connects checkout `ds git push` execution to the projection journal while warm
 repository open and bare-repository `log` remain local-only paths.
 
 The dry-run Worker bundle is 270.78 KiB uncompressed and 80.67 KiB compressed.
 The validation Wasm is 142,859 bytes and remains below its 200 KiB build gate.
-
-## Current limitations
-
-- The authenticated machine-ID header binds projection ownership and fencing
-  callbacks to the configured machine. A payload cannot claim another machine
-  ID.
-- Fetch-side hidden-lineage lifting is specified in
-  [`git-fetch.md`](git-fetch.md) but is not implemented. Push uses the remote
-  registry, structured Git subprocess and per-commit hidden model described in
-  [`git-push.md`](git-push.md) and [`hidden.md`](hidden.md).
-- Projection width and depth need observational scaling measurements before
-  production limits are set. Exercise at least 1,000, 10,000 and 100,000 tree
-  entries, and history depths of 1, 100 and 1,000 commits, recording cold
-  export, receipt-reuse export and empty-sidecar rebuild separately.

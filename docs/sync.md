@@ -494,17 +494,16 @@ The wrapper validates the 5 stock store-type markers and delegates to jj's
 loader. This code path has no cloud client or `SyncTransport` value, so the
 probe makes zero cloud requests by construction.
 
-The complete-command budget of 2 times local jj with zero cloud requests is
-met. A probe measured a representative warm read command — open the
-repository, walk and render 50 commits with ignore-working-copy semantics —
-as an end-to-end process against an equivalent stock jj-lib binary, spawn
-included, on 64-operation and 1,000-operation fixtures. Release builds, 101
-alternating samples per binary: the worst ratio was 1.0135 times stock jj,
-with no Devspace-specific cost growing with repository size. The fixed
-store-marker validation cost disappears into process startup and shared jj
-work. A network-denied run and a call-graph check confirmed zero cloud
-requests. The archived report is
-[`archive/probe-warm-command.md`](archive/probe-warm-command.md).
+A supporting process probe exercised the same direct bare-repository shape:
+open the repository, walk and render 50 commits with ignore-working-copy
+semantics. Against an equivalent stock jj-lib program, including process
+startup, its worst ratio was 1.0135 times stock jj-lib on 64-operation and
+1,000-operation fixtures, with no Devspace-specific cost growing with
+repository size. A network-denied run and a call-graph check confirmed zero
+cloud requests. This probe did not invoke the public `ds` and pinned `jj` CLIs,
+so it supports the design but does not close the complete-command budget. The
+public CLI no-pain smoke check is tracked in
+[issue 22](https://github.com/tomrford/ds/issues/22).
 
 The `ds` command runner resolves `ds -R <name> log` through the machine-store
 catalog and opens the resulting bare repository directly through a custom jj
@@ -524,38 +523,3 @@ Inside an owned Devspace checkout, the runner intercepts the parsed `git`
 subcommand before stock dispatch. Ordinary jj workspaces continue to use stock
 Git commands. Product Git commands require a checkout; repository-targeted bare
 mode remains read-only `log` only.
-
-## Open verification
-
-Pack size, chunk count and SQLite versus R2 placement still require production
-measurements. The protocol must not bake in a storage-provider-specific object
-location.
-
-## Deferred concerns
-
-Known limits carried forward deliberately; each needs a decision or a
-measurement before the affected surface hardens.
-
-- Worker pack installation verifies and validates an entire pack inside one
-  synchronous Durable Object transaction; a full 64 MiB, 65,536-object pack
-  may exceed Durable Object CPU budgets. Bounded staged installation is the
-  fallback shape.
-- The head-transaction ancestry walk recurses over the full operation ancestry
-  on every transaction; closure checks are memoized through the proven
-  frontier, ancestry checks are not.
-- Download and catalog routes verify the incarnation by reading the full head
-  set; a cheap incarnation-only check would remove up to 4,096 rows of work
-  per request.
-- Untested asserted behavior: receipt expiry and quota enforcement, SQLite
-  part-splitting above 1 MiB values, catalog pagination beyond one page,
-  no-clobber mismatch on existing native objects, and the 4,096-head bounds.
-- Before dogfooding, replace the shared-secret HTTP adapter with real
-  multi-user authentication and independently revocable machine credentials.
-  Typed principals, repository authorization and transport semantics remain
-  behind that boundary.
-- Retiring-row recovery is request-driven. Delete retries resume their exact
-  retirement, and later repository creates recover a bounded batch, but there
-  is no scheduled maintenance trigger for an otherwise idle tenant.
-- Repository-creation receipts are retained indefinitely. Receipt expiry
-  cannot be added without defining how a retry preserves the original
-  repository result.
