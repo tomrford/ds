@@ -1,16 +1,15 @@
 # Open items
 
-- Colliding-alias handling: IMPLEMENTABLE NOW without forking. jj-cli's
-  warning (cli_util.rs:3857, resolve_aliases) keys off alias-NAME presence
-  in the merged config; values, --quiet, and layer shadowing are all dead
-  ends — but `CliRunner::add_extra_config_migration` with a
-  ConfigMigrationRule::custom runs BEFORE alias validation and can delete
-  ds-colliding `aliases.*` keys from every layer. Use the self-disarming
-  variant (only the last migrate pass prints descriptions) for full
-  silence, pin with a CLI test (colliding alias → clean stderr) so a jj
-  bump that shifts the sequence fails loudly. Pair with `ds doctor`
-  reporting shadowed aliases on demand. Also send the ~10-line upstream PR
-  (`suppress_alias_override_warning(names)`) to make it boring forever.
+- Alias-collision residue: suppression shipped (config-migration rule +
+  pin test). Still open: `ds doctor` reporting shadowed aliases on demand
+  (verb name pending taxonomy), and the ~10-line upstream jj-cli PR
+  (`suppress_alias_override_warning(names)`) so the self-disarming trick
+  can retire at a future bump.
+- `ds git push` races the boundary sync its own preceding commands spawn:
+  the per-repo sync lock makes push error "already being synchronized;
+  retry" seconds after any ds command. Push (and fetch) should wait
+  briefly on the lock instead of failing — bare retry advice is a paper
+  cut in scripted/agent flows.
 - Machine enrolment endgame: devices become first-class server citizens —
   gh-style device-flow handshake registers the CLI, server issues the
   machine identity (replacing client-generated machine_id) and holds the
@@ -28,11 +27,6 @@
   Projection happens locally at export, so running the configured jj
   signing backend over freshly built public commits is feasible — design
   how signing config maps across the boundary and sign at projection time.
-- v3 checkouts have no `.git` shim, so agent tools that sniff for a git repo
-  refuse to run in them (codex needs `--skip-git-repo-check`; other tools may
-  hard-fail). v1 shipped a read-only `.git` shim partly for this. Decide
-  whether v3 checkouts should materialize a minimal read-only shim (and what
-  it must refuse) — first dogfood friction, found day one.
 
 - No `ds setup`/`ds login` verb: machine `config.json` (platform data dir,
   0600, `{version, base_url, machine_id, shared_secret}`) is written by hand.
@@ -84,10 +78,6 @@
   but pruned by jj's, so hidden matches inside it silently diverge from the
   documented rule. Plumb the same base ignores jj-cli feeds SnapshotOptions
   into `discover_hidden_paths` and pin a golden test.
-- Test harness dedup (~1.1k LOC): `settings()` defined 24x, the fake TCP
-  Worker written 4x, live-test helpers duplicated between `sync.rs` and
-  `sync_live.rs` (move the two `#[ignore]`d live tests there too).
-  Opportunistic; zero coverage change.
 - Worker version gating: clients now send `x-devspace-client`
   (`ds/<version> encoding/<epoch>`); the Worker ignores it. When enrolment or
   the first encoding bump lands, gate stale epochs with an "upgrade ds" error
