@@ -11,11 +11,6 @@
   but import already reads the remote HEAD symref — persist it as a
   committed `devspace.toml` default (overridable there), seed `main` for
   `ds repo new`, and let `ds add` fall back to it when `-r` is omitted.
-- `ds git push` races the boundary sync its own preceding commands spawn:
-  the per-repo sync lock makes push error "already being synchronized;
-  retry" seconds after any ds command. Push (and fetch) should wait
-  briefly on the lock instead of failing — bare retry advice is a paper
-  cut in scripted/agent flows.
 - Machine enrolment endgame: devices become first-class server citizens —
   gh-style device-flow handshake registers the CLI, server issues the
   machine identity (replacing client-generated machine_id) and holds the
@@ -23,11 +18,19 @@
   is a swap, not a rework. Pairs with retiring the shared secret. Until it
   lands, machine `config.toml` is written by hand at machine-add time — no
   interim `ds setup` verb (ruled: login replaces it, don't build the stopgap).
-- Signed public history: canonical commits can carry jj signatures today
-  (byte-exact sync), but projected public Git commits go out unsigned.
-  Projection happens locally at export, so running the configured jj
-  signing backend over freshly built public commits is feasible — design
-  how signing config maps across the boundary and sign at projection time.
+- Signed public history: design settled on remote-as-persistence — see
+  docs/sign-on-export.md (and its companion memo). Zero kernel changes;
+  signing runs through jj's SigningFn at export; racing exporters resolve
+  via the existing journal fencing plus fetch-back adoption. Open before
+  implementation: repo-wide vs per-remote one-OID-per-canonical scope
+  (doc recommends repo-wide) and the mixed signed/unsigned fleet policy.
+- Rename the public remote: v3 should take over `tomrford/devspace`
+  (currently the repo pushes to `tomrford/ds`). Repoint origin via the
+  remote registry, verify push/fetch, retire or archive the old name.
+- Checkpoint-8 tail, unscheduled: scaling-limits evidence (measured
+  ceilings written down, not guessed), recovery tooling / portable export
+  (get a repo out of the cloud store without a healthy machine), and
+  opportunistic pack dedup.
 
 - Release binaries built inside `nix develop` link libiconv from the build
   machine's nix store and fail on hosts without it. Fixed today by
