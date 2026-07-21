@@ -2,6 +2,7 @@ mod add;
 mod bare_workspace;
 mod boundary_sync;
 mod checkout;
+mod context;
 mod daemon;
 mod git;
 mod git_shim;

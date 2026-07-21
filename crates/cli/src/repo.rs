@@ -10,6 +10,7 @@ use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
 
 use crate::add::{AddArgs, add_checkout};
+use crate::context::{ContextArgs, run_context};
 use crate::daemon::{DaemonArgs, run_daemon};
 use crate::init::{InitArgs, init_repository};
 use crate::remove::{RemoveArgs, remove_checkout};
@@ -21,6 +22,8 @@ pub(crate) enum DevspaceCommand {
     Add(AddArgs),
     /// Initialize a Devspace repository from a Git remote.
     Init(InitArgs),
+    /// Pin read-only Git reference repos under .repos/.
+    Context(ContextArgs),
     /// Remove a disposable checkout while preserving its repository.
     Remove(RemoveArgs),
     #[command(hide = true)]
@@ -51,6 +54,7 @@ pub(crate) async fn run(
     match args {
         DevspaceCommand::Add(args) => add_checkout(ui, command, args).await,
         DevspaceCommand::Init(args) => init_repository(ui, command, args).await,
+        DevspaceCommand::Context(args) => run_context(ui, command, args).await,
         DevspaceCommand::Remove(args) => remove_checkout(ui, command, args).await,
         DevspaceCommand::Daemon(args) => {
             crate::boundary_sync::suppress();
