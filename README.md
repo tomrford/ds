@@ -189,6 +189,13 @@ the deterministic workspace identity and stored path allow the command to
 forget its remaining registration. An unmarked directory or a marker whose
 repository is absent from the catalog is left untouched.
 
+A checkout moved away from its registered path is also left untouched. If its
+marker, working-copy state, repository pointer and workspace registration still
+agree, `ds remove` reports the original path and directs the user to move the
+checkout back before removing it. If the original path still exists, the new
+directory is treated as a copy. Forged markers and stale workspace metadata do
+not establish ownership.
+
 Downloaded packs are decoded and hash-checked again before the machine installs
 their canonical objects into the stock simple stores with no-clobber writes.
 Pack installation never publishes an operation head; complete-closure

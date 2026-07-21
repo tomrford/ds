@@ -142,6 +142,20 @@ fn checkout_repository_path(checkout: &Path) -> PathBuf {
     dunce::canonicalize(pointer).unwrap()
 }
 
+fn copy_directory(source: &Path, destination: &Path) {
+    fs::create_dir(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_directory(&source, &destination);
+        } else {
+            fs::copy(source, destination).unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 async fn checkpoint_three_checkout_lifecycle_preserves_one_native_repository() {
     let temp = tempfile::tempdir().unwrap();
@@ -299,20 +313,181 @@ async fn renaming_machine_invalidates_existing_checkout_with_recovery_guidance()
     configure_machine_with_name(temp.path(), "http://127.0.0.1:1", Some("before"));
     let config = write_cli_config(temp.path());
     let path = temp.path().join("checkout");
-    add_checkout(temp.path(), &config, "renamed-owner", "root()", &path);
+    let added = add_checkout(temp.path(), &config, "renamed-owner", "root()", &path);
+    let registered = added["root"].as_str().unwrap();
 
     configure_machine_with_name(temp.path(), "http://127.0.0.1:1", Some("after"));
     let removed = remove_checkout(temp.path(), &config, &path);
 
     assert_eq!(removed.status.code(), Some(1));
     let error = stderr(&removed);
+    assert!(error.contains(registered), "{error}");
     assert!(
-        error.contains("renaming the machine or moving the checkout"),
+        error.contains("Restore the previous machine name"),
         "{error}"
     );
-    assert!(error.contains("`ds remove`"), "{error}");
-    assert!(error.contains("`ds add`"), "{error}");
+    assert!(
+        error.contains(&format!("`ds remove {registered}`")),
+        "{error}"
+    );
     assert!(path.join(".jj/devspace-checkout-owner").is_file());
+}
+
+#[tokio::test]
+async fn remove_reports_the_registered_path_after_a_same_volume_move() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_path = local_repository(temp.path(), "same-volume-move").await;
+    let config = write_cli_config(temp.path());
+    let original = temp.path().join("original");
+    let moved = temp.path().join("moved");
+    let added = add_checkout(
+        temp.path(),
+        &config,
+        "same-volume-move",
+        "root()",
+        &original,
+    );
+    let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
+    let registered = PathBuf::from(added["root"].as_str().unwrap());
+    fs::rename(&original, &moved).unwrap();
+
+    let output = remove_checkout(temp.path(), &config, &moved);
+
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(
+        error.contains("was moved from its registered path"),
+        "{error}"
+    );
+    assert!(error.contains(&registered.display().to_string()), "{error}");
+    assert!(
+        error.contains(&format!("`ds remove {}`", registered.display())),
+        "{error}"
+    );
+    assert!(moved.is_dir());
+    assert!(workspace_names(&repository_path).await.contains(&workspace));
+    assert!(stored_workspace_path(&repository_path, &workspace).is_some());
+
+    fs::rename(&moved, &original).unwrap();
+    let removed = remove_checkout(temp.path(), &config, &original);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+}
+
+#[tokio::test]
+async fn remove_reports_the_registered_path_after_a_cross_volume_move_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_path = local_repository(temp.path(), "cross-volume-move").await;
+    let config = write_cli_config(temp.path());
+    let original = temp.path().join("original");
+    let moved = temp.path().join("moved");
+    let added = add_checkout(
+        temp.path(),
+        &config,
+        "cross-volume-move",
+        "root()",
+        &original,
+    );
+    let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
+    let registered = PathBuf::from(added["root"].as_str().unwrap());
+    copy_directory(&original, &moved);
+    support_fs::remove_dir_all(&original);
+
+    let output = remove_checkout(temp.path(), &config, &moved);
+
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(
+        error.contains("was moved from its registered path"),
+        "{error}"
+    );
+    assert!(error.contains(&registered.display().to_string()), "{error}");
+    assert!(
+        error.contains(&format!("`ds remove {}`", registered.display())),
+        "{error}"
+    );
+    assert!(moved.is_dir());
+    assert!(workspace_names(&repository_path).await.contains(&workspace));
+    assert!(stored_workspace_path(&repository_path, &workspace).is_some());
+}
+
+#[tokio::test]
+async fn remove_rejects_a_copied_checkout_and_reports_the_registered_path() {
+    let temp = tempfile::tempdir().unwrap();
+    local_repository(temp.path(), "copied-checkout").await;
+    let config = write_cli_config(temp.path());
+    let original = temp.path().join("original");
+    let copied = temp.path().join("copied");
+    let added = add_checkout(temp.path(), &config, "copied-checkout", "root()", &original);
+    let registered = added["root"].as_str().unwrap();
+    copy_directory(&original, &copied);
+
+    let output = remove_checkout(temp.path(), &config, &copied);
+
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(error.contains("is a copy"), "{error}");
+    assert!(error.contains(registered), "{error}");
+    assert!(
+        error.contains(&format!("`ds remove {registered}`")),
+        "{error}"
+    );
+    assert!(original.is_dir());
+    assert!(copied.is_dir());
+}
+
+#[tokio::test]
+async fn remove_rejects_a_forged_marker_without_working_copy_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    local_repository(temp.path(), "forged-marker").await;
+    let config = write_cli_config(temp.path());
+    let original = temp.path().join("original");
+    let forged = temp.path().join("forged");
+    add_checkout(temp.path(), &config, "forged-marker", "root()", &original);
+    fs::create_dir(&forged).unwrap();
+    fs::create_dir(forged.join(".jj")).unwrap();
+    fs::copy(
+        original.join(".jj/devspace-checkout-owner"),
+        forged.join(".jj/devspace-checkout-owner"),
+    )
+    .unwrap();
+    fs::write(forged.join("keep"), "untouched").unwrap();
+
+    let output = remove_checkout(temp.path(), &config, &forged);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("not a Devspace checkout"));
+    assert_eq!(
+        fs::read_to_string(forged.join("keep")).unwrap(),
+        "untouched"
+    );
+    assert!(original.is_dir());
+}
+
+#[tokio::test]
+async fn remove_rejects_a_moved_checkout_with_stale_workspace_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_path = local_repository(temp.path(), "stale-workspace").await;
+    let config = write_cli_config(temp.path());
+    let original = temp.path().join("original");
+    let moved = temp.path().join("moved");
+    let added = add_checkout(temp.path(), &config, "stale-workspace", "root()", &original);
+    let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
+    fs::rename(&original, &moved).unwrap();
+    SimpleWorkspaceStore::load(&repository_path)
+        .unwrap()
+        .forget(&[&workspace])
+        .unwrap();
+
+    let output = remove_checkout(temp.path(), &config, &moved);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("no matching registered workspace metadata"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(moved.is_dir());
+    assert!(workspace_names(&repository_path).await.contains(&workspace));
 }
 
 #[tokio::test]

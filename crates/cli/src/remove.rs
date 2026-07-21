@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use devspace_machine::{CatalogEntry, MachineRepository, MachineStore};
+use devspace_machine::{CatalogEntry, MachineConfig, MachineRepository, MachineStore};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
@@ -64,7 +64,7 @@ pub(crate) async fn remove_checkout(
         .map_err(|error| user_error(error.to_string()))?;
     let expected_workspace = workspace_name(&machine, &path);
     let target = match fs::symlink_metadata(&path) {
-        Ok(_) => target_from_marker(&store, &path, &expected_workspace)?,
+        Ok(_) => target_from_marker(&store, &machine, &path, &expected_workspace, command).await?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             target_from_workspace_store(&store, &path, &expected_workspace, command.settings())
                 .await?
@@ -149,18 +149,14 @@ pub(crate) async fn remove_checkout(
     Ok(())
 }
 
-fn target_from_marker(
+async fn target_from_marker(
     store: &MachineStore,
+    machine: &MachineConfig,
     path: &Path,
     expected_workspace: &WorkspaceName,
+    command: &CommandHelper,
 ) -> Result<RemovalTarget, CommandError> {
     let owner = read_checkout_owner(path).map_err(|_| not_checkout(path))?;
-    if owner.workspace_name() != expected_workspace.as_str() {
-        return Err(user_error(format!(
-            "Checkout {} no longer matches its machine name or path; renaming the machine or moving the checkout requires `ds remove` before the change and `ds add` afterward; nothing was touched",
-            path.display()
-        )));
-    }
     let entry = store
         .entries()
         .map_err(|error| user_error(error.to_string()))?
@@ -175,11 +171,92 @@ fn target_from_marker(
                 path.display()
             ))
         })?;
+    if owner.workspace_name() != expected_workspace.as_str() {
+        explain_mismatched_checkout(&entry, machine, path, &owner, command).await?;
+    }
     Ok(RemovalTarget {
         entry,
         owner,
         path_exists: true,
     })
+}
+
+async fn explain_mismatched_checkout(
+    entry: &CatalogEntry,
+    machine: &MachineConfig,
+    path: &Path,
+    owner: &CheckoutOwner,
+    command: &CommandHelper,
+) -> Result<(), CommandError> {
+    require_native_repository(entry)?;
+    let registered_workspace = WorkspaceName::new(owner.workspace_name());
+    let workspace_store =
+        SimpleWorkspaceStore::load(&entry.native_repository_path).map_err(CommandError::from)?;
+    let registered_path = workspace_store
+        .get_workspace_path(registered_workspace)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| stale_checkout(path))?;
+    let registered_path = if registered_path.is_absolute() {
+        registered_path
+    } else {
+        entry.native_repository_path.join(registered_path)
+    };
+    let registered_path =
+        canonical_destination_path(&registered_path).map_err(|_| stale_checkout(path))?;
+
+    let workspace = command
+        .load_workspace_at(path, command.settings())
+        .map_err(|_| not_checkout(path))?;
+    validate_workspace(&workspace, entry, registered_workspace).map_err(|_| not_checkout(path))?;
+    let repository = MachineRepository::open(&entry.native_repository_path, command.settings())
+        .await
+        .map_err(|error| user_error(error.to_string()))?;
+    if repository
+        .repo()
+        .view()
+        .get_wc_commit_id(registered_workspace)
+        .is_none()
+    {
+        return Err(stale_checkout(path));
+    }
+
+    if registered_path == path {
+        return Err(user_error(format!(
+            "Checkout {} is registered at {}, but its workspace identity no longer matches this machine name. Restore the previous machine name, run `ds remove {}`, then rename the machine again; nothing was touched",
+            path.display(),
+            registered_path.display(),
+            registered_path.display()
+        )));
+    }
+    if workspace_name(machine, &registered_path) != registered_workspace {
+        return Err(stale_checkout(path));
+    }
+    match fs::symlink_metadata(&registered_path) {
+        Ok(_) => Err(user_error(format!(
+            "Checkout {} is a copy of the Devspace checkout registered at {}; run `ds remove {}` for the registered checkout; the copied directory was not touched",
+            path.display(),
+            registered_path.display(),
+            registered_path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(user_error(format!(
+            "Checkout {} was moved from its registered path {}. Move it back to {}, then run `ds remove {}`; nothing was touched",
+            path.display(),
+            registered_path.display(),
+            registered_path.display(),
+            registered_path.display()
+        ))),
+        Err(error) => Err(user_error(format!(
+            "Failed to inspect the registered checkout path {}: {error}; nothing was touched",
+            registered_path.display()
+        ))),
+    }
+}
+
+fn stale_checkout(path: &Path) -> CommandError {
+    user_error(format!(
+        "Checkout marker at {} has no matching registered workspace metadata; nothing was touched",
+        path.display()
+    ))
 }
 
 async fn target_from_workspace_store(
