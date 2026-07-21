@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::machine_store::MachineStore;
 
-const CONFIG_FILE: &str = "config.json";
+const CONFIG_FILE: &str = "config.toml";
 const CONFIG_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -143,13 +143,13 @@ impl MachineStore {
             })?;
         let persisted = PersistedConfig::from(config);
         let result = (|| {
-            serde_json::to_writer_pretty(&mut temp, &persisted).map_err(|source| {
+            let serialized = toml::to_string_pretty(&persisted).map_err(|source| {
                 MachineConfigError::Serialize {
                     path: temp_path.clone(),
                     source,
                 }
             })?;
-            temp.write_all(b"\n")
+            temp.write_all(serialized.as_bytes())
                 .and_then(|()| temp.sync_all())
                 .map_err(|source| MachineConfigError::Write {
                     path: temp_path.clone(),
@@ -187,7 +187,7 @@ impl MachineStore {
             path: path.clone(),
             source,
         })?;
-        let persisted: PersistedConfig = serde_json::from_slice(&bytes)
+        let persisted: PersistedConfig = toml::from_slice(&bytes)
             .map_err(|source| MachineConfigError::Decode { path, source })?;
         if persisted.version != CONFIG_VERSION {
             return Err(MachineConfigError::UnsupportedVersion(persisted.version));
@@ -344,7 +344,7 @@ pub enum MachineConfigError {
     Serialize {
         path: PathBuf,
         #[source]
-        source: serde_json::Error,
+        source: toml::ser::Error,
     },
     #[error("failed to atomically replace machine configuration {to} from {from}")]
     Replace {
@@ -373,7 +373,7 @@ pub enum MachineConfigError {
     Decode {
         path: PathBuf,
         #[source]
-        source: serde_json::Error,
+        source: toml::de::Error,
     },
     #[error("machine configuration version {0} is unsupported")]
     UnsupportedVersion(u32),

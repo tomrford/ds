@@ -27,16 +27,15 @@ fn config_round_trips_through_an_atomic_private_file() {
     assert_eq!(expected.base_url(), "https://worker.example.test/api");
     assert_eq!(expected.machine_id().as_str(), "ab".repeat(16));
     assert_eq!(expected.machine_name(), None);
-    let persisted: serde_json::Value =
-        serde_json::from_slice(&fs::read(store.config_path()).unwrap()).unwrap();
-    assert_eq!(persisted["version"], 1);
+    let persisted: toml::Value = toml::from_slice(&fs::read(store.config_path()).unwrap()).unwrap();
+    assert_eq!(persisted["version"].as_integer(), Some(1));
     assert!(persisted.get("machine_name").is_none());
     assert_eq!(
         fs::read_dir(&root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>(),
-        ["config.json"]
+        ["config.toml"]
     );
 
     #[cfg(unix)]
@@ -67,10 +66,9 @@ fn named_config_round_trips_without_changing_the_version() {
 
     assert_eq!(store.load_config().unwrap(), expected);
     assert_eq!(expected.machine_name(), Some("Tom-Mac_1"));
-    let persisted: serde_json::Value =
-        serde_json::from_slice(&fs::read(store.config_path()).unwrap()).unwrap();
-    assert_eq!(persisted["version"], 1);
-    assert_eq!(persisted["machine_name"], "Tom-Mac_1");
+    let persisted: toml::Value = toml::from_slice(&fs::read(store.config_path()).unwrap()).unwrap();
+    assert_eq!(persisted["version"].as_integer(), Some(1));
+    assert_eq!(persisted["machine_name"].as_str(), Some("Tom-Mac_1"));
 }
 
 #[test]

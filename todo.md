@@ -28,8 +28,8 @@
   signing backend over freshly built public commits is feasible — design
   how signing config maps across the boundary and sign at projection time.
 
-- No `ds setup`/`ds login` verb: machine `config.json` (platform data dir,
-  0600, `{version, base_url, machine_id, shared_secret}`) is written by hand.
+- No `ds setup`/`ds login` verb: machine `config.toml` (platform data dir,
+  0600, `{version, base_url, machine_id, machine_name, shared_secret}`) is written by hand.
   Needs a verb that generates the machine id, validates the URL/secret against
   the Worker, and writes the file atomically.
 - Release binaries built inside `nix develop` link libiconv from the build
