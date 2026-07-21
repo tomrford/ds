@@ -52,6 +52,11 @@ fn context(cwd: &Path, config: &Path, cache: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn enable_git_shim(config: &Path) {
+    let text = fs::read_to_string(config).unwrap();
+    fs::write(config, format!("{text}\n[devspace]\ngit-shim = true\n")).unwrap();
+}
+
 fn git(cwd: &Path, args: &[&str]) -> Output {
     Command::new("git")
         .current_dir(cwd)
@@ -102,6 +107,7 @@ fn git_ls_files(checkout: &Path) -> Vec<String> {
 async fn add_sync_share_remove_and_gc_context_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
+    enable_git_shim(&config);
     let cache = temp.path().join("cache");
     let checkout_a = temp.path().join("checkout-a");
     owned_checkout(temp.path(), &config, "context-fixture", &checkout_a).await;
@@ -199,6 +205,7 @@ async fn add_sync_share_remove_and_gc_context_snapshot() {
 async fn warns_when_context_aliases_are_not_ignored() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
+    enable_git_shim(&config);
     let cache = temp.path().join("cache");
     let checkout = temp.path().join("checkout");
     owned_checkout(temp.path(), &config, "warning-fixture", &checkout).await;

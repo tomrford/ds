@@ -104,7 +104,7 @@ pub(crate) async fn remove_checkout(
     if target.path_exists {
         failpoint("before_checkout_deletion_validation");
         validate_checkout_at_path(command, &target.entry, &target.owner, &path)?;
-        crate::git_shim::remove_guard(&path);
+        let _git_shim_removal_guard = crate::git_shim::remove_guard(&path);
         fs::remove_dir_all(&path).map_err(|error| {
             user_error(format!(
                 "Failed to delete checkout directory {}: {error}",

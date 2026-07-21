@@ -7,9 +7,8 @@ const CORE: &str = r#"# Devspace
 
 Devspace keeps native jj repositories on your machine and synchronizes them
 through a cloud authority. Git is a projection boundary for sharing selected
-history, not Devspace's source of truth. Read-only `git` commands (`status`,
-`log`, `ls-files`, and `diff`) use the checkout's index shim. Git writes and
-all `jj` commands fail; use `ds` for changes.
+history, not Devspace's source of truth. Git writes and all `jj` commands fail;
+use `ds` for changes.
 
 ## Daily work
 
@@ -25,6 +24,14 @@ all `jj` commands fail; use `ds` for changes.
 - create a repository and its first checkout with `ds init [<git-url>] [<path>]`
 - create an empty cloud repository without a checkout with `ds repo new [<name>]`
 - inspect machine, cloud, daemon, Git and checkout health with `ds doctor`
+
+## Experimental Git compatibility
+
+The best-effort Git index shim is off by default. Agents that need read-only
+`git status`, `git log`, `git ls-files`, or `git diff` compatibility can set
+the jj user setting `devspace.git-shim = true` in managed jj config, or pass
+`--config devspace.git-shim=true` to each `ds` command. The shim does not make
+Git a supported write surface.
 
 ## Private paths
 

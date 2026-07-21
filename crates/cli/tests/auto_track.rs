@@ -17,6 +17,10 @@ use support::{
 };
 
 async fn checkout(root: &Path, config: &Path, name: &str) -> PathBuf {
+    let text = fs::read_to_string(config).unwrap();
+    if !text.contains("git-shim = true") {
+        fs::write(config, format!("{text}\n[devspace]\ngit-shim = true\n")).unwrap();
+    }
     configure_machine(root, "http://127.0.0.1:1");
     let store = machine_store(root);
     let entry = store

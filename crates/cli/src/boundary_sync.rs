@@ -7,6 +7,8 @@ use std::thread;
 use std::time::Duration;
 
 use devspace_machine::{CatalogEntry, MachineStore, RepositoryName};
+use jj_cli::command_error::{CommandError, user_error};
+use jj_lib::settings::UserSettings;
 
 pub(crate) const BOUNDARY_SYNC_ENV: &str = "DEVSPACE_BOUNDARY_SYNC";
 pub(crate) const DAEMON_ENV: &str = "DEVSPACE_DAEMON";
@@ -23,6 +25,23 @@ struct BoundarySyncState {
     suppressed: bool,
     repositories: BTreeMap<RepositoryName, PathBuf>,
     checkouts: BTreeSet<PathBuf>,
+    git_shim: Option<(bool, UserSettings)>,
+}
+
+pub(crate) fn configure_git_shim(settings: &UserSettings) -> Result<(), CommandError> {
+    let enabled = settings
+        .get_bool(crate::git_shim::SETTING)
+        .map_err(|error| {
+            user_error(format!(
+                "invalid {} setting: {error}",
+                crate::git_shim::SETTING
+            ))
+        })?;
+    state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .git_shim = Some((enabled, settings.clone()));
+    Ok(())
 }
 
 pub(crate) fn record_checkout(path: &Path) {
@@ -75,7 +94,7 @@ pub(crate) fn suppress() {
 }
 
 pub(crate) fn spawn_recorded() {
-    let (suppressed, repositories, checkouts) = {
+    let (suppressed, repositories, checkouts, git_shim) = {
         let mut state = state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -83,12 +102,18 @@ pub(crate) fn spawn_recorded() {
             state.suppressed,
             std::mem::take(&mut state.repositories),
             std::mem::take(&mut state.checkouts),
+            state.git_shim.take(),
         )
     };
-    for checkout in checkouts {
-        crate::git_shim::ensure(&checkout);
+    if suppressed {
+        return;
     }
-    if suppressed || std::env::var_os(BOUNDARY_SYNC_ENV).is_some_and(|value| value == "0") {
+    if let Some((true, settings)) = git_shim {
+        for checkout in checkouts {
+            crate::git_shim::ensure(&checkout, &settings);
+        }
+    }
+    if std::env::var_os(BOUNDARY_SYNC_ENV).is_some_and(|value| value == "0") {
         return;
     }
     let Ok(executable) = std::env::current_exe() else {

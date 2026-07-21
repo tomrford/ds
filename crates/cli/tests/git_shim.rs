@@ -3,7 +3,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use devspace_machine::{
     MachineRepository, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
@@ -30,6 +30,26 @@ async fn local_repository(root: &Path, name: &str) {
     MachineRepository::init(&entry.native_repository_path, &settings())
         .await
         .unwrap();
+}
+
+fn set_git_shim(config: &Path, enabled: bool) {
+    let text = fs::read_to_string(config).unwrap();
+    let value = format!("git-shim = {enabled}");
+    let text = if text.contains("git-shim = ") {
+        text.lines()
+            .map(|line| {
+                if line.trim_start().starts_with("git-shim = ") {
+                    format!("            {value}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        format!("{text}\n[devspace]\n{value}\n")
+    };
+    fs::write(config, text).unwrap();
 }
 
 fn add_checkout(root: &Path, config: &Path, name: &str, checkout: &Path) -> Output {
@@ -70,10 +90,43 @@ fn assert_git_directories_read_only(path: &Path) {
     }
 }
 
+fn make_git_directories_writable(path: &Path) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    if metadata.is_dir() {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() | 0o700);
+        fs::set_permissions(path, permissions).unwrap();
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                make_git_directories_writable(&entry.path());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn git_shim_is_off_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    local_repository(temp.path(), "shim-default-off").await;
+    let checkout = temp.path().join("checkout");
+
+    let added = add_checkout(temp.path(), &config, "shim-default-off", &checkout);
+    assert!(added.status.success(), "{}", stderr(&added));
+    assert!(!checkout.join(".git").exists());
+
+    fs::write(checkout.join("public.txt"), "visible\n").unwrap();
+    let status = ds(&checkout, &config, &["status"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert!(!checkout.join(".git").exists());
+}
+
 #[tokio::test]
 async fn add_and_successful_checkout_commands_maintain_a_private_aware_read_only_index() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
+    set_git_shim(&config, true);
     local_repository(temp.path(), "shim-contract").await;
     let checkout = temp.path().join("checkout");
 
@@ -138,6 +191,168 @@ async fn add_and_successful_checkout_commands_maintain_a_private_aware_read_only
 }
 
 #[tokio::test]
+async fn unchanged_tree_and_policy_do_not_refresh_the_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    set_git_shim(&config, true);
+    local_repository(temp.path(), "shim-noop").await;
+    let checkout = temp.path().join("checkout");
+    let added = add_checkout(temp.path(), &config, "shim-noop", &checkout);
+    assert!(added.status.success(), "{}", stderr(&added));
+    let state_before = fs::read_to_string(checkout.join(".jj/devspace-git-shim.state")).unwrap();
+
+    let output = ds_command(&checkout, &config)
+        .env("JJ_LOG", "warn")
+        .env("DEVSPACE_FAILPOINT", "git_shim_after_exclusion")
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let state_after = fs::read_to_string(checkout.join(".jj/devspace-git-shim.state")).unwrap();
+    assert!(
+        !stderr(&output).contains("git_shim_after_exclusion"),
+        "{}\nstate before: {state_before:?}\nstate after: {state_after:?}",
+        stderr(&output)
+    );
+    assert_eq!(state_after, state_before);
+    assert_git_directories_read_only(&checkout.join(".git"));
+}
+
+#[tokio::test]
+async fn private_policy_change_invalidates_the_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    set_git_shim(&config, true);
+    local_repository(temp.path(), "shim-policy").await;
+    let checkout = temp.path().join("checkout");
+    let added = add_checkout(temp.path(), &config, "shim-policy", &checkout);
+    assert!(added.status.success(), "{}", stderr(&added));
+
+    fs::write(checkout.join(".dsprivate"), "secret.txt\n").unwrap();
+    fs::write(checkout.join("secret.txt"), "private\n").unwrap();
+    let hidden = ds(&checkout, &config, &["status"]);
+    assert!(hidden.status.success(), "{}", stderr(&hidden));
+    assert_eq!(git_ls_files(&checkout), Vec::<String>::new());
+
+    fs::write(checkout.join(".dsprivate"), "").unwrap();
+    let public = ds(&checkout, &config, &["status"]);
+    assert!(public.status.success(), "{}", stderr(&public));
+    assert_eq!(git_ls_files(&checkout), ["secret.txt"]);
+}
+
+#[tokio::test]
+async fn concurrent_commands_serialize_git_shim_refresh() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    set_git_shim(&config, true);
+    local_repository(temp.path(), "shim-concurrent").await;
+    let checkout = temp.path().join("checkout");
+    let added = add_checkout(temp.path(), &config, "shim-concurrent", &checkout);
+    assert!(added.status.success(), "{}", stderr(&added));
+    fs::write(checkout.join("concurrent.txt"), "visible\n").unwrap();
+
+    let children = (0..3)
+        .map(|_| {
+            let mut command = ds_command(&checkout, &config);
+            command
+                .env("JJ_LOG", "warn")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .arg("status")
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(
+            !stderr(&output).contains("index.lock"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert_eq!(git_ls_files(&checkout), ["concurrent.txt"]);
+    assert_git_directories_read_only(&checkout.join(".git"));
+}
+
+#[tokio::test]
+async fn interrupted_refresh_is_repaired_by_the_next_enabled_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    set_git_shim(&config, true);
+    local_repository(temp.path(), "shim-recovery").await;
+    let checkout = temp.path().join("checkout");
+    let added = add_checkout(temp.path(), &config, "shim-recovery", &checkout);
+    assert!(added.status.success(), "{}", stderr(&added));
+    fs::write(checkout.join("recovered.txt"), "visible\n").unwrap();
+
+    let interrupted = ds_command(&checkout, &config)
+        .env("JJ_LOG", "warn")
+        .env("DEVSPACE_FAILPOINT", "git_shim_after_exclusion")
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(interrupted.status.success(), "{}", stderr(&interrupted));
+    assert!(
+        stderr(&interrupted).contains("git_shim_after_exclusion"),
+        "{}",
+        stderr(&interrupted)
+    );
+    assert!(!git_ls_files(&checkout).contains(&"recovered.txt".to_owned()));
+
+    make_git_directories_writable(&checkout.join(".git"));
+    fs::write(checkout.join(".git/index.lock"), "interrupted\n").unwrap();
+    let repaired = ds(&checkout, &config, &["status"]);
+    assert!(repaired.status.success(), "{}", stderr(&repaired));
+    assert!(!checkout.join(".git/index.lock").exists());
+    assert_eq!(git_ls_files(&checkout), ["recovered.txt"]);
+    assert_git_directories_read_only(&checkout.join(".git"));
+}
+
+#[tokio::test]
+async fn boundary_suppression_skips_git_shim_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    local_repository(temp.path(), "shim-suppressed").await;
+    let checkout = temp.path().join("checkout");
+    let added = add_checkout(temp.path(), &config, "shim-suppressed", &checkout);
+    assert!(added.status.success(), "{}", stderr(&added));
+    assert!(!checkout.join(".git").exists());
+
+    set_git_shim(&config, true);
+    let listed = ds(&checkout, &config, &["list"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    assert!(!checkout.join(".git").exists());
+}
+
+#[tokio::test]
+async fn checkout_removal_unlocks_a_legacy_shim_after_disabling() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    set_git_shim(&config, true);
+    local_repository(temp.path(), "shim-disabled-removal").await;
+    let checkout = temp.path().join("checkout");
+    let added = add_checkout(temp.path(), &config, "shim-disabled-removal", &checkout);
+    assert!(added.status.success(), "{}", stderr(&added));
+    assert_git_directories_read_only(&checkout.join(".git"));
+
+    set_git_shim(&config, false);
+    fs::write(checkout.join("disabled.txt"), "not refreshed\n").unwrap();
+    let status = ds(&checkout, &config, &["status"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert!(!git_ls_files(&checkout).contains(&"disabled.txt".to_owned()));
+
+    let removed = ds_command(temp.path(), &config)
+        .arg("remove")
+        .arg(&checkout)
+        .output()
+        .unwrap();
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(!checkout.exists());
+}
+
+#[tokio::test]
 async fn plain_jj_checkout_never_gets_a_git_shim() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
@@ -159,6 +374,7 @@ async fn plain_jj_checkout_never_gets_a_git_shim() {
 async fn missing_git_warns_without_failing_add() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
+    set_git_shim(&config, true);
     local_repository(temp.path(), "missing-git").await;
     let checkout = temp.path().join("checkout");
     let empty_path = temp.path().join("empty-path");
@@ -186,6 +402,7 @@ async fn missing_git_warns_without_failing_add() {
 async fn pathspec_special_names_are_handled_literally() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
+    set_git_shim(&config, true);
     local_repository(temp.path(), "shim-literal").await;
     let checkout = temp.path().join("checkout");
     let added = add_checkout(temp.path(), &config, "shim-literal", &checkout);
@@ -215,6 +432,7 @@ async fn pathspec_special_names_are_handled_literally() {
 async fn hidden_path_with_newline_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
+    set_git_shim(&config, true);
     local_repository(temp.path(), "shim-newline").await;
     let checkout = temp.path().join("checkout");
     let added = add_checkout(temp.path(), &config, "shim-newline", &checkout);

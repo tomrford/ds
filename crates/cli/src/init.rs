@@ -95,7 +95,6 @@ pub(crate) async fn init_repository(
             )
             .await
             .map_err(|error| post_registration_error(user_error(error), &incomplete))?;
-            crate::git_shim::ensure(&checkout_path);
             imported.write_summary(ui)?;
             writeln!(ui.status(), "Checkout: {}", checkout_path.display())?;
             Ok(())

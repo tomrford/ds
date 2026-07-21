@@ -174,6 +174,17 @@ state. Removing a completed checkout directory and repeating the same command
 rebuilds it from the registered workspace. Use `ds remove` for normal removal
 so the workspace identity is freed.
 
+The experimental Git index shim is best-effort compatibility for read-only
+Git consumers. It is off by default and creates no `.git` directory unless the
+jj user setting `devspace.git-shim` is `true`. An agent runner can enable it in
+managed jj config or pass `--config devspace.git-shim=true` to each `ds`
+command. This is a jj user setting, not versioned Devspace machine
+`config.toml`. When enabled, Devspace refreshes the index only after the
+materialized tree or `.dsprivate` policy identity changes, serializes refresh
+with a checkout-local lock under `.jj`, and restores `.git` directories to
+read-only permissions. The shim does not make Git writes supported and can
+warn without failing an otherwise successful `ds` command.
+
 `ds remove <path>` removes one checkout without removing its native repository
 or catalog entry. The command accepts only a directory with a valid Devspace
 ownership marker whose repository identity is in the local catalog. It

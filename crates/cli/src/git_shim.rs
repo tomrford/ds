@@ -2,14 +2,15 @@
 //! Git metadata without treating Git as Devspace's local VCS surface.
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 use std::process::Command;
 
+use blake2::{Blake2b512, Digest as _};
 use jj_lib::backend::TreeValue;
-use jj_lib::config::StackedConfig;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::merged_tree::MergedTree;
+use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::StoreFactories;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::settings::UserSettings;
@@ -20,9 +21,15 @@ const PRIVATE_EXCLUDES_END: &str = "# /devspace private paths";
 const MAX_PATHS_PER_GIT_COMMAND: usize = 128;
 const MAX_PATH_BYTES_PER_GIT_COMMAND: usize = 32 * 1024;
 const AFTER_EXCLUSION_FAILPOINT: &str = "git_shim_after_exclusion";
+const LOCK_FILE: &str = "devspace-git-shim.lock";
+const STATE_FILE: &str = "devspace-git-shim.state";
+const TREE_IDENTITY_DOMAIN: &[u8] = b"devspace-git-shim-tree-v1";
+const POLICY_IDENTITY_DOMAIN: &[u8] = b"devspace-hidden-set-v1";
 
-pub fn ensure(checkout_root: &Path) {
-    if let Err(err) = ensure_inner(checkout_root) {
+pub const SETTING: &str = "devspace.git-shim";
+
+pub fn ensure(checkout_root: &Path, settings: &UserSettings) {
+    if let Err(err) = ensure_inner(checkout_root, settings) {
         tracing::warn!(
             checkout = %checkout_root.display(),
             "git index shim refresh failed: {err}"
@@ -30,16 +37,28 @@ pub fn ensure(checkout_root: &Path) {
     }
 }
 
-pub fn remove_guard(checkout_root: &Path) {
-    if let Err(err) = make_git_dirs_writable(checkout_root) {
-        tracing::warn!(
-            checkout = %checkout_root.display(),
-            "git index shim unlock failed: {err}"
-        );
+pub struct RemovalGuard {
+    _lock: Option<CheckoutLock>,
+}
+
+pub fn remove_guard(checkout_root: &Path) -> RemovalGuard {
+    match CheckoutLock::acquire(checkout_root).and_then(|lock| {
+        make_git_dirs_writable(checkout_root)?;
+        Ok(lock)
+    }) {
+        Ok(lock) => RemovalGuard { _lock: Some(lock) },
+        Err(err) => {
+            tracing::warn!(
+                checkout = %checkout_root.display(),
+                "git index shim unlock failed: {err}"
+            );
+            RemovalGuard { _lock: None }
+        }
     }
 }
 
-fn ensure_inner(checkout_root: &Path) -> Result<(), String> {
+fn ensure_inner(checkout_root: &Path, settings: &UserSettings) -> Result<(), String> {
+    let _checkout_lock = CheckoutLock::acquire(checkout_root)?;
     let git_dir = checkout_root.join(".git");
     if git_dir.exists() && !git_dir.is_dir() {
         return Err(format!(
@@ -47,11 +66,9 @@ fn ensure_inner(checkout_root: &Path) -> Result<(), String> {
             git_dir.display()
         ));
     }
-
-    if !git_dir.exists() {
-        require_success(git(checkout_root).args(["init", "-q"]), "git init")?;
-        GitDirGuard::new(checkout_root).finish()?;
-    }
+    // An interrupted process can leave the guard relaxed. Repair it before
+    // resolving any refresh inputs so errors cannot extend that window.
+    make_git_dirs_read_only(checkout_root)?;
 
     // Resolve everything that does not need a writable .git first. In
     // particular, an unrelated invalid filesystem path must not leave the
@@ -60,7 +77,18 @@ fn ensure_inner(checkout_root: &Path) -> Result<(), String> {
         crate::working_copy::base_ignores(checkout_root).map_err(|error| error.to_string())?;
     let discovered = crate::working_copy::discover_shim_paths(checkout_root, &base_ignores)
         .map_err(|error| error.to_string())?;
-    let canonical = canonical_paths(checkout_root)?;
+    let canonical = canonical_paths(checkout_root, settings)?;
+    let refresh_state = canonical.refresh_state(&discovered);
+    if git_dir.is_dir()
+        && (git_dir.join("index").is_file() || !canonical.has_public_paths())
+        && read_refresh_state(checkout_root).as_deref() == Some(refresh_state.as_str())
+    {
+        return if canonical.policy_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(canonical.policy_errors.join("; "))
+        };
+    }
     let excluded_paths = discovered
         .hidden_paths
         .iter()
@@ -107,6 +135,10 @@ fn ensure_inner(checkout_root: &Path) -> Result<(), String> {
 
     let guard = GitDirGuard::acquire(checkout_root)?;
     let refresh = (|| {
+        if !git_dir.exists() {
+            require_success(git(checkout_root).args(["init", "-q"]), "git init")?;
+        }
+        remove_stale_index_lock(&git_dir)?;
         ensure_info_exclude(&git_dir, excluded_paths.iter().map(|path| path.as_ref()))?;
 
         // Remove exclusions before adding anything. Once removed, info/exclude
@@ -118,6 +150,7 @@ fn ensure_inner(checkout_root: &Path) -> Result<(), String> {
         }
         require_success(git(checkout_root).args(["add", "-A"]), "git add -A")?;
         add_to_index(checkout_root, canonical_public)?;
+        write_refresh_state(checkout_root, &refresh_state)?;
 
         if canonical.policy_errors.is_empty() {
             Ok(())
@@ -125,8 +158,11 @@ fn ensure_inner(checkout_root: &Path) -> Result<(), String> {
             Err(canonical.policy_errors.join("; "))
         }
     })();
-    let relocked = guard.finish();
-    match (refresh, relocked) {
+    finish_guard(refresh, guard)
+}
+
+fn finish_guard(result: Result<(), String>, guard: GitDirGuard<'_>) -> Result<(), String> {
+    match (result, guard.finish()) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
         (Ok(()), Err(error)) => Err(error),
@@ -137,17 +173,53 @@ fn ensure_inner(checkout_root: &Path) -> Result<(), String> {
 }
 
 struct CanonicalPaths {
+    tree_identity: String,
+    policy_identity: String,
     tracked_paths: BTreeSet<RepoPathBuf>,
     hidden_paths: BTreeSet<RepoPathBuf>,
     fail_closed_roots: BTreeSet<RepoPathBuf>,
     policy_errors: Vec<String>,
 }
 
-fn canonical_paths(checkout_root: &Path) -> Result<CanonicalPaths, String> {
-    let settings = UserSettings::from_config(StackedConfig::with_defaults())
-        .map_err(|error| format!("load jj settings: {error}"))?;
+impl CanonicalPaths {
+    fn refresh_state(&self, discovered: &crate::working_copy::ShimDiscovery) -> String {
+        let mut hasher = Blake2b512::new();
+        hasher.update(self.tree_identity.as_bytes());
+        for (kind, paths) in [
+            (b'h', &discovered.hidden_paths),
+            (b'i', &discovered.base_ignored_paths),
+        ] {
+            for path in paths {
+                let path = path.as_internal_file_string();
+                hasher.update([kind]);
+                hasher.update((path.len() as u64).to_le_bytes());
+                hasher.update(path.as_bytes());
+            }
+        }
+        format!(
+            "{}\n{}\n",
+            hex_bytes(&hasher.finalize()),
+            self.policy_identity
+        )
+    }
+
+    fn has_public_paths(&self) -> bool {
+        self.tracked_paths.iter().any(|path| {
+            !self.hidden_paths.contains(path)
+                && !self
+                    .fail_closed_roots
+                    .iter()
+                    .any(|root| at_or_below(path, root))
+        })
+    }
+}
+
+fn canonical_paths(
+    checkout_root: &Path,
+    settings: &UserSettings,
+) -> Result<CanonicalPaths, String> {
     let workspace = Workspace::load(
-        &settings,
+        settings,
         checkout_root,
         &StoreFactories::default(),
         &crate::working_copy::devspace_working_copy_factories(),
@@ -162,6 +234,7 @@ fn canonical_paths(checkout_root: &Path) -> Result<CanonicalPaths, String> {
 }
 
 async fn resolve_canonical_paths(tree: MergedTree) -> Result<CanonicalPaths, String> {
+    let tree_identity = tree_identity(&tree);
     let store = tree.store();
     let mut policy_paths = BTreeSet::new();
     for tree_id in tree.tree_ids().iter() {
@@ -183,6 +256,7 @@ async fn resolve_canonical_paths(tree: MergedTree) -> Result<CanonicalPaths, Str
     }
 
     let mut matcher = GitIgnoreFile::empty();
+    let mut policy_files = Vec::new();
     let mut fail_closed_roots = BTreeSet::new();
     let mut policy_errors = Vec::new();
     for path in &policy_paths {
@@ -210,6 +284,7 @@ async fn resolve_canonical_paths(tree: MergedTree) -> Result<CanonicalPaths, Str
                 continue;
             }
         };
+        policy_files.push((path.clone(), id.clone()));
         let contents = store.read_file(path, &id).await.map_err(|error| {
             format!("read canonical {}: {error}", path.as_internal_file_string())
         })?;
@@ -251,11 +326,64 @@ async fn resolve_canonical_paths(tree: MergedTree) -> Result<CanonicalPaths, Str
     hidden_paths.extend(policy_paths);
 
     Ok(CanonicalPaths {
+        tree_identity,
+        policy_identity: policy_identity(&policy_files),
         tracked_paths,
         hidden_paths,
         fail_closed_roots,
         policy_errors,
     })
+}
+
+fn tree_identity(tree: &MergedTree) -> String {
+    let mut hasher = Blake2b512::new();
+    hasher.update(TREE_IDENTITY_DOMAIN);
+    for id in tree.tree_ids().iter() {
+        hasher.update((id.as_bytes().len() as u64).to_le_bytes());
+        hasher.update(id.as_bytes());
+    }
+    for label in tree.labels().as_slice() {
+        hasher.update((label.len() as u64).to_le_bytes());
+        hasher.update(label.as_bytes());
+    }
+    hex_bytes(&hasher.finalize())
+}
+
+fn policy_identity(files: &[(RepoPathBuf, jj_lib::backend::FileId)]) -> String {
+    if files.is_empty() {
+        return "none".to_owned();
+    }
+    let mut hasher = Blake2b512::new();
+    hasher.update(POLICY_IDENTITY_DOMAIN);
+    for (path, id) in files {
+        let path = path.as_internal_file_string();
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(id.as_bytes());
+    }
+    hex_bytes(&hasher.finalize())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn read_refresh_state(checkout_root: &Path) -> Option<String> {
+    fs::read_to_string(checkout_root.join(".jj").join(STATE_FILE)).ok()
+}
+
+fn write_refresh_state(checkout_root: &Path, state: &str) -> Result<(), String> {
+    let path = checkout_root.join(".jj").join(STATE_FILE);
+    fs::write(&path, state).map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+fn remove_stale_index_lock(git_dir: &Path) -> Result<(), String> {
+    let path = git_dir.join("index.lock");
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove stale {}: {error}", path.display())),
+    }
 }
 
 fn fail_closed_policy(
@@ -438,6 +566,32 @@ fn update_git_dir_modes(checkout_root: &Path, f: impl Fn(u32) -> u32 + Copy) -> 
     }
     crate::tree_modes::rewrite(&git_dir, |is_dir, mode| is_dir.then(|| f(mode)))
         .map_err(|error| format!("update modes under {}: {error}", git_dir.display()))
+}
+
+struct CheckoutLock {
+    file: fs::File,
+}
+
+impl CheckoutLock {
+    fn acquire(checkout_root: &Path) -> Result<Self, String> {
+        let path = checkout_root.join(".jj").join(LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| format!("open {}: {error}", path.display()))?;
+        file.lock()
+            .map_err(|error| format!("lock {}: {error}", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for CheckoutLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 struct GitDirGuard<'a> {

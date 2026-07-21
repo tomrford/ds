@@ -35,7 +35,7 @@ use clap::Subcommand as _;
 use jj_cli::cli_util::{CliRunner, CommandHelper};
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
-use jj_lib::config::{ConfigMigrationRule, ConfigSource};
+use jj_lib::config::{ConfigLayer, ConfigMigrationRule, ConfigSource};
 use jj_lib::op_heads_store::OpHeadsStoreError;
 
 static REPOSITORY_SELECTOR: OnceLock<Arc<RepositorySelector>> = OnceLock::new();
@@ -56,6 +56,7 @@ pub fn run() -> ExitCode {
         .name("ds")
         .about(APP_ABOUT)
         .version(env!("CARGO_PKG_VERSION"))
+        .add_extra_config(devspace_default_config())
         .set_workspace_loader_factory(Box::new(DevspaceWorkspaceLoaderFactory::new(
             repository_selector,
         )))
@@ -72,6 +73,17 @@ pub fn run() -> ExitCode {
         boundary_sync::spawn_recorded();
     }
     exit_code
+}
+
+fn devspace_default_config() -> ConfigLayer {
+    ConfigLayer::parse(
+        ConfigSource::Default,
+        r#"
+            [devspace]
+            git-shim = false
+        "#,
+    )
+    .expect("built-in Devspace config is valid")
 }
 
 fn devspace_alias_migration() -> ConfigMigrationRule {
@@ -185,6 +197,7 @@ async fn restrict_bare_repository_commands(
     command: &CommandHelper,
     stock_dispatch: jj_cli::cli_util::BoxedAsyncCliDispatch<'_>,
 ) -> Result<(), CommandError> {
+    crate::boundary_sync::configure_git_shim(command.settings())?;
     // Daemon and sync plumbing are workspace-less. `sync run --repository-name`
     // resolves its value through the machine catalog.
     if matches!(command.matches().subcommand_name(), Some("daemon" | "sync")) {

@@ -223,7 +223,7 @@ pub(crate) async fn add_checkout(
             })?;
     }
 
-    crate::git_shim::ensure(&requested_path);
+    crate::boundary_sync::record_checkout(&requested_path);
 
     let checkout = AddedCheckout {
         root: &requested_path,
