@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use devspace_machine::{CatalogEntry, MachineConfig, MachineRepository, MachineStore};
 use jj_cli::cli_util::CommandHelper;
@@ -66,8 +66,7 @@ pub(crate) async fn remove_checkout(
     let target = match fs::symlink_metadata(&path) {
         Ok(_) => target_from_marker(&store, &machine, &path, &expected_workspace, command).await?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            target_from_workspace_store(&store, &path, &expected_workspace, command.settings())
-                .await?
+            target_from_workspace_store(&store, &path, &expected_workspace)?
         }
         Err(_) => return Err(not_checkout(&path)),
     };
@@ -101,16 +100,10 @@ pub(crate) async fn remove_checkout(
     if registered && target.path_exists {
         snapshot_checkout(ui, command, &target.entry, &path, &workspace_name).await?;
     }
-    if registered {
-        forget_workspace(&target.entry, &workspace_name, &settings).await?;
-    } else {
-        forget_workspace_record(&target.entry.native_repository_path, &workspace_name)?;
-    }
 
     if target.path_exists {
-        if !owned_directory_matches(&path, &target.owner).map_err(|_| not_checkout(&path))? {
-            return Err(not_checkout(&path));
-        }
+        failpoint("before_checkout_deletion_validation");
+        validate_checkout_at_path(command, &target.entry, &target.owner, &path)?;
         crate::git_shim::remove_guard(&path);
         fs::remove_dir_all(&path).map_err(|error| {
             user_error(format!(
@@ -118,6 +111,12 @@ pub(crate) async fn remove_checkout(
                 path.display()
             ))
         })?;
+    }
+
+    if registered {
+        forget_workspace(&target.entry, &workspace_name, &settings).await?;
+    } else {
+        forget_workspace_record(&target.entry.native_repository_path, &workspace_name)?;
     }
 
     let removed = RemovedCheckout {
@@ -196,18 +195,8 @@ async fn explain_mismatched_checkout(
         .get_workspace_path(registered_workspace)
         .map_err(CommandError::from)?
         .ok_or_else(|| stale_checkout(path))?;
-    let registered_path = if registered_path.is_absolute() {
-        registered_path
-    } else {
-        entry.native_repository_path.join(registered_path)
-    };
     let registered_path =
-        canonical_destination_path(&registered_path).map_err(|_| stale_checkout(path))?;
-
-    let workspace = command
-        .load_workspace_at(path, command.settings())
-        .map_err(|_| not_checkout(path))?;
-    validate_workspace(&workspace, entry, registered_workspace).map_err(|_| not_checkout(path))?;
+        resolve_stored_workspace_path(&entry.native_repository_path, &registered_path);
     let repository = MachineRepository::open(&entry.native_repository_path, command.settings())
         .await
         .map_err(|error| user_error(error.to_string()))?;
@@ -219,12 +208,27 @@ async fn explain_mismatched_checkout(
     {
         return Err(stale_checkout(path));
     }
+    if !fs::read_to_string(path.join(".jj/working_copy/type"))
+        .is_ok_and(|kind| kind == crate::working_copy::DEVSPACE_WORKING_COPY_TYPE)
+    {
+        return Err(not_checkout(path));
+    }
+    let working_copy = crate::working_copy::devspace_working_copy_factory()
+        .load_working_copy(
+            repository.repo().store().clone(),
+            path.to_owned(),
+            path.join(".jj/working_copy"),
+            command.settings(),
+        )
+        .map_err(|_| not_checkout(path))?;
+    if working_copy.workspace_name() != registered_workspace {
+        return Err(not_checkout(path));
+    }
 
     if registered_path == path {
         return Err(user_error(format!(
-            "Checkout {} is registered at {}, but its workspace identity no longer matches this machine name. Restore the previous machine name, run `ds remove {}`, then rename the machine again; nothing was touched",
+            "Checkout {} is registered at {}, but its workspace identity no longer matches this machine name. Restore the previous machine name, remove the registered path with `ds remove`, then rename the machine again; nothing was touched",
             path.display(),
-            registered_path.display(),
             registered_path.display()
         )));
     }
@@ -233,16 +237,13 @@ async fn explain_mismatched_checkout(
     }
     match fs::symlink_metadata(&registered_path) {
         Ok(_) => Err(user_error(format!(
-            "Checkout {} is a copy of the Devspace checkout registered at {}; run `ds remove {}` for the registered checkout; the copied directory was not touched",
+            "Checkout {} is a copy of the Devspace checkout registered at {}; remove that registered path with `ds remove`; the copied directory was not touched",
             path.display(),
-            registered_path.display(),
             registered_path.display()
         ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(user_error(format!(
-            "Checkout {} was moved from its registered path {}. Move it back to {}, then run `ds remove {}`; nothing was touched",
+            "Checkout {} was moved from its registered path {}. Move it back to that path, then remove it with `ds remove`; nothing was touched",
             path.display(),
-            registered_path.display(),
-            registered_path.display(),
             registered_path.display()
         ))),
         Err(error) => Err(user_error(format!(
@@ -259,11 +260,10 @@ fn stale_checkout(path: &Path) -> CommandError {
     ))
 }
 
-async fn target_from_workspace_store(
+fn target_from_workspace_store(
     store: &MachineStore,
     path: &Path,
     workspace_name: &WorkspaceName,
-    settings: &jj_lib::settings::UserSettings,
 ) -> Result<RemovalTarget, CommandError> {
     let mut matches = Vec::new();
     for entry in store
@@ -286,17 +286,7 @@ async fn target_from_workspace_store(
         if !workspace_paths_match(&entry.native_repository_path, &stored_path, path) {
             continue;
         }
-        let repository = MachineRepository::open(&entry.native_repository_path, settings)
-            .await
-            .map_err(|error| user_error(error.to_string()))?;
-        if repository
-            .repo()
-            .view()
-            .get_wc_commit_id(workspace_name)
-            .is_some()
-        {
-            matches.push(entry);
-        }
+        matches.push(entry);
     }
     let [entry] = matches.as_slice() else {
         return Err(not_checkout(path));
@@ -317,12 +307,30 @@ fn workspace_paths_match(
     stored_path: &Path,
     requested_path: &Path,
 ) -> bool {
-    let stored_path = if stored_path.is_absolute() {
+    resolve_stored_workspace_path(repository_path, stored_path) == requested_path
+}
+
+fn resolve_stored_workspace_path(repository_path: &Path, stored_path: &Path) -> PathBuf {
+    let path = if stored_path.is_absolute() {
         stored_path.to_owned()
     } else {
-        repository_path.join(stored_path)
+        dunce::canonicalize(repository_path)
+            .unwrap_or_else(|_| repository_path.to_owned())
+            .join(stored_path)
     };
-    canonical_destination_path(&stored_path).is_ok_and(|stored| stored == requested_path)
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                resolved.push(component.as_os_str());
+            }
+        }
+    }
+    resolved
 }
 
 fn require_native_repository(entry: &CatalogEntry) -> Result<(), CommandError> {
@@ -463,6 +471,25 @@ fn validate_workspace(
     Ok(())
 }
 
+fn validate_checkout_at_path(
+    command: &CommandHelper,
+    entry: &CatalogEntry,
+    owner: &CheckoutOwner,
+    path: &Path,
+) -> Result<(), CommandError> {
+    if !owned_directory_matches(path, owner).map_err(|_| not_checkout(path))? {
+        return Err(not_checkout(path));
+    }
+    let workspace = command
+        .load_workspace_at(path, command.settings())
+        .map_err(|_| not_checkout(path))?;
+    validate_workspace(
+        &workspace,
+        entry,
+        WorkspaceName::new(owner.workspace_name()),
+    )
+}
+
 async fn forget_workspace(
     entry: &CatalogEntry,
     workspace_name: &WorkspaceName,
@@ -521,6 +548,7 @@ async fn forget_workspace(
             RepoTransactionError::Rebase(source) => CommandError::from(source),
             RepoTransactionError::Commit(source) => CommandError::from(source),
         })?;
+        failpoint("after_repository_view_forget");
     }
     forget_workspace_record(&entry.native_repository_path, workspace_name)
 }
@@ -539,4 +567,24 @@ fn not_checkout(path: &Path) -> CommandError {
         "{} is not a Devspace checkout; nothing was touched",
         path.display()
     ))
+}
+
+fn failpoint(name: &str) {
+    if std::env::var_os("DEVSPACE_TEST_CHECKOUT_FAILPOINT").as_deref()
+        != Some(std::ffi::OsStr::new(name))
+    {
+        return;
+    }
+    if let Some(path) = std::env::var_os("DEVSPACE_TEST_CHECKOUT_FAILPOINT_READY") {
+        let _ = fs::write(path, name);
+    }
+    if let Some(path) = std::env::var_os("DEVSPACE_TEST_CHECKOUT_FAILPOINT_CONTINUE") {
+        while !Path::new(&path).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        return;
+    }
+    loop {
+        std::thread::park();
+    }
 }

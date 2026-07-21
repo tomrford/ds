@@ -178,23 +178,26 @@ so the workspace identity is freed.
 or catalog entry. The command accepts only a directory with a valid Devspace
 ownership marker whose repository identity is in the local catalog. It
 snapshots the checkout first, including stale working-copy recovery, so final
-file edits remain in the shared store. It then forgets the workspace, removes
-its workspace-path record and deletes the checkout directory. Other checkouts
-and repository data remain available. `--json` prints the removed repository,
-workspace and root identity.
+file edits remain in the shared store. It revalidates the checkout identity,
+deletes the directory, forgets the workspace from the repository view and then
+removes its workspace-path record. Other checkouts and repository data remain
+available. `--json` prints the removed repository, workspace and root identity.
 
 Removal also converges from interrupted states. A marked directory whose
 workspace is already forgotten is deleted. If the directory is already gone,
-the deterministic workspace identity and stored path allow the command to
-forget its remaining registration. An unmarked directory or a marker whose
-repository is absent from the catalog is left untouched.
+the deterministic workspace identity, exact stored path and unique catalog
+repository allow the command to forget either or both remaining records. An
+unmarked directory or a marker whose repository is absent from the catalog is
+left untouched.
 
 A checkout moved away from its registered path is also left untouched. If its
-marker, working-copy state, repository pointer and workspace registration still
-agree, `ds remove` reports the original path and directs the user to move the
-checkout back before removing it. If the original path still exists, the new
-directory is treated as a copy. Forged markers and stale workspace metadata do
-not establish ownership.
+marker, Devspace working-copy type and workspace identity, catalog repository
+identity and workspace registration agree, `ds remove` reports the original
+path and directs the user to move the checkout back before removing it. This
+diagnostic does not require the relative repository pointer to resolve after a
+cross-parent move. If the original path still exists, the new directory is
+treated as a copy. Forged markers and stale workspace metadata do not establish
+ownership.
 
 Downloaded packs are decoded and hash-checked again before the machine installs
 their canonical objects into the stock simple stores with no-clobber writes.

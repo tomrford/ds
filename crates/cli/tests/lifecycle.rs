@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Child, Output, Stdio};
+use std::thread;
 
 use devspace_machine::{
     MachineRepository, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
@@ -58,6 +59,36 @@ fn remove_checkout(cwd: &Path, config: &Path, path: &Path) -> Output {
         .arg(path)
         .output()
         .unwrap()
+}
+
+fn spawn_remove_at_failpoint(
+    cwd: &Path,
+    config: &Path,
+    path: &Path,
+    failpoint: &str,
+    ready: &Path,
+    continue_path: &Path,
+) -> Child {
+    let mut command = ds_command(cwd, config);
+    command
+        .env("DEVSPACE_TEST_CHECKOUT_FAILPOINT", failpoint)
+        .env("DEVSPACE_TEST_CHECKOUT_FAILPOINT_READY", ready)
+        .env("DEVSPACE_TEST_CHECKOUT_FAILPOINT_CONTINUE", continue_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .arg("remove")
+        .arg(path);
+    command.spawn().unwrap()
+}
+
+fn wait_for_failpoint(ready: &Path) {
+    for _ in 0..1_000 {
+        if ready.exists() {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("checkout failpoint was not reached");
 }
 
 fn visible_head_ids(cwd: &Path, config: &Path, repo: &str) -> Vec<String> {
@@ -131,15 +162,38 @@ fn stored_workspace_path(
         .unwrap()
 }
 
+async fn forget_workspace_in_repository_view(
+    repository_path: &Path,
+    workspace_name: &WorkspaceName,
+) {
+    let repository = MachineRepository::open(repository_path, &settings())
+        .await
+        .unwrap();
+    let mut transaction = repository.repo().start_transaction();
+    transaction
+        .repo_mut()
+        .remove_wc_commit(workspace_name)
+        .await
+        .unwrap();
+    transaction.repo_mut().rebase_descendants().await.unwrap();
+    transaction
+        .commit("simulated interrupted remove")
+        .await
+        .unwrap();
+}
+
 fn checkout_repository_path(checkout: &Path) -> PathBuf {
+    dunce::canonicalize(checkout_repository_pointer(checkout)).unwrap()
+}
+
+fn checkout_repository_pointer(checkout: &Path) -> PathBuf {
     let pointer =
         PathBuf::from(String::from_utf8(fs::read(checkout.join(".jj/repo")).unwrap()).unwrap());
-    let pointer = if pointer.is_absolute() {
+    if pointer.is_absolute() {
         pointer
     } else {
         checkout.join(".jj").join(pointer)
-    };
-    dunce::canonicalize(pointer).unwrap()
+    }
 }
 
 fn copy_directory(source: &Path, destination: &Path) {
@@ -326,8 +380,9 @@ async fn renaming_machine_invalidates_existing_checkout_with_recovery_guidance()
         error.contains("Restore the previous machine name"),
         "{error}"
     );
+    assert!(error.contains("with `ds remove`"), "{error}");
     assert!(
-        error.contains(&format!("`ds remove {registered}`")),
+        !error.contains(&format!("ds remove {registered}")),
         "{error}"
     );
     assert!(path.join(".jj/devspace-checkout-owner").is_file());
@@ -360,8 +415,9 @@ async fn remove_reports_the_registered_path_after_a_same_volume_move() {
         "{error}"
     );
     assert!(error.contains(&registered.display().to_string()), "{error}");
+    assert!(error.contains("with `ds remove`"), "{error}");
     assert!(
-        error.contains(&format!("`ds remove {}`", registered.display())),
+        !error.contains(&format!("ds remove {}", registered.display())),
         "{error}"
     );
     assert!(moved.is_dir());
@@ -378,8 +434,8 @@ async fn remove_reports_the_registered_path_after_a_cross_volume_move_result() {
     let temp = tempfile::tempdir().unwrap();
     let repository_path = local_repository(temp.path(), "cross-volume-move").await;
     let config = write_cli_config(temp.path());
-    let original = temp.path().join("original");
-    let moved = temp.path().join("moved");
+    let original = temp.path().join("source/checkouts/original checkout");
+    let moved = temp.path().join("destination/moved checkout");
     let added = add_checkout(
         temp.path(),
         &config,
@@ -389,8 +445,13 @@ async fn remove_reports_the_registered_path_after_a_cross_volume_move_result() {
     );
     let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
     let registered = PathBuf::from(added["root"].as_str().unwrap());
+    fs::create_dir_all(moved.parent().unwrap()).unwrap();
     copy_directory(&original, &moved);
     support_fs::remove_dir_all(&original);
+    assert!(
+        dunce::canonicalize(checkout_repository_pointer(&moved)).is_err(),
+        "the moved checkout must have a broken relative repository pointer"
+    );
 
     let output = remove_checkout(temp.path(), &config, &moved);
 
@@ -401,10 +462,46 @@ async fn remove_reports_the_registered_path_after_a_cross_volume_move_result() {
         "{error}"
     );
     assert!(error.contains(&registered.display().to_string()), "{error}");
+    assert!(error.contains("with `ds remove`"), "{error}");
     assert!(
-        error.contains(&format!("`ds remove {}`", registered.display())),
+        !error.contains(&format!("ds remove {}", registered.display())),
         "{error}"
     );
+    assert!(moved.is_dir());
+    assert!(workspace_names(&repository_path).await.contains(&workspace));
+    assert!(stored_workspace_path(&repository_path, &workspace).is_some());
+}
+
+#[tokio::test]
+async fn remove_reports_the_registered_path_when_its_parent_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_path = local_repository(temp.path(), "missing-original-parent").await;
+    let config = write_cli_config(temp.path());
+    let original = temp.path().join("vanished parent/original checkout");
+    let moved = temp.path().join("surviving parent/moved checkout");
+    let added = add_checkout(
+        temp.path(),
+        &config,
+        "missing-original-parent",
+        "root()",
+        &original,
+    );
+    let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
+    let registered = PathBuf::from(added["root"].as_str().unwrap());
+    fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    copy_directory(&original, &moved);
+    support_fs::remove_dir_all(original.parent().unwrap());
+
+    let output = remove_checkout(temp.path(), &config, &moved);
+
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(
+        error.contains("was moved from its registered path"),
+        "{error}"
+    );
+    assert!(error.contains(&registered.display().to_string()), "{error}");
+    assert!(error.contains("with `ds remove`"), "{error}");
     assert!(moved.is_dir());
     assert!(workspace_names(&repository_path).await.contains(&workspace));
     assert!(stored_workspace_path(&repository_path, &workspace).is_some());
@@ -427,8 +524,9 @@ async fn remove_rejects_a_copied_checkout_and_reports_the_registered_path() {
     let error = stderr(&output);
     assert!(error.contains("is a copy"), "{error}");
     assert!(error.contains(registered), "{error}");
+    assert!(error.contains("with `ds remove`"), "{error}");
     assert!(
-        error.contains(&format!("`ds remove {registered}`")),
+        !error.contains(&format!("ds remove {registered}")),
         "{error}"
     );
     assert!(original.is_dir());
@@ -461,6 +559,39 @@ async fn remove_rejects_a_forged_marker_without_working_copy_metadata() {
         "untouched"
     );
     assert!(original.is_dir());
+}
+
+#[tokio::test]
+async fn remove_rejects_a_forged_marker_at_an_unregistered_canonical_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_path = local_repository(temp.path(), "forgotten-forged-marker").await;
+    let config = write_cli_config(temp.path());
+    let path = temp.path().join("checkout");
+    let added = add_checkout(
+        temp.path(),
+        &config,
+        "forgotten-forged-marker",
+        "root()",
+        &path,
+    );
+    let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
+    let marker = fs::read(path.join(".jj/devspace-checkout-owner")).unwrap();
+    forget_workspace_in_repository_view(&repository_path, &workspace).await;
+    support_fs::remove_dir_all(&path);
+    fs::create_dir_all(path.join(".jj")).unwrap();
+    fs::write(path.join(".jj/devspace-checkout-owner"), marker).unwrap();
+    fs::write(path.join("keep"), "untouched").unwrap();
+
+    let output = remove_checkout(temp.path(), &config, &path);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("not a Devspace checkout"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read_to_string(path.join("keep")).unwrap(), "untouched");
+    assert!(stored_workspace_path(&repository_path, &workspace).is_some());
 }
 
 #[tokio::test]
@@ -616,26 +747,59 @@ async fn remove_finishes_when_the_workspace_was_already_forgotten() {
     let path = temp.path().join("checkout");
     let added = add_checkout(temp.path(), &config, "forgotten", "root()", &path);
     let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
-    let repository = MachineRepository::open(&repository_path, &settings())
-        .await
-        .unwrap();
-    let mut transaction = repository.repo().start_transaction();
-    transaction
-        .repo_mut()
-        .remove_wc_commit(&workspace)
-        .await
-        .unwrap();
-    transaction.repo_mut().rebase_descendants().await.unwrap();
-    transaction
-        .commit("simulated interrupted remove")
-        .await
-        .unwrap();
+    forget_workspace_in_repository_view(&repository_path, &workspace).await;
     assert!(stored_workspace_path(&repository_path, &workspace).is_some());
 
     let output = remove_checkout(temp.path(), &config, &path);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!path.exists());
     assert!(stored_workspace_path(&repository_path, &workspace).is_none());
+}
+
+#[tokio::test]
+async fn remove_validation_failure_before_deletion_keeps_workspace_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_path = local_repository(temp.path(), "pre-delete-failure").await;
+    let config = write_cli_config(temp.path());
+    let path = temp.path().join("checkout");
+    let displaced = temp.path().join("displaced-checkout");
+    let added = add_checkout(temp.path(), &config, "pre-delete-failure", "root()", &path);
+    let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
+    let ready = temp.path().join("remove-ready");
+    let continue_path = temp.path().join("remove-continue");
+    let child = spawn_remove_at_failpoint(
+        temp.path(),
+        &config,
+        &path,
+        "before_checkout_deletion_validation",
+        &ready,
+        &continue_path,
+    );
+    wait_for_failpoint(&ready);
+
+    fs::rename(&path, &displaced).unwrap();
+    fs::create_dir_all(path.join(".jj")).unwrap();
+    fs::copy(
+        displaced.join(".jj/devspace-checkout-owner"),
+        path.join(".jj/devspace-checkout-owner"),
+    )
+    .unwrap();
+    fs::write(path.join("keep"), "replacement remains").unwrap();
+    fs::write(&continue_path, "continue").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("not a Devspace checkout"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("keep")).unwrap(),
+        "replacement remains"
+    );
+    assert!(workspace_names(&repository_path).await.contains(&workspace));
+    assert!(stored_workspace_path(&repository_path, &workspace).is_some());
 }
 
 #[tokio::test]
@@ -651,6 +815,39 @@ async fn remove_forgets_a_workspace_when_its_directory_was_already_gone() {
     let output = remove_checkout(temp.path(), &config, &path);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stderr(&output).contains("was already gone"));
+    assert!(!workspace_names(&repository_path).await.contains(&workspace));
+    assert!(stored_workspace_path(&repository_path, &workspace).is_none());
+}
+
+#[tokio::test]
+async fn remove_retries_after_repository_view_forget_before_workspace_store_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_path = local_repository(temp.path(), "interrupted-forget").await;
+    let config = write_cli_config(temp.path());
+    let path = temp.path().join("checkout");
+    let added = add_checkout(temp.path(), &config, "interrupted-forget", "root()", &path);
+    let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
+    let ready = temp.path().join("remove-ready");
+    let continue_path = temp.path().join("remove-continue");
+    let mut child = spawn_remove_at_failpoint(
+        temp.path(),
+        &config,
+        &path,
+        "after_repository_view_forget",
+        &ready,
+        &continue_path,
+    );
+    wait_for_failpoint(&ready);
+
+    assert!(!path.exists());
+    assert!(!workspace_names(&repository_path).await.contains(&workspace));
+    assert!(stored_workspace_path(&repository_path, &workspace).is_some());
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let retry = remove_checkout(temp.path(), &config, &path);
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    assert!(stderr(&retry).contains("was already gone"));
     assert!(!workspace_names(&repository_path).await.contains(&workspace));
     assert!(stored_workspace_path(&repository_path, &workspace).is_none());
 }
