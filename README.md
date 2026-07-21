@@ -235,7 +235,7 @@ the release-only probe against a 64-operation fixture repository and cannot
 issue cloud requests. A supporting process probe of the direct bare-repository
 shape measured at most 1.0135 times an equivalent stock jj-lib program. It did
 not compare the public `ds` and `jj` CLIs; that no-pain smoke check remains
-[open](https://github.com/tomrford/ds/issues/22).
+[open](https://github.com/tomrford/devspace/issues/22).
 
 When cloud operation objects have been installed locally, the machine validates
 their complete closure before adding them to jj's stock operation-head store.

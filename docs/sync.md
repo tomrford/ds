@@ -503,7 +503,7 @@ repository size. A network-denied run and a call-graph check confirmed zero
 cloud requests. This probe did not invoke the public `ds` and pinned `jj` CLIs,
 so it supports the design but does not close the complete-command budget. The
 public CLI no-pain smoke check is tracked in
-[issue 22](https://github.com/tomrford/ds/issues/22).
+[issue 22](https://github.com/tomrford/devspace/issues/22).
 
 The `ds` command runner resolves `ds -R <name> log` through the machine-store
 catalog and opens the resulting bare repository directly through a custom jj
