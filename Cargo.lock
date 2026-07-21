@@ -679,6 +679,7 @@ dependencies = [
  "devspace-machine",
  "dunce",
  "etcetera",
+ "futures 0.3.32",
  "getrandom 0.4.3",
  "gix",
  "jj-cli",

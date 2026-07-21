@@ -234,6 +234,7 @@ fn hidden_track_matcher(
         RepoPath::root(),
         &GitIgnoreFile::empty(),
         base_ignores,
+        base_ignores,
         &mut hidden,
     )?;
     if hidden.files.is_empty() && hidden.directories.is_empty() {
@@ -243,20 +244,29 @@ fn hidden_track_matcher(
     }
 }
 
-pub(crate) fn discover_hidden_paths(
+pub(crate) struct ShimDiscovery {
+    pub hidden_paths: BTreeSet<RepoPathBuf>,
+    pub base_ignored_paths: BTreeSet<RepoPathBuf>,
+}
+
+pub(crate) fn discover_shim_paths(
     root: &Path,
     base_ignores: &Arc<GitIgnoreFile>,
-) -> Result<BTreeSet<RepoPathBuf>, SnapshotError> {
+) -> Result<ShimDiscovery, SnapshotError> {
     let mut hidden = HiddenTrackMatcher::default();
     discover_hidden_paths_into(
         root,
         RepoPath::root(),
         &GitIgnoreFile::empty(),
         base_ignores,
+        base_ignores,
         &mut hidden,
     )?;
     hidden.files.extend(hidden.directories);
-    Ok(hidden.files)
+    Ok(ShimDiscovery {
+        hidden_paths: hidden.files,
+        base_ignored_paths: hidden.base_ignored_paths,
+    })
 }
 
 /// Mirrors jj-cli 0.42's `WorkspaceCommandHelper::base_ignores` for
@@ -298,6 +308,7 @@ struct HiddenTrackMatcher {
     files: BTreeSet<RepoPathBuf>,
     directories: BTreeSet<RepoPathBuf>,
     visited_directories: BTreeSet<RepoPathBuf>,
+    base_ignored_paths: BTreeSet<RepoPathBuf>,
 }
 
 impl Matcher for HiddenTrackMatcher {
@@ -330,6 +341,7 @@ fn discover_hidden_paths_into(
     dir: &RepoPath,
     inherited_hidden: &Arc<GitIgnoreFile>,
     inherited_gitignore: &Arc<GitIgnoreFile>,
+    base_ignores: &Arc<GitIgnoreFile>,
     result: &mut HiddenTrackMatcher,
 ) -> Result<(), SnapshotError> {
     let entries = fs::read_dir(disk_dir)
@@ -389,11 +401,24 @@ fn discover_hidden_paths_into(
         if file_type.is_dir() {
             if hidden.matches_dir(&path) {
                 result.directories.insert(path);
-            } else if !gitignore.matches_dir(&path) {
-                discover_hidden_paths_into(&entry.path(), &path, &hidden, &gitignore, result)?;
+            } else if gitignore.matches_dir(&path) {
+                if base_ignores.matches_dir(&path) {
+                    result.base_ignored_paths.insert(path);
+                }
+            } else {
+                discover_hidden_paths_into(
+                    &entry.path(),
+                    &path,
+                    &hidden,
+                    &gitignore,
+                    base_ignores,
+                    result,
+                )?;
             }
         } else if hidden.matches_file(&path) {
             result.files.insert(path);
+        } else if gitignore.matches_file(&path) && base_ignores.matches_file(&path) {
+            result.base_ignored_paths.insert(path);
         }
     }
     Ok(())

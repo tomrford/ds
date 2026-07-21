@@ -318,6 +318,6 @@ pub(super) fn short_oid(oid: GitOid) -> String {
     oid.to_string()[..12].to_owned()
 }
 
-pub(super) fn failpoint_enabled(name: &str) -> bool {
+pub(crate) fn failpoint_enabled(name: &str) -> bool {
     std::env::var_os(FAILPOINT_ENV).as_deref() == Some(std::ffi::OsStr::new(name))
 }
