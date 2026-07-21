@@ -32,8 +32,10 @@ enum SyncCommand {
     #[command(hide = true)]
     Run {
         /// Repository name in the local machine catalog.
-        #[arg(long)]
-        repository: String,
+        // jj owns global `--repository`; reusing it here makes CliRunner reload
+        // aliases after Devspace's collision migration has self-disarmed.
+        #[arg(long = "repository-name")]
+        sync_repository: String,
     },
     /// Show local synchronization state for every catalog repository.
     Status,
@@ -45,7 +47,9 @@ pub(crate) async fn run_sync(
     args: SyncArgs,
 ) -> Result<(), CommandError> {
     match args.command {
-        SyncCommand::Run { repository } => sync_repository(ui, command, repository).await,
+        SyncCommand::Run {
+            sync_repository: name,
+        } => sync_repository(ui, command, name).await,
         SyncCommand::Status => crate::sync_status::write_catalog_status(ui, command).await,
     }
 }

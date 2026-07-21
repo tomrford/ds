@@ -185,9 +185,8 @@ async fn restrict_bare_repository_commands(
     command: &CommandHelper,
     stock_dispatch: jj_cli::cli_util::BoxedAsyncCliDispatch<'_>,
 ) -> Result<(), CommandError> {
-    // Daemon and sync plumbing are workspace-less. `sync run --repository`
-    // deliberately shares jj's global option spelling, but resolves the value
-    // itself through the machine catalog.
+    // Daemon and sync plumbing are workspace-less. `sync run --repository-name`
+    // resolves its value through the machine catalog.
     if matches!(command.matches().subcommand_name(), Some("daemon" | "sync")) {
         return stock_dispatch.call(ui, command).await;
     }

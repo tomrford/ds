@@ -445,7 +445,7 @@ repository it opened. It sends `sync <name>` to the machine daemon over a
 private local socket with a short bounded connect. A running daemon queues the
 repository once. If the socket is unavailable, `ds` starts `ds daemon run`
 detached, retries the notification for a bounded interval and starts a detached
-`ds sync run --repository <name>` one-shot if notification still fails. The
+`ds sync run --repository-name <name>` one-shot if notification still fails. The
 command does not wait for Worker I/O. Command failures, `ds daemon` and `ds
 sync` do not create another boundary.
 

@@ -90,7 +90,7 @@ matches the cloud heads recorded by the last successful sync. The indicator
 never contacts the Worker. `ds sync status` gives the local picture for every
 catalog repository: incomplete clones, pending operation counts and the last
 successful-sync guidance available from the existing sidecar. Its only IPC is
-a short daemon `ping`; it never contacts the Worker. `ds sync run --repository
+a short daemon `ping`; it never contacts the Worker. `ds sync run --repository-name
 <name>` remains the plumbing command used by degraded boundary sync and manual
 recovery.
 

@@ -137,7 +137,7 @@ fn spawn_one_shot(executable: &Path, name: &RepositoryName, repository_directory
     };
     let mut command = Command::new(executable);
     command
-        .args(["sync", "run", "--repository", name.as_str()])
+        .args(["sync", "run", "--repository-name", name.as_str()])
         // The parent's cwd may no longer exist (`ds remove .` deletes it);
         // give the child a directory that outlives the command.
         .current_dir(repository_directory)

@@ -97,6 +97,44 @@ async fn local_repository(root: &Path, name: &str, base_url: &str) -> CatalogEnt
     entry
 }
 
+#[tokio::test]
+async fn sync_run_silences_colliding_alias_warning() {
+    let (base_url, server) = support::fake_worker::create_server(|_, request, stream| {
+        let request_line = request.lines().next().unwrap();
+        if request_line.starts_with("GET ") && request_line.contains("/packs?") {
+            support::fake_worker::respond(
+                stream,
+                "200 OK",
+                r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
+            );
+            false
+        } else if request_line.starts_with("GET ") && request_line.contains("/heads?") {
+            support::fake_worker::respond(stream, "200 OK", r#"{"cursor":0,"heads":[]}"#);
+            true
+        } else {
+            panic!("unexpected fake cloud request: {request_line}");
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    local_repository(temp.path(), "alias-warning", &base_url).await;
+    let config = write_cli_config(temp.path());
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str("\n[aliases]\nsync = [\"status\"]\n");
+    fs::write(&config, contents).unwrap();
+
+    let output = ds(
+        temp.path(),
+        temp.path(),
+        &config,
+        &["sync", "run", "--repository-name", "alias-warning"],
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn sync_run_times_out_when_the_worker_accepts_but_never_responds() {
@@ -109,7 +147,7 @@ async fn sync_run_times_out_when_the_worker_accepts_but_never_responds() {
     let output = ds_command(temp.path(), temp.path(), &config)
         .env("DEVSPACE_HTTP_TEST_HOOKS", "1")
         .env("DEVSPACE_HTTP_TEST_REQUEST_TIMEOUT_MS", "100")
-        .args(["sync", "run", "--repository", "stalled"])
+        .args(["sync", "run", "--repository-name", "stalled"])
         .output()
         .unwrap();
 
@@ -164,7 +202,7 @@ async fn sync_run_skips_when_the_repository_lock_is_held() {
         temp.path(),
         temp.path(),
         &config,
-        &["sync", "run", "--repository", "locked"],
+        &["sync", "run", "--repository-name", "locked"],
     );
 
     assert!(output.status.success(), "{}", stderr(&output));
@@ -195,7 +233,7 @@ fn sync_run_rejects_an_unknown_repository_cleanly() {
         temp.path(),
         temp.path(),
         &config,
-        &["sync", "run", "--repository", "missing-repository"],
+        &["sync", "run", "--repository-name", "missing-repository"],
     );
 
     assert_eq!(output.status.code(), Some(1));
@@ -232,7 +270,7 @@ fn sync_run_points_an_incomplete_clone_back_to_add() {
         temp.path(),
         temp.path(),
         &config,
-        &["sync", "run", "--repository", "incomplete"],
+        &["sync", "run", "--repository-name", "incomplete"],
     );
 
     assert_eq!(output.status.code(), Some(1));
@@ -267,7 +305,7 @@ async fn sync_run_reports_offline_transport_failure_without_mutating_durable_sta
         temp.path(),
         temp.path(),
         &config,
-        &["sync", "run", "--repository", "offline"],
+        &["sync", "run", "--repository-name", "offline"],
     );
 
     assert_eq!(output.status.code(), Some(1));
@@ -797,7 +835,7 @@ async fn sync_run_does_not_respawn_itself() {
         temp.path(),
         temp.path(),
         &config,
-        &["sync", "run", "--repository", "boundary-recursion"],
+        &["sync", "run", "--repository-name", "boundary-recursion"],
     );
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stderr(&output).contains("already being synchronized; skipping"));

@@ -69,7 +69,7 @@ async fn two_machine_cli_sync_converges_through_a_live_worker() {
         &home_a,
         &home_a,
         &config_a,
-        &["sync", "run", "--repository", &repository_name],
+        &["sync", "run", "--repository-name", &repository_name],
     );
     assert!(uploaded_a.status.success(), "{}", stderr(&uploaded_a));
 
@@ -105,7 +105,7 @@ async fn two_machine_cli_sync_converges_through_a_live_worker() {
             home,
             home,
             config,
-            &["sync", "run", "--repository", &repository_name],
+            &["sync", "run", "--repository-name", &repository_name],
         );
         assert!(output.status.success(), "{}", stderr(&output));
         assert!(stdout(&output).is_empty());
@@ -201,7 +201,7 @@ async fn virgin_repository_syncs_and_clones_before_any_checkout_exists() {
         &home_a,
         &home_a,
         &config_a,
-        &["sync", "run", "--repository", &repository_name],
+        &["sync", "run", "--repository-name", &repository_name],
     );
     assert!(synced.status.success(), "{}", stderr(&synced));
 
@@ -304,7 +304,7 @@ async fn boundary_sync_uploads_machine_a_without_explicit_sync() {
             &home_b,
             &home_b,
             &config_b,
-            &["sync", "run", "--repository", &repository_name],
+            &["sync", "run", "--repository-name", &repository_name],
         );
         assert!(pulled_b.status.success(), "{}", stderr(&pulled_b));
         if repository_commit_ids(&home_b, &config_b, &repository_name).contains(&commit_a) {
@@ -604,7 +604,7 @@ async fn daemon_restart_drains_one_offline_commit_exactly_once() {
         &home,
         &home,
         &config,
-        &["sync", "run", "--repository", &repository_name],
+        &["sync", "run", "--repository-name", &repository_name],
     );
     assert!(synchronized.status.success(), "{}", stderr(&synchronized));
 
