@@ -70,6 +70,20 @@ fn ensure_inner(checkout_root: &Path) -> Result<(), String> {
         .cloned()
         .collect::<BTreeSet<_>>();
 
+    // info/exclude is line-based with no escape for newlines, so such a path
+    // cannot be kept out of `git add -A`; a carriage return survives only
+    // until Git strips it at a line ending. Fail closed before touching .git
+    // rather than let the path into the index.
+    if let Some(path) = excluded_paths
+        .iter()
+        .find(|path| path.as_internal_file_string().contains(['\n', '\r']))
+    {
+        return Err(format!(
+            "cannot exclude {:?}: Git exclude patterns cannot represent newlines",
+            path.as_internal_file_string()
+        ));
+    }
+
     // A base ignore only excludes untracked paths from jj's snapshot. Restore
     // canonical public files after clearing an ignored root, including on the
     // first shim build and after repairing an index written by an older ds.
@@ -385,6 +399,10 @@ fn git(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .current_dir(cwd)
+        // Index paths are exact repo paths, never patterns. Literal pathspecs
+        // keep names starting with `:` or containing glob characters from
+        // being parsed as pathspec magic.
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")

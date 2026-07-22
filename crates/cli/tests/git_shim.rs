@@ -181,3 +181,72 @@ async fn missing_git_warns_without_failing_add() {
         stderr(&output)
     );
 }
+
+#[tokio::test]
+async fn pathspec_special_names_are_handled_literally() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    local_repository(temp.path(), "shim-literal").await;
+    let checkout = temp.path().join("checkout");
+    let added = add_checkout(temp.path(), &config, "shim-literal", &checkout);
+    assert!(added.status.success(), "{}", stderr(&added));
+
+    fs::write(checkout.join(".dsprivate"), ":colon-secret\nstar*secret\n").unwrap();
+    fs::write(checkout.join(":colon-secret"), "private\n").unwrap();
+    fs::write(checkout.join("star*secret"), "private\n").unwrap();
+    fs::write(checkout.join(":colon-public"), "visible\n").unwrap();
+
+    let refreshed = ds_command(&checkout, &config)
+        .env("JJ_LOG", "warn")
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(refreshed.status.success(), "{}", stderr(&refreshed));
+    assert!(
+        !stderr(&refreshed).contains("git index shim refresh failed"),
+        "{}",
+        stderr(&refreshed)
+    );
+    assert_eq!(git_ls_files(&checkout), [":colon-public"]);
+    assert_git_directories_read_only(&checkout.join(".git"));
+}
+
+#[tokio::test]
+async fn hidden_path_with_newline_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_cli_config(temp.path());
+    local_repository(temp.path(), "shim-newline").await;
+    let checkout = temp.path().join("checkout");
+    let added = add_checkout(temp.path(), &config, "shim-newline", &checkout);
+    assert!(added.status.success(), "{}", stderr(&added));
+
+    fs::write(checkout.join("public.txt"), "visible\n").unwrap();
+    let refreshed = ds(&checkout, &config, &["status"]);
+    assert!(refreshed.status.success(), "{}", stderr(&refreshed));
+    assert_eq!(git_ls_files(&checkout), ["public.txt"]);
+
+    // The pattern hides the file, but no info/exclude line can express its
+    // name; the refresh must refuse rather than let `add -A` index it.
+    fs::write(checkout.join(".dsprivate"), "bad*\n").unwrap();
+    fs::write(checkout.join("bad\nname"), "private\n").unwrap();
+    let refused = ds_command(&checkout, &config)
+        .env("JJ_LOG", "warn")
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(refused.status.success(), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("cannot exclude"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(git_ls_files(&checkout), ["public.txt"]);
+    assert_git_directories_read_only(&checkout.join(".git"));
+
+    // Removing the unrepresentable path lets the next refresh recover.
+    fs::remove_file(checkout.join("bad\nname")).unwrap();
+    fs::write(checkout.join("later.txt"), "visible\n").unwrap();
+    let recovered = ds(&checkout, &config, &["status"]);
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+    assert_eq!(git_ls_files(&checkout), ["later.txt", "public.txt"]);
+}
