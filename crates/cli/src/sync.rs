@@ -106,7 +106,7 @@ pub(crate) async fn run_sync_entry(
     }
 }
 
-pub(crate) async fn run_sync_entry_locked(
+async fn run_sync_entry_locked(
     store: &MachineStore,
     entry: &CatalogEntry,
     settings: &UserSettings,

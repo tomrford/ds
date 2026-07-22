@@ -133,7 +133,7 @@ fn devspace_command_names() -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn shadowed_aliases() -> Vec<String> {
+fn shadowed_aliases() -> Vec<String> {
     SHADOWED_ALIASES
         .get_or_init(Default::default)
         .lock()

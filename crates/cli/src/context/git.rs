@@ -332,7 +332,7 @@ pub fn validate_commit_oid(commit: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn remove_path(path: &Path) -> Result<()> {
+fn remove_path(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),

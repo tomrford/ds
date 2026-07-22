@@ -14,7 +14,7 @@ use crate::{
     PendingHeadTransaction, ReconcileOperationHeadsError, SyncState, SyncStateError, build_packs,
 };
 
-pub const MAX_OBJECT_INVENTORY_KEYS: usize = 4_096;
+const MAX_OBJECT_INVENTORY_KEYS: usize = 4_096;
 const MAX_HEAD_SNAPSHOTS_PER_PASS: usize = 4;
 const MAX_PACK_GC_DIRECTORIES: usize = 256;
 const MAX_PACK_GC_FILES: usize = 1_025;

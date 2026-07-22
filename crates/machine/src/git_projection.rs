@@ -64,15 +64,6 @@ impl ExportMappings {
         }
         Ok(mappings)
     }
-
-    pub fn rows(&self) -> impl Iterator<Item = CommitMapping> + '_ {
-        self.by_canonical
-            .iter()
-            .map(|(canonical_id, git_id)| CommitMapping {
-                canonical_id: canonical_id.clone(),
-                git_id: git_id.clone(),
-            })
-    }
 }
 
 #[derive(Clone, Debug, Default)]

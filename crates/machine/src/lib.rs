@@ -56,10 +56,10 @@ pub use git_projection::{
     MAX_IMPORT_TREE_DEPTH, MAX_IMPORT_TREE_ENTRIES, ProjectionError,
 };
 pub use git_subprocess::{
-    CommandDiagnostic, FetchDiagnostic, FetchError, FetchErrorKind, FetchReport, GitOid,
-    GitOidParseError, GitProcessEnvironment, GitProcessMode, LeaseUpdate, PushError, PushErrorKind,
-    PushRefReport, PushRefStatus, PushReport, QualifiedRef, QualifiedRefError, RemoteHead,
-    RemoteHeadsError, RemoteUrl, fetch, ls_remote_head, ls_remote_heads, push,
+    CommandDiagnostic, FetchError, FetchReport, GitOid, GitOidParseError, GitProcessEnvironment,
+    GitProcessMode, LeaseUpdate, PushError, PushErrorKind, PushRefReport, PushRefStatus,
+    PushReport, QualifiedRef, QualifiedRefError, RemoteHead, RemoteHeadsError, RemoteUrl, fetch,
+    ls_remote_head, ls_remote_heads, push,
 };
 pub use http_transport::HttpTransport;
 pub use install::{InstalledPack, PackInstallError};
@@ -73,8 +73,7 @@ pub use object_closure::{
     MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectId, ObjectKey,
 };
 pub use pack::{
-    BuiltPack, BuiltPacks, DEFAULT_CHUNK_BYTES, DEFAULT_PACK_BYTES, DEFAULT_PACK_OBJECTS,
-    MAX_CHUNK_BYTES, MAX_PACK_BYTES, MAX_PACK_OBJECTS, MAX_PACK_OPERATION_HEADS, MIN_CHUNK_BYTES,
+    BuiltPack, BuiltPacks, MAX_CHUNK_BYTES, MAX_PACK_BYTES, MAX_PACK_OBJECTS, MIN_CHUNK_BYTES,
     MIN_PACK_BYTES, PackBuildError, PackMetrics, PackOptions, build_packs,
 };
 pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
@@ -85,9 +84,8 @@ pub use projection_transport::{
     RegisteredRemote,
 };
 pub use sync_engine::{
-    CloudHeads, DownloadedPack, HeadTransactionResult, MAX_OBJECT_INVENTORY_KEYS, PackCatalogEntry,
-    PackCatalogPage, PackGcError, SyncEngine, SyncEngineError, SyncTransport, TransportError,
-    upload_object_closure,
+    CloudHeads, DownloadedPack, HeadTransactionResult, PackCatalogEntry, PackCatalogPage,
+    PackGcError, SyncEngine, SyncEngineError, SyncTransport, TransportError, upload_object_closure,
 };
 pub use sync_state::{
     MachineSyncLock, MachineSyncStore, PendingHead, PendingHeadBatch, PendingHeadTransaction,

@@ -21,7 +21,7 @@ pub(crate) const MAX_MANIFEST_BYTES: usize = MANIFEST_HEADER_BYTES
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectEntry {
     pub key: ObjectKey,
-    pub offset: u64,
+    pub(crate) offset: u64,
     pub length: u64,
 }
 
@@ -29,7 +29,7 @@ pub struct ObjectEntry {
 pub struct ChunkEntry {
     pub offset: u64,
     pub length: u32,
-    pub hash: ObjectId,
+    pub(crate) hash: ObjectId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,19 +63,15 @@ impl PackManifest {
         Ok(manifest)
     }
 
-    pub fn chunk_bytes(&self) -> u32 {
-        self.chunk_bytes
-    }
-
     pub fn pack_length(&self) -> u64 {
         self.pack_length
     }
 
-    pub fn pack_hash(&self) -> ObjectId {
+    pub(crate) fn pack_hash(&self) -> ObjectId {
         self.pack_hash
     }
 
-    pub fn operation_heads(&self) -> &[ObjectId] {
+    pub(crate) fn operation_heads(&self) -> &[ObjectId] {
         &self.operation_heads
     }
 
@@ -419,8 +415,9 @@ pub enum PackManifestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ObjectKind;
     use crate::encode_lower_hex as hex;
-    use crate::{DEFAULT_CHUNK_BYTES, ObjectKind};
+    use crate::pack::DEFAULT_CHUNK_BYTES;
     use blake2::{Blake2b512, Digest};
 
     fn key(byte: u8) -> ObjectKey {

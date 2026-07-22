@@ -25,16 +25,16 @@ const FAILPOINT_ENV: &str = "DEVSPACE_FAILPOINT";
 pub(crate) const CLOUD_RUNTIME_ERROR: &str = "failed to start the cloud transport runtime";
 
 pub(super) struct LockedCheckoutEntry {
-    pub(super) store: MachineStore,
-    pub(super) entry: CatalogEntry,
+    store: MachineStore,
+    entry: CatalogEntry,
     _guard: RepositorySyncGuard,
 }
 
 pub(super) struct CloudSession {
-    pub(super) repository: MachineRepository,
-    pub(super) projection: GitProjection,
-    pub(super) transport: HttpTransport,
-    pub(super) machine_id: [u8; 16],
+    repository: MachineRepository,
+    projection: GitProjection,
+    transport: HttpTransport,
+    machine_id: [u8; 16],
 }
 
 pub(crate) async fn run_git(ui: &mut Ui, command: &CommandHelper) -> Result<(), CommandError> {
@@ -296,7 +296,7 @@ pub(super) async fn open_cloud_session(
     })
 }
 
-pub(super) fn parse_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], CommandError> {
+fn parse_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], CommandError> {
     decode_lower_hex(value).map_err(|error| match error {
         LowerHexError::InvalidLength { .. } => user_error(format!("{label} has an invalid length")),
         LowerHexError::InvalidDigit => user_error(format!("{label} is not lowercase hexadecimal")),

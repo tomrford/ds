@@ -10,8 +10,8 @@ use devspace_machine::{CatalogEntry, MachineStore, RepositoryName};
 use jj_cli::command_error::{CommandError, user_error};
 use jj_lib::settings::UserSettings;
 
-pub(crate) const BOUNDARY_SYNC_ENV: &str = "DEVSPACE_BOUNDARY_SYNC";
-pub(crate) const DAEMON_ENV: &str = "DEVSPACE_DAEMON";
+const BOUNDARY_SYNC_ENV: &str = "DEVSPACE_BOUNDARY_SYNC";
+const DAEMON_ENV: &str = "DEVSPACE_DAEMON";
 
 const DAEMON_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_millis(5),

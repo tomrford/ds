@@ -16,14 +16,14 @@ use crate::{
 };
 
 pub const MIN_CHUNK_BYTES: u32 = 64 * 1024;
-pub const DEFAULT_CHUNK_BYTES: u32 = 1024 * 1024;
+pub(crate) const DEFAULT_CHUNK_BYTES: u32 = 1024 * 1024;
 pub const MAX_CHUNK_BYTES: u32 = 8 * 1024 * 1024;
 pub const MIN_PACK_BYTES: u64 = 1024 * 1024;
-pub const DEFAULT_PACK_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_PACK_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_PACK_BYTES: u64 = 64 * 1024 * 1024;
-pub const DEFAULT_PACK_OBJECTS: u32 = 65_536;
+const DEFAULT_PACK_OBJECTS: u32 = 65_536;
 pub const MAX_PACK_OBJECTS: u32 = 65_536;
-pub const MAX_PACK_OPERATION_HEADS: usize = 4_096;
+pub(crate) const MAX_PACK_OPERATION_HEADS: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackMetrics {

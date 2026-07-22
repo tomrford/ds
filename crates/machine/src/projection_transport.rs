@@ -89,14 +89,14 @@ pub struct ProjectionBatchResult {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionClaimResult {
     pub fence: u64,
-    pub previous_fence: u64,
+    previous_fence: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionReplay {
     #[serde(deserialize_with = "deserialize_short_id")]
-    pub batch_id: [u8; 16],
+    batch_id: [u8; 16],
     pub remote: String,
     #[serde(deserialize_with = "deserialize_short_id")]
     pub owner_machine: [u8; 16],
@@ -142,8 +142,8 @@ pub struct PendingProjectionBatch {
     pub batch_id: [u8; 16],
     pub remote: String,
     #[serde(deserialize_with = "deserialize_short_id")]
-    pub owner_machine: [u8; 16],
-    pub fence: u64,
+    owner_machine: [u8; 16],
+    fence: u64,
     pub refs: Vec<PendingProjectionRef>,
 }
 
@@ -152,7 +152,7 @@ pub struct PendingProjectionBatch {
 pub struct PendingProjectionRef {
     pub bookmark: String,
     #[serde(default, deserialize_with = "deserialize_optional_git_oid")]
-    pub expected_old_oid: Option<[u8; 20]>,
+    expected_old_oid: Option<[u8; 20]>,
     #[serde(default, deserialize_with = "deserialize_optional_git_oid")]
     pub proposed_git_oid: Option<[u8; 20]>,
 }

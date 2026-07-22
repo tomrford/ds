@@ -9,7 +9,7 @@ const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ErrorResponse {
-    pub(crate) error: String,
+    error: String,
     pub(crate) code: Option<String>,
 }
 

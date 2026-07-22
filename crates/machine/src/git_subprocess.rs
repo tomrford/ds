@@ -3,8 +3,7 @@
 mod fetch;
 
 pub use fetch::{
-    FetchDiagnostic, FetchError, FetchErrorKind, FetchReport, RemoteHead, RemoteHeadsError, fetch,
-    ls_remote_head, ls_remote_heads,
+    FetchError, FetchReport, RemoteHead, RemoteHeadsError, fetch, ls_remote_head, ls_remote_heads,
 };
 
 use std::collections::BTreeMap;
@@ -160,10 +159,6 @@ impl GitProcessEnvironment {
     pub fn git_executable(&self) -> &Path {
         &self.git_executable
     }
-
-    pub fn mode(&self) -> GitProcessMode {
-        self.mode
-    }
 }
 
 impl Default for GitProcessEnvironment {
@@ -202,10 +197,10 @@ pub struct PushRefReport {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandDiagnostic {
-    pub push_command: String,
-    pub push_exit_code: Option<i32>,
-    pub observation_command: String,
-    pub observation_exit_code: Option<i32>,
+    push_command: String,
+    push_exit_code: Option<i32>,
+    observation_command: String,
+    observation_exit_code: Option<i32>,
     pub stderr_excerpt: String,
 }
 

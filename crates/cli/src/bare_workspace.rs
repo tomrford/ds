@@ -205,7 +205,7 @@ pub(crate) fn is_stock_bare_repository(path: &Path) -> bool {
     })
 }
 
-pub(crate) fn repository_name(path: &Path) -> Option<RepositoryName> {
+fn repository_name(path: &Path) -> Option<RepositoryName> {
     let mut components = path.components();
     let Component::Normal(name) = components.next()? else {
         return None;

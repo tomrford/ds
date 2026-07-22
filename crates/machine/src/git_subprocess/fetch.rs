@@ -4,22 +4,22 @@ const MAX_OBSERVATION_BYTES: usize = 1024 * 1024;
 const MAX_REMOTE_HEADS: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FetchDiagnostic {
-    pub fetch_command: String,
-    pub fetch_exit_code: Option<i32>,
-    pub observation_command: String,
-    pub observation_exit_code: Option<i32>,
-    pub stderr_excerpt: String,
+struct FetchDiagnostic {
+    fetch_command: String,
+    fetch_exit_code: Option<i32>,
+    observation_command: String,
+    observation_exit_code: Option<i32>,
+    stderr_excerpt: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchReport {
     pub heads: BTreeMap<String, GitOid>,
-    pub diagnostic: FetchDiagnostic,
+    diagnostic: FetchDiagnostic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FetchErrorKind {
+enum FetchErrorKind {
     InvalidInput,
     FetchFailed,
     ObservationFailed,
@@ -27,8 +27,8 @@ pub enum FetchErrorKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchError {
-    pub kind: FetchErrorKind,
-    pub report: FetchReport,
+    kind: FetchErrorKind,
+    report: FetchReport,
 }
 
 impl fmt::Display for FetchError {
@@ -52,9 +52,9 @@ impl std::error::Error for FetchError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteHeadsError {
-    pub command: String,
-    pub exit_code: Option<i32>,
-    pub stderr_excerpt: String,
+    command: String,
+    exit_code: Option<i32>,
+    stderr_excerpt: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

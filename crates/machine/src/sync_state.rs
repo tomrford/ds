@@ -41,7 +41,7 @@ pub struct PendingHead {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingHeadBatch {
     pub entries: Vec<PendingHead>,
-    pub observed_heads: BTreeSet<ObjectId>,
+    observed_heads: BTreeSet<ObjectId>,
 }
 
 impl PendingHeadBatch {
@@ -141,7 +141,8 @@ impl MachineSyncStore {
         Ok(Self { directory })
     }
 
-    pub fn directory(&self) -> &Path {
+    #[cfg(test)]
+    fn directory(&self) -> &Path {
         &self.directory
     }
 
@@ -224,7 +225,7 @@ impl MachineSyncStore {
         atomic_write(&self.directory, "outbox", &bytes)
     }
 
-    pub fn clear_outbox(&self) -> Result<(), SyncStateError> {
+    pub(crate) fn clear_outbox(&self) -> Result<(), SyncStateError> {
         let path = self.directory.join("outbox");
         match fs::remove_file(&path) {
             Ok(()) => sync_directory(&self.directory),

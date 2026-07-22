@@ -21,8 +21,8 @@ const MAX_JSON_RESPONSE_BYTES: usize = 1024 * 1024;
 pub struct HttpTransport {
     pub(crate) client: reqwest::Client,
     pub(crate) repository_url: String,
-    pub(crate) authorization: reqwest::header::HeaderValue,
-    pub(crate) machine_id: String,
+    authorization: reqwest::header::HeaderValue,
+    machine_id: String,
     pub(crate) incarnation: String,
 }
 
