@@ -479,31 +479,7 @@ adds one `daemon: running` or `daemon: not running` line from a short local
 `ping`. Neither status command constructs an HTTP transport or contacts the
 Worker.
 
-## Warm latency
-
-The release-only probe compares `MachineRepository::open()` with stock jj's
-`RepoLoader::load_at_head()` on the same warm stock repository, whose fixture
-holds 64 chained operations and a 64-bookmark view so the open reads a real
-operation and view. It alternates the order of 5 warm-up batches and 21
-measured batches, takes the median batch time, and amortizes each over 20
-opens. Three consecutive runs measured the Devspace wrapper at 1.309, 1.306
-and 1.304 times stock jj, inside the 2 times budget for this shared subpath.
-The probe is ignored by default and run explicitly; it does not gate CI.
-
-The wrapper validates the 5 stock store-type markers and delegates to jj's
-loader. This code path has no cloud client or `SyncTransport` value, so the
-probe makes zero cloud requests by construction.
-
-A supporting process probe exercised the same direct bare-repository shape:
-open the repository, walk and render 50 commits with ignore-working-copy
-semantics. Against an equivalent stock jj-lib program, including process
-startup, its worst ratio was 1.0135 times stock jj-lib on 64-operation and
-1,000-operation fixtures, with no Devspace-specific cost growing with
-repository size. A network-denied run and a call-graph check confirmed zero
-cloud requests. This probe did not invoke the public `ds` and pinned `jj` CLIs,
-so it supports the design but does not close the complete-command budget. The
-public CLI no-pain smoke check is tracked in
-[issue 22](https://github.com/tomrford/devspace/issues/22).
+## Bare repository command boundary
 
 The `ds` command runner resolves `ds -R <name> log` through the machine-store
 catalog and opens the resulting bare repository directly through a custom jj
