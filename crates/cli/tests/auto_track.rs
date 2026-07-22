@@ -12,16 +12,13 @@ use devspace_machine::{
 mod support;
 
 use support::{
-    commit_id, configure_machine, ds, ds_with_env, machine_store, settings, stderr, stdout,
-    write_cli_config,
+    commit_id, configure_machine, ds, ds_with_env, machine_store, set_machine_git_shim, settings,
+    stderr, stdout, write_cli_config,
 };
 
 async fn checkout(root: &Path, config: &Path, name: &str) -> PathBuf {
-    let text = fs::read_to_string(config).unwrap();
-    if !text.contains("git-shim = true") {
-        fs::write(config, format!("{text}\n[devspace]\ngit-shim = true\n")).unwrap();
-    }
     configure_machine(root, "http://127.0.0.1:1");
+    set_machine_git_shim(root, true);
     let store = machine_store(root);
     let entry = store
         .register_repository(

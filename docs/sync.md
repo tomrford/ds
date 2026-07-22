@@ -48,11 +48,14 @@ repository is rejected before jj attempts to load it.
 
 ## Machine-store catalog
 
-One `MachineStore` owns the platform data root, the local repository catalog
-and native repository locations. macOS uses
-`~/Library/Application Support/devspace`, Linux uses the XDG data directory and
-Windows uses the local application-data directory.
-`DEVSPACE_MACHINE_STORE_DIR` exists only for deterministic bring-up and tests.
+One `MachineStore` owns the local configuration, platform data root, repository
+catalog and native repository locations. Configuration lives at
+`$XDG_CONFIG_HOME/devspace/config.toml`, or
+`~/.config/devspace/config.toml` when `XDG_CONFIG_HOME` is unset. macOS repository
+data uses `~/Library/Application Support/devspace`; Linux uses the XDG data
+directory and Windows uses the local application-data directory.
+`DEVSPACE_MACHINE_STORE_DIR` redirects both configuration and data only for
+deterministic bring-up and tests.
 
 The versioned JSON catalog binds a validated tenant-visible name to a 64-digit
 opaque repository ID and a 32-digit incarnation. Native repositories live under
@@ -67,10 +70,9 @@ The library exposes registration, incarnation-checked materialization,
 repository open and incarnation-checked catalog removal. Materialization uses
 an opaque per-identity lock, initializes in a temporary sibling and atomically
 publishes only a complete native repository. Catalog removal never prunes native
-repository data. Protected machine configuration stores the Worker URL, shared
-development credential and machine ID in an atomic private file. Repository
-creation adds the separate durable journal described below. Cloud first-use and
-import remain outside this local boundary.
+repository data. The user-managed Devspace configuration stores the Worker URL,
+shared development credential, machine identity and local Git-shim preference.
+Repository creation adds the separate durable journal described below. Cloud first-use and import remain outside this local boundary.
 
 ## Object closure
 

@@ -27,11 +27,9 @@ use `ds` for changes.
 
 ## Experimental Git compatibility
 
-The best-effort Git index shim is off by default. Agents that need read-only
-`git status`, `git log`, `git ls-files`, or `git diff` compatibility can set
-the jj user setting `devspace.git-shim = true` in managed jj config, or pass
-`--config devspace.git-shim=true` to each `ds` command. The shim does not make
-Git a supported write surface.
+The best-effort Git index shim is off by default. Enable it for this machine
+with `ds config set git-shim true`. The shim does not make Git a supported
+write surface.
 
 ## Private paths
 
@@ -118,8 +116,8 @@ const JJ: &str = r#"# Devspace and jj
 `ds` embeds jj: every jj command, template, revset, and your jj user
 config (name, email, aliases) work unchanged — `ds log`, `ds describe`,
 `ds rebase`, `ds op undo`, and so on. A user alias whose name matches a
-Devspace command is shadowed by the Devspace command. Run `ds help jj` for
-the full jj command reference.
+Devspace command is shadowed by the Devspace command. Run `ds jj config` for
+jj configuration and `ds help jj` for the full jj command reference.
 
 ## Conventions
 

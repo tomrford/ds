@@ -12,8 +12,8 @@ use devspace_machine::{
 mod support;
 
 use support::{
-    commit_id, configure_machine, ds, ds_command, machine_store, settings, stderr, stdout,
-    write_cli_config,
+    commit_id, configure_machine, ds, ds_command, machine_store, set_machine_git_shim, settings,
+    stderr, stdout, write_cli_config,
 };
 
 async fn owned_checkout(root: &Path, config: &Path, name: &str, checkout: &Path) {
@@ -52,9 +52,10 @@ fn context(cwd: &Path, config: &Path, cache: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn enable_git_shim(config: &Path) {
-    let text = fs::read_to_string(config).unwrap();
-    fs::write(config, format!("{text}\n[devspace]\ngit-shim = true\n")).unwrap();
+fn enable_git_shim(root: &Path, config: &Path, checkout: &Path) {
+    set_machine_git_shim(root, true);
+    let refreshed = ds(checkout, config, &["status"]);
+    assert!(refreshed.status.success(), "{}", stderr(&refreshed));
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
@@ -107,10 +108,10 @@ fn git_ls_files(checkout: &Path) -> Vec<String> {
 async fn add_sync_share_remove_and_gc_context_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
-    enable_git_shim(&config);
     let cache = temp.path().join("cache");
     let checkout_a = temp.path().join("checkout-a");
     owned_checkout(temp.path(), &config, "context-fixture", &checkout_a).await;
+    enable_git_shim(temp.path(), &config, &checkout_a);
     fs::write(checkout_a.join(".gitignore"), ".repos/*\n!.repos/.lock\n").unwrap();
     let (source, head) = git_fixture(temp.path());
     let url = format!("file://{}", source.display());
@@ -205,10 +206,10 @@ async fn add_sync_share_remove_and_gc_context_snapshot() {
 async fn warns_when_context_aliases_are_not_ignored() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
-    enable_git_shim(&config);
     let cache = temp.path().join("cache");
     let checkout = temp.path().join("checkout");
     owned_checkout(temp.path(), &config, "warning-fixture", &checkout).await;
+    enable_git_shim(temp.path(), &config, &checkout);
     fs::create_dir(checkout.join(".repos")).unwrap();
     fs::write(checkout.join(".repos/.lock"), "").unwrap();
     let (source, _) = git_fixture(temp.path());

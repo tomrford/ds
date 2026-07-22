@@ -468,9 +468,8 @@ async fn list_reports_all_workspace_positions_and_marks_current() {
     assert!(!output_text.contains("more"));
 }
 
-#[cfg(unix)]
 #[test]
-fn doctor_happy_path_and_insecure_config_failure() {
+fn doctor_happy_path_and_invalid_config_failure() {
     let temp = tempfile::tempdir().unwrap();
     let (base_url, server) = create_server(|_, request, stream| {
         assert!(request.starts_with("GET /repositories HTTP/1.1"));
@@ -503,9 +502,11 @@ fn doctor_happy_path_and_insecure_config_failure() {
     daemon.kill().unwrap();
     daemon.wait().unwrap();
 
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = machine_store(temp.path()).config_path();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(
+        machine_store(temp.path()).config_path(),
+        "this is not valid TOML",
+    )
+    .unwrap();
     let broken = ds(temp.path(), &config, &["doctor"]);
     assert_eq!(broken.status.code(), Some(1));
     assert!(stdout(&broken).contains("FAIL machine config:"));

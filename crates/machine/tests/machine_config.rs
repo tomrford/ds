@@ -16,7 +16,7 @@ fn named_config(secret: &str, name: &str) -> MachineConfig {
 }
 
 #[test]
-fn config_round_trips_through_an_atomic_private_file() {
+fn config_round_trips_through_the_user_config_file() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("isolated-machine");
     let store = MachineStore::new(&root);
@@ -28,8 +28,9 @@ fn config_round_trips_through_an_atomic_private_file() {
     assert_eq!(expected.machine_id().as_str(), "ab".repeat(16));
     assert_eq!(expected.machine_name(), None);
     let persisted: toml::Value = toml::from_slice(&fs::read(store.config_path()).unwrap()).unwrap();
-    assert_eq!(persisted["version"].as_integer(), Some(1));
+    assert!(persisted.get("version").is_none());
     assert!(persisted.get("machine_name").is_none());
+    assert_eq!(persisted["git_shim"].as_bool(), Some(false));
     assert_eq!(
         fs::read_dir(&root)
             .unwrap()
@@ -37,38 +38,22 @@ fn config_round_trips_through_an_atomic_private_file() {
             .collect::<Vec<_>>(),
         ["config.toml"]
     );
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(
-            fs::metadata(store.config_path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        assert_eq!(
-            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-    }
 }
 
 #[test]
-fn named_config_round_trips_without_changing_the_version() {
+fn named_config_and_git_shim_round_trip() {
     let temp = tempfile::tempdir().unwrap();
     let store = MachineStore::new(temp.path());
-    let expected = named_config("local-development-secret", "Tom-Mac_1");
+    let expected = named_config("local-development-secret", "Tom-Mac_1").with_git_shim(true);
 
     store.write_config(&expected).unwrap();
 
     assert_eq!(store.load_config().unwrap(), expected);
     assert_eq!(expected.machine_name(), Some("Tom-Mac_1"));
+    assert!(expected.git_shim());
     let persisted: toml::Value = toml::from_slice(&fs::read(store.config_path()).unwrap()).unwrap();
-    assert_eq!(persisted["version"].as_integer(), Some(1));
     assert_eq!(persisted["machine_name"].as_str(), Some("Tom-Mac_1"));
+    assert_eq!(persisted["git_shim"].as_bool(), Some(true));
 }
 
 #[test]
@@ -90,7 +75,7 @@ fn machine_name_accepts_only_the_configured_length_and_ascii_set() {
 }
 
 #[test]
-fn replacement_is_complete_and_secret_is_redacted() {
+fn write_config_replaces_the_previous_contents() {
     let temp = tempfile::tempdir().unwrap();
     let store = MachineStore::new(temp.path());
     let first = config("first-sensitive-value");
@@ -98,12 +83,11 @@ fn replacement_is_complete_and_secret_is_redacted() {
     store.write_config(&first).unwrap();
     store.write_config(&second).unwrap();
     assert_eq!(store.load_config().unwrap(), second);
-    assert!(!format!("{second:?}").contains("second-sensitive-value"));
-    assert!(!format!("{:?}", second.shared_secret()).contains("second-sensitive-value"));
+    assert!(format!("{second:?}").contains("second-sensitive-value"));
 }
 
 #[test]
-fn decode_errors_report_only_the_location() {
+fn decode_errors_include_the_toml_diagnostic() {
     let temp = tempfile::tempdir().unwrap();
     let store = MachineStore::new(temp.path());
     store.write_config(&config("initial-secret")).unwrap();
@@ -111,7 +95,7 @@ fn decode_errors_report_only_the_location() {
     fs::write(
         store.config_path(),
         format!(
-            "version = 1\nbase_url = \"https://worker.example.test\"\nmachine_id = \"{}\"\nshared_secret = {exposed_secret}\n",
+            "base_url = \"https://worker.example.test\"\nmachine_id = \"{}\"\nshared_secret = {exposed_secret}\n",
             "ab".repeat(16)
         ),
     )
@@ -119,23 +103,18 @@ fn decode_errors_report_only_the_location() {
 
     let error = store.load_config().unwrap_err();
     let message = format!("{error:#}");
-    assert!(message.contains("line 4, column"), "{message}");
-    assert!(!message.contains(exposed_secret), "{message}");
+    assert!(message.contains("line 3"), "{message}");
+    assert!(message.contains(exposed_secret), "{message}");
 }
 
 #[cfg(unix)]
 #[test]
-fn refuses_to_load_a_group_or_world_readable_secret() {
+fn loads_a_user_config_with_normal_permissions() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let temp = tempfile::tempdir().unwrap();
     let store = MachineStore::new(temp.path());
-    store
-        .write_config(&config("private-until-permissions-change"))
-        .unwrap();
+    store.write_config(&config("development-secret")).unwrap();
     fs::set_permissions(store.config_path(), fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(matches!(
-        store.load_config(),
-        Err(MachineConfigError::InsecurePermissions(_))
-    ));
+    assert_eq!(store.load_config().unwrap(), config("development-secret"));
 }

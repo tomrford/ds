@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use devspace_machine::{CatalogEntry, MachineStore, RepositoryName};
+use devspace_machine::{CatalogEntry, MachineConfigError, MachineStore, RepositoryName};
 use jj_cli::command_error::{CommandError, user_error};
 use jj_lib::settings::UserSettings;
 
@@ -29,14 +29,16 @@ struct BoundarySyncState {
 }
 
 pub(crate) fn configure_git_shim(settings: &UserSettings) -> Result<(), CommandError> {
-    let enabled = settings
-        .get_bool(crate::git_shim::SETTING)
-        .map_err(|error| {
-            user_error(format!(
-                "invalid {} setting: {error}",
-                crate::git_shim::SETTING
-            ))
-        })?;
+    let store = MachineStore::platform_default().map_err(|error| user_error(error.to_string()))?;
+    let enabled = match store.load_config() {
+        Ok(config) => config.git_shim(),
+        Err(MachineConfigError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            false
+        }
+        Err(error) => return Err(user_error(error.to_string())),
+    };
     state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -2,6 +2,7 @@ mod add;
 mod bare_workspace;
 mod boundary_sync;
 mod checkout;
+mod config;
 mod context;
 mod daemon;
 mod doctor;
@@ -45,7 +46,14 @@ const JJ_HELP_HINT: &str =
     "ds embeds Jujutsu. Run `ds help jj` for the full Jujutsu command reference.";
 
 pub fn run() -> ExitCode {
-    if let Some(exit_code) = intercept_help(env::args_os().skip(1)) {
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(exit_code) = config::intercept(&args) {
+        return exit_code;
+    }
+    if let Some(exit_code) = intercept_jj_escape(&args) {
+        return exit_code;
+    }
+    if let Some(exit_code) = intercept_help(&args) {
         return exit_code;
     }
     let repository_selector = REPOSITORY_SELECTOR
@@ -67,6 +75,7 @@ pub fn run() -> ExitCode {
             Ok(())
         })
         .add_dispatch_hook(restrict_bare_repository_commands)
+        .add_dispatch_hook(guard_shadowed_jj_commands)
         .run()
         .into();
     if exit_code == ExitCode::SUCCESS {
@@ -79,8 +88,8 @@ fn devspace_default_config() -> ConfigLayer {
     ConfigLayer::parse(
         ConfigSource::Default,
         r#"
-            [devspace]
-            git-shim = false
+            [aliases]
+            jj = []
         "#,
     )
     .expect("built-in Devspace config is valid")
@@ -93,7 +102,7 @@ fn devspace_alias_migration() -> ConfigMigrationRule {
 
     ConfigMigrationRule::custom(
         move |layer| {
-            if !migration_active.get() {
+            if !migration_active.get() || layer.source == ConfigSource::Default {
                 return false;
             }
             let matches = names_to_match
@@ -127,10 +136,12 @@ fn devspace_alias_migration() -> ConfigMigrationRule {
 }
 
 fn devspace_command_names() -> Vec<String> {
-    repo::DevspaceCommand::augment_subcommands(clap::Command::new("ds"))
+    let mut names = repo::DevspaceCommand::augment_subcommands(clap::Command::new("ds"))
         .get_subcommands()
         .map(|command| command.get_name().to_owned())
-        .collect()
+        .collect::<Vec<_>>();
+    names.extend(["config".to_owned(), "jj".to_owned()]);
+    names
 }
 
 fn shadowed_aliases() -> Vec<String> {
@@ -150,6 +161,7 @@ fn intercept_help(args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Option<E
         .collect::<Vec<_>>();
     let mut app = match args.as_slice() {
         [arg] if arg == "--help" || arg == "-h" || arg == "help" => root_help_app(),
+        [help, config] if help == "help" && config == "config" => config::help_app(),
         [help, jj] if help == "help" && jj == "jj" => devspace_app(),
         _ => return None,
     };
@@ -163,8 +175,11 @@ fn intercept_help(args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Option<E
 }
 
 fn devspace_app() -> clap::Command {
-    repo::DevspaceCommand::augment_subcommands(jj_cli::commands::default_app())
-        .name("ds")
+    let mut app = repo::DevspaceCommand::augment_subcommands(jj_cli::commands::default_app());
+    if let Some(config) = app.find_subcommand_mut("config") {
+        *config = std::mem::take(config).about("Manage jj configuration through `ds jj config`");
+    }
+    app.name("ds")
         .about(APP_ABOUT)
         .long_about(APP_ABOUT)
         .version(env!("CARGO_PKG_VERSION"))
@@ -175,6 +190,7 @@ fn root_help_app() -> clap::Command {
     for slot in app.get_subcommands_mut() {
         let command = mem::take(slot).hide(true);
         *slot = match command.get_name() {
+            "config" => command.hide(false).about("Manage Devspace configuration"),
             "git" => command
                 .hide(false)
                 .about("Manage Devspace's Git remote boundary"),
@@ -185,6 +201,11 @@ fn root_help_app() -> clap::Command {
         };
     }
     repo::DevspaceCommand::augment_subcommands(app)
+        .subcommand(
+            clap::Command::new("jj")
+                .about("Run a jj command shadowed by Devspace")
+                .subcommand(clap::Command::new("config")),
+        )
         .name("ds")
         .about(APP_ABOUT)
         .long_about(APP_ABOUT)
@@ -192,12 +213,43 @@ fn root_help_app() -> clap::Command {
         .after_long_help(JJ_HELP_HINT)
 }
 
+fn intercept_jj_escape(args: &[std::ffi::OsString]) -> Option<ExitCode> {
+    if args.first().is_none_or(|arg| arg != "jj") {
+        return None;
+    }
+    if args.get(1).is_some_and(|arg| arg == "config") {
+        return None;
+    }
+    eprintln!("Error: only `ds jj config` is supported; run `ds help jj` for jj command help");
+    Some(ExitCode::FAILURE)
+}
+
+fn is_jj_config_request() -> bool {
+    let mut args = env::args_os().skip(1);
+    args.next().is_some_and(|arg| arg == "jj") && args.next().is_some_and(|arg| arg == "config")
+}
+
+async fn guard_shadowed_jj_commands(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    stock_dispatch: jj_cli::cli_util::BoxedAsyncCliDispatch<'_>,
+) -> Result<(), CommandError> {
+    if command.matches().subcommand_name() == Some("config") && !is_jj_config_request() {
+        return Err(user_error(
+            "Use `ds config` for Devspace configuration or `ds jj config` for jj configuration.",
+        ));
+    }
+    stock_dispatch.call(ui, command).await
+}
+
 async fn restrict_bare_repository_commands(
     ui: &mut Ui,
     command: &CommandHelper,
     stock_dispatch: jj_cli::cli_util::BoxedAsyncCliDispatch<'_>,
 ) -> Result<(), CommandError> {
-    crate::boundary_sync::configure_git_shim(command.settings())?;
+    if !is_jj_config_request() && command.matches().subcommand_name() != Some("doctor") {
+        crate::boundary_sync::configure_git_shim(command.settings())?;
+    }
     // Daemon and sync plumbing are workspace-less. `sync run --repository-name`
     // resolves its value through the machine catalog.
     if matches!(command.matches().subcommand_name(), Some("daemon" | "sync")) {

@@ -8,7 +8,7 @@ use crate::http_client::hardened_http_client;
 use crate::wire::{BoundedResponseError, ErrorResponse, read_bounded};
 use crate::{
     MachineConfig, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
-    SharedSecret, encode_lower_hex,
+    encode_lower_hex,
 };
 
 const MAX_DIRECTORY_RESPONSE_BYTES: usize = 64 * 1024;
@@ -19,7 +19,6 @@ pub struct ControlPlaneClient {
     base_url: String,
     authorization: HeaderValue,
     machine_id: HeaderValue,
-    shared_secret: SharedSecret,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,7 +90,6 @@ impl ControlPlaneClient {
             base_url: config.base_url().to_owned(),
             authorization,
             machine_id,
-            shared_secret: config.shared_secret().clone(),
         })
     }
 
@@ -225,11 +223,10 @@ impl ControlPlaneClient {
                     ControlPlaneRemoteErrorKind::Other,
                 ),
             };
-            let error = raw_error.replace(self.shared_secret.expose(), "[REDACTED]");
             return Err(ControlPlaneClientError::Remote {
                 status: status.as_u16(),
                 kind,
-                error,
+                error: raw_error,
             });
         }
         Ok(bytes)
@@ -376,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_is_redacted_from_debug_output() {
+    fn authorization_header_is_sensitive_in_debug_output() {
         let secret = "must-never-appear";
         let config = MachineConfig::new(
             "https://worker.example.test",
@@ -384,7 +381,6 @@ mod tests {
             SharedSecret::new(secret).unwrap(),
         )
         .unwrap();
-        assert!(!format!("{config:?}").contains(secret));
         let client = ControlPlaneClient::new(&config).unwrap();
         assert!(!format!("{:?}", client.authorization).contains(secret));
     }
@@ -422,7 +418,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maps_structured_remote_errors_without_echoing_the_credential() {
+    async fn maps_structured_remote_errors() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -457,8 +453,6 @@ mod tests {
                 ..
             }
         ));
-        let message = error.to_string();
-        assert!(message.contains("[REDACTED]"));
-        assert!(!message.contains("remote-error-secret"));
+        assert!(error.to_string().contains("remote-error-secret"));
     }
 }

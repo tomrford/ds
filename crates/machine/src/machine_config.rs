@@ -1,8 +1,6 @@
-use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -10,12 +8,7 @@ use thiserror::Error;
 
 use crate::machine_store::MachineStore;
 
-const CONFIG_FILE: &str = "config.toml";
-const CONFIG_VERSION: u32 = 1;
-const MAX_CONFIG_BYTES: u64 = 64 * 1024;
-static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SharedSecret(String);
 
@@ -33,12 +26,6 @@ impl SharedSecret {
 
     pub(crate) fn expose(&self) -> &str {
         &self.0
-    }
-}
-
-impl fmt::Debug for SharedSecret {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("SharedSecret([REDACTED])")
     }
 }
 
@@ -70,6 +57,7 @@ pub struct MachineConfig {
     machine_id: MachineId,
     machine_name: Option<String>,
     shared_secret: SharedSecret,
+    git_shim: bool,
 }
 
 impl MachineConfig {
@@ -84,6 +72,7 @@ impl MachineConfig {
             machine_id,
             machine_name: None,
             shared_secret,
+            git_shim: false,
         })
     }
 
@@ -95,6 +84,11 @@ impl MachineConfig {
         validate_machine_name(&machine_name)?;
         self.machine_name = Some(machine_name);
         Ok(self)
+    }
+
+    pub fn with_git_shim(mut self, enabled: bool) -> Self {
+        self.git_shim = enabled;
+        self
     }
 
     pub fn base_url(&self) -> &str {
@@ -112,88 +106,41 @@ impl MachineConfig {
     pub fn shared_secret(&self) -> &SharedSecret {
         &self.shared_secret
     }
+
+    pub fn git_shim(&self) -> bool {
+        self.git_shim
+    }
 }
 
 impl MachineStore {
-    pub fn config_path(&self) -> PathBuf {
-        self.root().join(CONFIG_FILE)
-    }
-
     pub fn write_config(&self, config: &MachineConfig) -> Result<(), MachineConfigError> {
-        fs::create_dir_all(self.root()).map_err(|source| MachineConfigError::CreateRoot {
-            path: self.root().to_owned(),
+        let path = self.config_path();
+        let directory = path.parent().expect("machine config path has a parent");
+        fs::create_dir_all(directory).map_err(|source| MachineConfigError::CreateRoot {
+            path: directory.to_owned(),
             source,
         })?;
-        protect_directory(self.root())?;
-
-        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp_path = self.root().join(format!(
-            ".{CONFIG_FILE}.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        protect_new_file(&mut options);
-        let mut temp = options
-            .open(&temp_path)
-            .map_err(|source| MachineConfigError::Write {
-                path: temp_path.clone(),
-                source,
-            })?;
-        let persisted = PersistedConfig::from(config);
-        let result = (|| {
-            let serialized = toml::to_string_pretty(&persisted).map_err(|source| {
+        let serialized =
+            toml::to_string_pretty(&PersistedConfig::from(config)).map_err(|source| {
                 MachineConfigError::Serialize {
-                    path: temp_path.clone(),
+                    path: path.clone(),
                     source,
                 }
             })?;
-            temp.write_all(serialized.as_bytes())
-                .and_then(|()| temp.sync_all())
-                .map_err(|source| MachineConfigError::Write {
-                    path: temp_path.clone(),
-                    source,
-                })?;
-            fs::rename(&temp_path, self.config_path()).map_err(|source| {
-                MachineConfigError::Replace {
-                    from: temp_path.clone(),
-                    to: self.config_path(),
-                    source,
-                }
-            })?;
-            sync_directory(self.root()).map_err(|source| MachineConfigError::SyncRoot {
-                path: self.root().to_owned(),
-                source,
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temp_path);
-        }
-        result
+        fs::write(&path, serialized).map_err(|source| MachineConfigError::Write { path, source })
     }
 
     pub fn load_config(&self) -> Result<MachineConfig, MachineConfigError> {
         let path = self.config_path();
-        require_protected_file(&path)?;
-        let metadata = fs::metadata(&path).map_err(|source| MachineConfigError::Read {
+        let text = fs::read_to_string(&path).map_err(|source| MachineConfigError::Read {
             path: path.clone(),
             source,
         })?;
-        if metadata.len() > MAX_CONFIG_BYTES {
-            return Err(MachineConfigError::TooLarge(path));
-        }
-        let bytes = fs::read(&path).map_err(|source| MachineConfigError::Read {
-            path: path.clone(),
-            source,
-        })?;
-        let persisted: PersistedConfig = toml::from_slice(&bytes).map_err(|error| {
-            let (line, column) = decode_error_position(&bytes, &error);
-            MachineConfigError::Decode { path, line, column }
-        })?;
-        if persisted.version != CONFIG_VERSION {
-            return Err(MachineConfigError::UnsupportedVersion(persisted.version));
-        }
+        let persisted: PersistedConfig =
+            toml::from_str(&text).map_err(|source| MachineConfigError::Decode {
+                path: path.clone(),
+                source,
+            })?;
         let mut config = MachineConfig::new(
             persisted.base_url,
             MachineId::parse(persisted.machine_id)?,
@@ -202,29 +149,30 @@ impl MachineStore {
         if let Some(machine_name) = persisted.machine_name {
             config = config.with_machine_name(machine_name)?;
         }
-        Ok(config)
+        Ok(config.with_git_shim(persisted.git_shim))
     }
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedConfig {
-    version: u32,
     base_url: String,
     machine_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     machine_name: Option<String>,
     shared_secret: String,
+    #[serde(default)]
+    git_shim: bool,
 }
 
 impl From<&MachineConfig> for PersistedConfig {
     fn from(config: &MachineConfig) -> Self {
         Self {
-            version: CONFIG_VERSION,
             base_url: config.base_url.clone(),
             machine_id: config.machine_id.0.clone(),
             machine_name: config.machine_name.clone(),
             shared_secret: config.shared_secret.0.clone(),
+            git_shim: config.git_shim,
         }
     }
 }
@@ -257,74 +205,6 @@ fn normalize_base_url(value: String) -> Result<String, MachineConfigError> {
     Ok(url.to_string().trim_end_matches('/').to_owned())
 }
 
-fn decode_error_position(bytes: &[u8], error: &toml::de::Error) -> (usize, usize) {
-    let offset = error.span().map_or(0, |span| span.start.min(bytes.len()));
-    let prefix = String::from_utf8_lossy(&bytes[..offset]);
-    let line = prefix
-        .chars()
-        .filter(|character| *character == '\n')
-        .count()
-        + 1;
-    let column = prefix
-        .rsplit_once('\n')
-        .map_or(prefix.chars().count(), |(_, tail)| tail.chars().count())
-        + 1;
-    (line, column)
-}
-
-#[cfg(unix)]
-fn protect_directory(path: &Path) -> Result<(), MachineConfigError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-        MachineConfigError::Protect {
-            path: path.to_owned(),
-            source,
-        }
-    })
-}
-
-#[cfg(not(unix))]
-fn protect_directory(_path: &Path) -> Result<(), MachineConfigError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn protect_new_file(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    options.mode(0o600);
-}
-
-#[cfg(not(unix))]
-fn protect_new_file(_options: &mut OpenOptions) {}
-
-#[cfg(unix)]
-fn require_protected_file(path: &Path) -> Result<(), MachineConfigError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let metadata = fs::metadata(path).map_err(|source| MachineConfigError::Read {
-        path: path.to_owned(),
-        source,
-    })?;
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(MachineConfigError::InsecurePermissions(path.to_owned()));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn require_protected_file(_path: &Path) -> Result<(), MachineConfigError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 #[derive(Debug, Error)]
 pub enum MachineConfigError {
     #[error(
@@ -345,12 +225,6 @@ pub enum MachineConfigError {
         #[source]
         source: io::Error,
     },
-    #[error("failed to protect machine configuration at {path}")]
-    Protect {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
     #[error("failed to write machine configuration at {path}")]
     Write {
         path: PathBuf,
@@ -363,35 +237,16 @@ pub enum MachineConfigError {
         #[source]
         source: toml::ser::Error,
     },
-    #[error("failed to atomically replace machine configuration {to} from {from}")]
-    Replace {
-        from: PathBuf,
-        to: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to sync machine configuration directory at {path}")]
-    SyncRoot {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
     #[error("failed to read machine configuration at {path}")]
     Read {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("machine configuration at {0} is not private to the current user")]
-    InsecurePermissions(PathBuf),
-    #[error("machine configuration at {0} exceeds the 64 KiB limit")]
-    TooLarge(PathBuf),
-    #[error("failed to decode machine configuration at {path}, line {line}, column {column}")]
+    #[error("failed to decode machine configuration at {path}: {source}")]
     Decode {
         path: PathBuf,
-        line: usize,
-        column: usize,
+        #[source]
+        source: toml::de::Error,
     },
-    #[error("machine configuration version {0} is unsupported")]
-    UnsupportedVersion(u32),
 }

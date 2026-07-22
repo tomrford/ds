@@ -26,8 +26,6 @@ const STATE_FILE: &str = "devspace-git-shim.state";
 const TREE_IDENTITY_DOMAIN: &[u8] = b"devspace-git-shim-tree-v1";
 const POLICY_IDENTITY_DOMAIN: &[u8] = b"devspace-hidden-set-v1";
 
-pub const SETTING: &str = "devspace.git-shim";
-
 pub fn ensure(checkout_root: &Path, settings: &UserSettings) {
     if let Err(err) = ensure_inner(checkout_root, settings) {
         tracing::warn!(

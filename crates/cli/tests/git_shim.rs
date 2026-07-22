@@ -12,11 +12,15 @@ use devspace_machine::{
 mod support;
 
 use support::{
-    configure_machine, ds, ds_command, machine_store, settings, stderr, write_cli_config,
+    configure_machine, ds, ds_command, machine_store, set_machine_git_shim, settings, stderr,
+    write_cli_config,
 };
 
 async fn local_repository(root: &Path, name: &str) {
-    configure_machine(root, "http://127.0.0.1:1");
+    let store = machine_store(root);
+    if store.load_config().is_err() {
+        configure_machine(root, "http://127.0.0.1:1");
+    }
     let store = machine_store(root);
     let entry = store
         .register_repository(
@@ -33,23 +37,11 @@ async fn local_repository(root: &Path, name: &str) {
 }
 
 fn set_git_shim(config: &Path, enabled: bool) {
-    let text = fs::read_to_string(config).unwrap();
-    let value = format!("git-shim = {enabled}");
-    let text = if text.contains("git-shim = ") {
-        text.lines()
-            .map(|line| {
-                if line.trim_start().starts_with("git-shim = ") {
-                    format!("            {value}")
-                } else {
-                    line.to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        format!("{text}\n[devspace]\n{value}\n")
-    };
-    fs::write(config, text).unwrap();
+    let root = config.parent().unwrap();
+    if machine_store(root).load_config().is_err() {
+        configure_machine(root, "http://127.0.0.1:1");
+    }
+    set_machine_git_shim(root, enabled);
 }
 
 fn add_checkout(root: &Path, config: &Path, name: &str, checkout: &Path) -> Output {

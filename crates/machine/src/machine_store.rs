@@ -128,6 +128,7 @@ pub struct CatalogEntry {
 #[derive(Clone, Debug)]
 pub struct MachineStore {
     root: PathBuf,
+    config_path: PathBuf,
 }
 
 pub struct CheckoutDestinationGuard {
@@ -141,7 +142,9 @@ pub struct RepositorySyncGuard {
 
 impl MachineStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        let config_path = root.join("config.toml");
+        Self { root, config_path }
     }
 
     pub fn platform_default() -> Result<Self, MachineStoreError> {
@@ -151,11 +154,18 @@ impl MachineStore {
             }
             return Ok(Self::new(root));
         }
-        Ok(Self::new(platform_data_directory()?))
+        Ok(Self {
+            root: platform_data_directory()?,
+            config_path: platform_config_file()?,
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.config_path.clone()
     }
 
     pub fn catalog_path(&self) -> PathBuf {
@@ -652,6 +662,23 @@ fn validate_lower_hex(
     Ok(())
 }
 
+fn platform_config_file() -> Result<PathBuf, MachineStoreError> {
+    if let Some(root) = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+    {
+        return Ok(root.join("devspace/config.toml"));
+    }
+    if let Some(home) = env::var_os("HOME").filter(|home| !home.is_empty()) {
+        return Ok(PathBuf::from(home).join(".config/devspace/config.toml"));
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(home) = env::var_os("USERPROFILE").filter(|home| !home.is_empty()) {
+        return Ok(PathBuf::from(home).join(".config/devspace/config.toml"));
+    }
+    Err(MachineStoreError::PlatformConfigFile)
+}
+
 fn platform_data_directory() -> Result<PathBuf, MachineStoreError> {
     #[cfg(target_os = "macos")]
     {
@@ -690,6 +717,8 @@ pub enum MachineStoreError {
     },
     #[error("{MACHINE_STORE_OVERRIDE} must not be empty")]
     EmptyRootOverride,
+    #[error("the Devspace config path is unavailable; set XDG_CONFIG_HOME or HOME")]
+    PlatformConfigFile,
     #[error("the platform data directory is unavailable")]
     PlatformDataDirectory,
     #[error("failed to create machine-store root at {path}")]

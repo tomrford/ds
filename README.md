@@ -86,11 +86,24 @@ commands when current cloud directory or authorization state matters.
 
 ## Repositories and checkouts
 
-`MachineStore` owns the protected local configuration, repository catalog,
-creation journal, native repositories and synchronization sidecars. Native paths
-use the opaque repository ID and incarnation, never the tenant-visible name.
-The default root follows the platform data directory; `DEVSPACE_MACHINE_STORE_DIR`
-is a bring-up and test override.
+`MachineStore` owns the local configuration, repository catalog, creation journal,
+native repositories and synchronization sidecars. Configuration
+lives at `$XDG_CONFIG_HOME/devspace/config.toml`, or
+`~/.config/devspace/config.toml` when `XDG_CONFIG_HOME` is unset. Repository data
+uses the platform data directory. Native paths use the opaque repository ID and
+incarnation, never the tenant-visible name. `DEVSPACE_MACHINE_STORE_DIR` is a
+bring-up and test override for both data and configuration.
+
+```toml
+base_url = "https://worker.example.com"
+machine_id = "0123456789abcdef0123456789abcdef"
+machine_name = "macmini"
+shared_secret = "..."
+git_shim = true
+```
+
+This is an ordinary user-managed TOML file. `machine_name` is optional and
+`git_shim` defaults to `false` when omitted.
 
 Repository creation records an idempotency intent before claiming a cloud name.
 A lost response can therefore replay the same request. Git import uses the same
@@ -113,9 +126,11 @@ handled idempotently; moved or unowned directories are left untouched.
 repository without a checkout or cloud request. The bare surface is read-only,
 and `@` is unavailable because no working copy is selected.
 
-The optional `devspace.git-shim` jj setting maintains a read-only Git index for
-consumers that require one. It is off by default and does not make Git writes a
-supported surface.
+The optional `git_shim` Devspace setting maintains a read-only Git index for
+consumers that require one. It is off by default; enable it with
+`ds config set git-shim true`. The shim does not make Git writes a supported
+surface. `ds config` manages Devspace settings; use `ds jj config` for jj's own
+configuration.
 
 ## Synchronization
 

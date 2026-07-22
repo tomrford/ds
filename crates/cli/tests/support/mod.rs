@@ -138,6 +138,12 @@ pub fn configure_machine_with_name(root: &Path, base_url: &str, machine_name: Op
     );
 }
 
+pub fn set_machine_git_shim(root: &Path, enabled: bool) {
+    let store = machine_store(root);
+    let config = store.load_config().unwrap().with_git_shim(enabled);
+    store.write_config(&config).unwrap();
+}
+
 fn write_machine_config(
     root: &Path,
     base_url: &str,

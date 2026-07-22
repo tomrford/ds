@@ -269,7 +269,8 @@ fn root_help_is_devspace_first() {
         "{help}"
     );
     for command in [
-        "add", "init", "list", "doctor", "remove", "repo", "skill", "sync", "git", "status",
+        "add", "init", "list", "doctor", "remove", "repo", "skill", "sync", "config", "git", "jj",
+        "status",
     ] {
         assert!(
             help.lines()
@@ -291,7 +292,7 @@ fn skill_prints_agent_guidance_without_a_checkout() {
     assert!(output.status.success(), "{}", stderr(&output));
     let guidance = stdout(&output);
     assert!(guidance.contains("best-effort Git index shim is off by default"));
-    assert!(guidance.contains("devspace.git-shim=true"));
+    assert!(guidance.contains("ds config set git-shim true"));
     assert!(guidance.contains("Git writes and all `jj` commands"));
     assert!(guidance.contains("Git is a projection boundary"));
     assert!(guidance.contains("It is not an ignore file"));

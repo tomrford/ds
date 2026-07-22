@@ -24,10 +24,7 @@ pub(crate) async fn run_doctor(ui: &mut Ui, command: &CommandHelper) -> Result<(
     };
     let config = match store.as_ref().map(MachineStore::load_config) {
         Some(Ok(config)) => {
-            writeln!(
-                ui.stdout(),
-                "OK machine config: config.toml is valid and protected"
-            )?;
+            writeln!(ui.stdout(), "OK machine config: config.toml is valid")?;
             Some(config)
         }
         Some(Err(error)) => {
