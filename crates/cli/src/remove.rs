@@ -37,6 +37,7 @@ struct RemovedCheckout<'a> {
     root: &'a Path,
     repo: &'a str,
     workspace_id: &'a str,
+    change_id: Option<&'a str>,
 }
 
 struct RemovalTarget {
@@ -101,6 +102,12 @@ pub(crate) async fn remove_checkout(
         snapshot_checkout(ui, command, &target.entry, &path, &workspace_name).await?;
     }
 
+    let change_id = if registered {
+        registered_change_id(&target.entry, &workspace_name, &settings).await?
+    } else {
+        None
+    };
+
     if target.path_exists {
         failpoint("before_checkout_deletion_validation");
         validate_checkout_at_path(command, &target.entry, &target.owner, &path)?;
@@ -113,16 +120,19 @@ pub(crate) async fn remove_checkout(
         })?;
     }
 
-    if registered {
-        forget_workspace(&target.entry, &workspace_name, &settings).await?;
+    let abandoned = if registered {
+        forget_workspace(&target.entry, &workspace_name, &settings).await?
     } else {
         forget_workspace_record(&target.entry.native_repository_path, &workspace_name)?;
-    }
+        false
+    };
+    let change_id = (!abandoned).then_some(change_id).flatten();
 
     let removed = RemovedCheckout {
         root: &path,
         repo: target.entry.name.as_str(),
         workspace_id: workspace_name.as_str(),
+        change_id: change_id.as_deref(),
     };
     if args.json {
         serde_json::to_writer_pretty(ui.stdout(), &removed)
@@ -494,10 +504,11 @@ async fn forget_workspace(
     entry: &CatalogEntry,
     workspace_name: &WorkspaceName,
     settings: &jj_lib::settings::UserSettings,
-) -> Result<(), CommandError> {
+) -> Result<bool, CommandError> {
     let repository = MachineRepository::open(&entry.native_repository_path, settings)
         .await
         .map_err(|error| user_error(error.to_string()))?;
+    let mut abandoned = false;
     if let Some(working_copy_commit_id) = repository
         .repo()
         .view()
@@ -535,6 +546,7 @@ async fn forget_workspace(
             transaction
                 .repo_mut()
                 .record_abandoned_commit(&working_copy_commit);
+            abandoned = true;
         }
         commit_repo_transaction(
             transaction,
@@ -550,7 +562,27 @@ async fn forget_workspace(
         })?;
         failpoint("after_repository_view_forget");
     }
-    forget_workspace_record(&entry.native_repository_path, workspace_name)
+    forget_workspace_record(&entry.native_repository_path, workspace_name)?;
+    Ok(abandoned)
+}
+
+async fn registered_change_id(
+    entry: &CatalogEntry,
+    workspace_name: &WorkspaceName,
+    settings: &jj_lib::settings::UserSettings,
+) -> Result<Option<String>, CommandError> {
+    let repository = MachineRepository::open(&entry.native_repository_path, settings)
+        .await
+        .map_err(|error| user_error(error.to_string()))?;
+    let Some(commit_id) = repository.repo().view().get_wc_commit_id(workspace_name) else {
+        return Ok(None);
+    };
+    let commit = repository
+        .repo()
+        .store()
+        .get_commit_async(commit_id)
+        .await?;
+    Ok(Some(commit.change_id().reverse_hex()))
 }
 
 fn forget_workspace_record(

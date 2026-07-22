@@ -55,6 +55,9 @@ ds init <git-url> [<directory>]
 # Create another checkout at an explicit revision
 ds add <repository> -r <revision> <path>
 
+# Create another checkout that edits an existing mutable revision
+ds add <repository> --edit <revision> <path>
+
 # Inspect local repositories and workspaces
 ds repo list
 ds list
@@ -84,6 +87,19 @@ it does not contact the Worker. `ds sync status` does the same for every local
 catalog repository and pings only the local daemon. Use online repository
 commands when current cloud directory or authorization state matters.
 
+The read commands below accept `--json`. They write one JSON document followed
+by a newline to stdout; diagnostics go to stderr.
+
+- `ds list --json` returns an array of
+  `{current, workspace_id, change_id, commit_id, description}`. Both IDs are
+  full canonical jj IDs, and `change_id` can be used in a revset.
+- `ds repo list --json` returns an array of
+  `{name, availability, checkouts}`. `availability` is `available-locally`,
+  `cloud-only` or `missing-from-cloud`.
+- `ds sync status --json` returns
+  `{daemon_running, repositories: [{repo, complete, has_sync_state, pending}]}`.
+- `ds git remote list --json` returns an array of `{name, url}`.
+
 ## Repositories and checkouts
 
 `MachineStore` owns the local configuration, repository catalog, creation journal,
@@ -110,17 +126,25 @@ A lost response can therefore replay the same request. Git import uses the same
 creation path, registers `origin`, imports remote heads and rejects Git links
 before the simple backend can encode them.
 
-`ds add` creates a deterministic workspace whose identity combines the machine
-ID and canonical destination path. The checkout contains an ownership marker
-and a stock repository pointer to the shared native repository. Publication is
-staged and atomic; foreign or mismatched destinations are never overwritten.
-A later `ds add` uses the local repository unless its first machine clone is
-still incomplete.
+`ds add` requires exactly one of `-r <revision>` and `--edit <revision>`.
+`-r` creates a new empty working-copy change whose parent is the requested
+revision. `--edit` fails unless the revision is mutable, then registers the new
+workspace directly at that change.
+The workspace identity combines the machine ID and canonical destination path.
+The checkout contains an ownership marker and a stock repository pointer to the
+shared native repository. Publication is staged and atomic; foreign or
+mismatched destinations are never overwritten. A later `ds add` uses the local
+repository unless its first machine clone is still incomplete. `ds add --json`
+returns `root`, `repo`, `workspace_id` and the full canonical `change_id`.
 
 `ds remove` accepts only an owned checkout. It snapshots pending edits, deletes
 the checkout, forgets its workspace and removes its path record while retaining
 the native repository. Interrupted and already-missing checkout states are
 handled idempotently; moved or unowned directories are left untouched.
+`ds remove --json` returns `root`, `repo`, `workspace_id` and `change_id`.
+After snapshotting and any disposable-head abandonment, `change_id` is either
+the preserved change's full canonical ID or null. A non-null ID can be passed
+to `ds add --edit`.
 
 `ds -R <repository> log` resolves a local catalog name and opens the bare native
 repository without a checkout or cloud request. The bare surface is read-only,

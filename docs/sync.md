@@ -8,10 +8,12 @@ a separate subsystem described in [`git-projection.md`](git-projection.md).
 
 Repository work is offline-first: ordinary jj-compatible commands operate on
 the local checkout, while `ds sync`, the daemon and command-boundary sync move
-native state to and from the cloud. `ds add` creates another checkout from a
-local machine repository or resolves and clones it on first use. `ds remove`
-discards a checkout while retaining its machine repository. `ds git fetch` and
-`ds git push` own the explicit public Git boundary.
+native state to and from the cloud. `ds add -r <revision>` creates another
+checkout with a new child change. `ds add --edit <revision>` fails unless the
+revision is mutable, then edits that change directly; exactly one mode is
+required. Both use a local machine repository or resolve and clone it on first
+use. `ds remove` discards a checkout while retaining its machine repository.
+`ds git fetch` and `ds git push` own the explicit public Git boundary.
 
 Repository directory commands are online-only. `ds repo new [<name>]` creates
 an empty cloud repository. `ds repo add <git-url> [--name <name>]` imports a Git
@@ -19,6 +21,13 @@ remote without a checkout. `ds repo rename` and `ds repo list` update or read
 the cloud directory. `ds init [<git-url>] [<directory>]` composes repository
 creation or import with a first checkout. It does not convert a local Git
 working copy.
+
+`ds repo list --json` returns an array of `{name, availability, checkouts}`;
+`availability` is `available-locally`, `cloud-only` or `missing-from-cloud`.
+`ds sync status --json` returns
+`{daemon_running, repositories: [{repo, complete, has_sync_state, pending}]}`.
+Each command writes only the JSON document and its trailing newline to stdout;
+diagnostics go to stderr.
 
 ## Native repository boundary
 

@@ -221,6 +221,42 @@ async fn add_catalog_hit_never_contacts_the_control_plane() {
 }
 
 #[tokio::test]
+async fn add_requires_one_position_mode_and_preserves_revision_alias() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_name = "position-mode";
+    local_repository(temp.path(), repository_name).await;
+    let config = write_cli_config(temp.path());
+
+    let missing = ds_command(temp.path(), &config)
+        .args(["add", repository_name])
+        .arg(temp.path().join("missing"))
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2), "{}", stderr(&missing));
+
+    let conflicting = ds_command(temp.path(), &config)
+        .args(["add", repository_name, "-r", "root()", "--edit", "root()"])
+        .arg(temp.path().join("conflicting"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        conflicting.status.code(),
+        Some(2),
+        "{}",
+        stderr(&conflicting)
+    );
+
+    let destination = temp.path().join("alias");
+    let alias = ds_command(temp.path(), &config)
+        .args(["add", repository_name, "--revision", "root()"])
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(alias.status.success(), "{}", stderr(&alias));
+    assert!(destination.join(".jj/repo").is_file());
+}
+
+#[tokio::test]
 async fn add_resumes_after_kill_between_catalog_registration_and_native_publication() {
     let temp = tempfile::tempdir().unwrap();
     let fixture = cloud_fixture(temp.path()).await;
@@ -327,6 +363,37 @@ fn add_json(
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn add_edit(
+    cwd: &Path,
+    config: &Path,
+    repository_name: &str,
+    revision: &str,
+    path: &Path,
+) -> Output {
+    ds_command(cwd, config)
+        .args(["add", repository_name, "--edit", revision])
+        .arg(path)
+        .output()
+        .unwrap()
+}
+
+fn add_edit_json(
+    cwd: &Path,
+    config: &Path,
+    repository_name: &str,
+    revision: &str,
+    path: &Path,
+) -> serde_json::Value {
+    let output = ds_command(cwd, config)
+        .args(["add", repository_name, "--edit", revision])
+        .arg(path)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn spawn_add_at_failpoint(
     cwd: &Path,
     config: &Path,
@@ -349,6 +416,27 @@ fn spawn_add_at_failpoint(
         command.env("DEVSPACE_TEST_CHECKOUT_FAILPOINT_CONTINUE", path);
     }
     command.spawn().unwrap()
+}
+
+fn spawn_add_edit_at_failpoint(
+    cwd: &Path,
+    config: &Path,
+    repository_name: &str,
+    revision: &str,
+    destination: &Path,
+    failpoint: &str,
+    ready: &Path,
+) -> Child {
+    ds_command(cwd, config)
+        .env("DEVSPACE_TEST_CHECKOUT_FAILPOINT", failpoint)
+        .env("DEVSPACE_TEST_CHECKOUT_FAILPOINT_READY", ready)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["add", repository_name, "--edit", revision])
+        .arg(destination)
+        .arg("--json")
+        .spawn()
+        .unwrap()
 }
 
 fn wait_for_failpoint(ready: &Path) {
@@ -433,6 +521,8 @@ async fn add_fresh_creates_deterministic_owned_workspace() {
     assert!(workspace_id.starts_with(&format!("{TEST_MACHINE_ID}-")));
     assert_eq!(workspace_id.len(), TEST_MACHINE_ID.len() + 1 + 24);
     assert_eq!(added["root"], canonical_destination.to_str().unwrap());
+    assert_eq!(added.as_object().unwrap().len(), 4);
+    assert_eq!(added["change_id"].as_str().unwrap().len(), 32);
     assert!(canonical_destination.join(".jj/repo").is_file());
     let owner: serde_json::Value = serde_json::from_slice(
         &fs::read(
@@ -474,6 +564,87 @@ async fn add_fresh_creates_deterministic_owned_workspace() {
             .join("machine-store/checkout-creations.json")
             .exists()
     );
+}
+
+#[tokio::test]
+async fn add_edit_materializes_a_mutable_change_without_creating_a_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_name = "edit-mutable";
+    local_repository(temp.path(), repository_name).await;
+    let config = write_cli_config(temp.path());
+    let source = temp.path().join("source");
+    let source_added = add_json(temp.path(), &config, repository_name, "root()", &source);
+    fs::write(source.join("tracked"), "same change\n").unwrap();
+    let describe = ds(&source, &config, &["describe", "-m", "mutable target"]);
+    assert!(describe.status.success(), "{}", stderr(&describe));
+    let target_commit = commit_id(&source, &config, "@");
+    let target_change = source_added["change_id"].as_str().unwrap();
+    let destination = temp.path().join("edited");
+
+    let edited = add_edit_json(
+        temp.path(),
+        &config,
+        repository_name,
+        target_change,
+        &destination,
+    );
+
+    assert_eq!(edited["change_id"], target_change);
+    assert_eq!(commit_id(&destination, &config, "@"), target_commit);
+    assert_eq!(
+        fs::read_to_string(destination.join("tracked")).unwrap(),
+        "same change\n"
+    );
+
+    let wrong_mode = add(
+        temp.path(),
+        &config,
+        repository_name,
+        target_change,
+        &destination,
+    );
+    assert!(wrong_mode.status.success(), "{}", stderr(&wrong_mode));
+    assert!(
+        stderr(&wrong_mode).contains("requested revision was not applied"),
+        "{}",
+        stderr(&wrong_mode)
+    );
+    assert_eq!(commit_id(&destination, &config, "@"), target_commit);
+}
+
+#[tokio::test]
+async fn add_edit_rejects_immutable_root_with_child_hint() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_name = "edit-root";
+    local_repository(temp.path(), repository_name).await;
+    let config = write_cli_config(temp.path());
+    let destination = temp.path().join("checkout");
+
+    let output = add_edit(
+        temp.path(),
+        &config,
+        repository_name,
+        "root()",
+        &destination,
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("root commit"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("is immutable"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("Use `-r root()` to create a child"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!destination.exists());
 }
 
 #[tokio::test]
@@ -767,6 +938,84 @@ async fn add_adopts_registered_workspace_when_destination_is_absent() {
     assert!(retry.status.success(), "{}", stderr(&retry));
     assert!(stderr(&retry).contains("Rebuilt workspace"));
     assert!(destination.join(".jj/working_copy/type").is_file());
+}
+
+#[tokio::test]
+async fn add_rebuild_retry_validates_edit_mode_against_the_exact_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository_name = "edit-rebuild";
+    local_repository(temp.path(), repository_name).await;
+    let config = write_cli_config(temp.path());
+    let source = temp.path().join("source");
+    let source_added = add_json(temp.path(), &config, repository_name, "root()", &source);
+    let describe = ds(&source, &config, &["describe", "-m", "edit target"]);
+    assert!(describe.status.success(), "{}", stderr(&describe));
+    let target_change = source_added["change_id"].as_str().unwrap();
+    let target_commit = commit_id(&source, &config, "@");
+    let destination = temp.path().join("checkout");
+    let ready = temp.path().join("ready");
+    let mut child = spawn_add_edit_at_failpoint(
+        temp.path(),
+        &config,
+        repository_name,
+        target_change,
+        &destination,
+        "after_workspace_registration",
+        &ready,
+    );
+    wait_for_failpoint(&ready);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(!destination.exists());
+
+    let new = ds(&source, &config, &["new", "-m", "other edit target"]);
+    assert!(new.status.success(), "{}", stderr(&new));
+    let other_target = commit_id(&source, &config, "@");
+    let wrong_target = add_edit(
+        temp.path(),
+        &config,
+        repository_name,
+        &other_target,
+        &destination,
+    );
+    assert_eq!(
+        wrong_target.status.code(),
+        Some(1),
+        "{}",
+        stderr(&wrong_target)
+    );
+    assert!(
+        stderr(&wrong_target).contains("not requested edit target"),
+        "{}",
+        stderr(&wrong_target)
+    );
+    assert!(!destination.exists());
+
+    let wrong_mode = add(
+        temp.path(),
+        &config,
+        repository_name,
+        target_change,
+        &destination,
+    );
+    assert_eq!(wrong_mode.status.code(), Some(1), "{}", stderr(&wrong_mode));
+    assert!(
+        stderr(&wrong_mode).contains("whose parent position is"),
+        "{}",
+        stderr(&wrong_mode)
+    );
+    assert!(!destination.exists());
+
+    let rebuilt = add_edit(
+        temp.path(),
+        &config,
+        repository_name,
+        target_change,
+        &destination,
+    );
+    assert!(rebuilt.status.success(), "{}", stderr(&rebuilt));
+    assert!(stderr(&rebuilt).contains("Rebuilt workspace"));
+    assert_eq!(commit_id(&destination, &config, "@"), target_commit);
 }
 
 #[tokio::test]

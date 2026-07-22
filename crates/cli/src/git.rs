@@ -22,7 +22,58 @@ use self::projection_sidecar::open_or_create_projection;
 
 const DEFAULT_REMOTE: &str = "origin";
 const FAILPOINT_ENV: &str = "DEVSPACE_FAILPOINT";
+const REMOTE_LIST_JSON_ARG: &str = "devspace-git-remote-list-json";
 pub(crate) const CLOUD_RUNTIME_ERROR: &str = "failed to start the cloud transport runtime";
+
+pub(crate) struct GitRemoteListJsonArgs {
+    requested: bool,
+}
+
+impl clap::FromArgMatches for GitRemoteListJsonArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            requested: remote_list_json_requested(matches),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.requested = remote_list_json_requested(matches);
+        Ok(())
+    }
+}
+
+impl clap::Args for GitRemoteListJsonArgs {
+    fn augment_args(mut command: clap::Command) -> clap::Command {
+        let list = command
+            .find_subcommand_mut("git")
+            .expect("jj command tree contains git")
+            .find_subcommand_mut("remote")
+            .expect("jj git command tree contains remote")
+            .find_subcommand_mut("list")
+            .expect("jj git remote command tree contains list");
+        *list = std::mem::take(list).arg(
+            clap::Arg::new(REMOTE_LIST_JSON_ARG)
+                .long("json")
+                .action(clap::ArgAction::SetTrue)
+                .help("Print Devspace remote configuration as JSON"),
+        );
+        command
+    }
+
+    fn augment_args_for_update(command: clap::Command) -> clap::Command {
+        Self::augment_args(command)
+    }
+}
+
+pub(crate) fn remote_list_json_requested(matches: &clap::ArgMatches) -> bool {
+    matches
+        .subcommand_matches("git")
+        .and_then(|matches| matches.subcommand_matches("remote"))
+        .and_then(|matches| matches.subcommand_matches("list"))
+        .and_then(|matches| matches.get_one::<bool>(REMOTE_LIST_JSON_ARG))
+        .copied()
+        .unwrap_or(false)
+}
 
 pub(super) struct LockedCheckoutEntry {
     store: MachineStore,
@@ -51,8 +102,13 @@ pub(crate) async fn run_git(ui: &mut Ui, command: &CommandHelper) -> Result<(), 
                 remote_add(ui, command, &name, &url).await
             }
             Some(("list", list_matches)) => {
-                reject_command_line_values(list_matches, &[], "git remote list")?;
-                remote_list(ui, command).await
+                reject_command_line_values(
+                    list_matches,
+                    &[REMOTE_LIST_JSON_ARG],
+                    "git remote list",
+                )?;
+                let json = list_matches.get_flag(REMOTE_LIST_JSON_ARG);
+                remote_list(ui, command, json).await
             }
             Some((name, _)) => Err(owned_boundary_error(&format!("remote {name}"))),
             None => Err(owned_boundary_error("remote")),
@@ -179,14 +235,33 @@ pub(crate) fn register_remote(
     Ok(())
 }
 
-async fn remote_list(ui: &mut Ui, command: &CommandHelper) -> Result<(), CommandError> {
+#[derive(serde::Serialize)]
+struct RemoteListEntry<'a> {
+    name: &'a str,
+    url: &'a str,
+}
+
+async fn remote_list(ui: &mut Ui, command: &CommandHelper, json: bool) -> Result<(), CommandError> {
     reject_unsupported_global_options(command, "git remote list")?;
     let entry = checkout_entry(ui, command).await?;
     let store = MachineStore::platform_default().map_err(display_error)?;
     let config = store.load_config().map_err(display_error)?;
     let remotes = list_registered_remotes(&config, &entry)?;
-    for remote in remotes {
-        writeln!(ui.stdout(), "{} {}", remote.name, remote.url)?;
+    if json {
+        let remotes = remotes
+            .iter()
+            .map(|remote| RemoteListEntry {
+                name: &remote.name,
+                url: &remote.url,
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_writer(ui.stdout(), &remotes)
+            .map_err(|error| user_error(format!("failed to encode Git remote list: {error}")))?;
+        writeln!(ui.stdout())?;
+    } else {
+        for remote in remotes {
+            writeln!(ui.stdout(), "{} {}", remote.name, remote.url)?;
+        }
     }
     Ok(())
 }

@@ -14,6 +14,20 @@ struct LocalSyncStatus {
     pending: usize,
 }
 
+#[derive(serde::Serialize)]
+struct CatalogSyncStatus {
+    daemon_running: bool,
+    repositories: Vec<RepositorySyncStatus>,
+}
+
+#[derive(serde::Serialize)]
+struct RepositorySyncStatus {
+    repo: String,
+    complete: bool,
+    has_sync_state: bool,
+    pending: usize,
+}
+
 pub(crate) async fn write_status_line(
     ui: &mut Ui,
     command: &CommandHelper,
@@ -62,19 +76,24 @@ pub(crate) async fn write_status_line(
 pub(crate) async fn write_catalog_status(
     ui: &mut Ui,
     command: &CommandHelper,
+    json: bool,
 ) -> Result<(), CommandError> {
     reject_unsupported_global_options(command, "sync status")?;
     let store = MachineStore::platform_default().map_err(|error| user_error(error.to_string()))?;
-    writeln!(
-        ui.status(),
-        "daemon: {}",
-        if crate::daemon::is_running(&store) {
-            "running"
-        } else {
-            "not running"
-        }
-    )?;
+    let daemon_running = crate::daemon::is_running(&store);
+    if !json {
+        writeln!(
+            ui.status(),
+            "daemon: {}",
+            if daemon_running {
+                "running"
+            } else {
+                "not running"
+            }
+        )?;
+    }
 
+    let mut repositories = Vec::new();
     for entry in store
         .entries()
         .map_err(|error| user_error(error.to_string()))?
@@ -95,20 +114,40 @@ pub(crate) async fn write_catalog_status(
             Vec::new()
         };
         let status = local_sync_status(&store, &entry, &current_heads).map_err(user_error)?;
-        write!(ui.status(), "{}: ", entry.name)?;
-        if !complete {
-            write!(ui.status(), "incomplete clone; ")?;
+        if json {
+            repositories.push(RepositorySyncStatus {
+                repo: entry.name.to_string(),
+                complete,
+                has_sync_state: status.has_sync_state,
+                pending: status.pending,
+            });
+        } else {
+            write!(ui.status(), "{}: ", entry.name)?;
+            if !complete {
+                write!(ui.status(), "incomplete clone; ")?;
+            }
+            write!(ui.status(), "pending: {}", status.pending)?;
+            if !status.has_sync_state {
+                write!(ui.status(), "; never synchronized")?;
+            } else if status.pending == 0 {
+                write!(
+                    ui.status(),
+                    "; in sync with cloud as of the last successful sync"
+                )?;
+            }
+            writeln!(ui.status())?;
         }
-        write!(ui.status(), "pending: {}", status.pending)?;
-        if !status.has_sync_state {
-            write!(ui.status(), "; never synchronized")?;
-        } else if status.pending == 0 {
-            write!(
-                ui.status(),
-                "; in sync with cloud as of the last successful sync"
-            )?;
-        }
-        writeln!(ui.status())?;
+    }
+    if json {
+        serde_json::to_writer(
+            ui.stdout(),
+            &CatalogSyncStatus {
+                daemon_running,
+                repositories,
+            },
+        )
+        .map_err(|error| user_error(format!("failed to encode synchronization status: {error}")))?;
+        writeln!(ui.stdout())?;
     }
     Ok(())
 }

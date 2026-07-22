@@ -718,7 +718,7 @@ async fn remove_discards_an_unedited_working_copy_head() {
 }
 
 #[tokio::test]
-async fn remove_json_reports_the_removed_checkout_identity() {
+async fn remove_json_reports_null_for_an_abandoned_disposable_change() {
     let temp = tempfile::tempdir().unwrap();
     local_repository(temp.path(), "json").await;
     let config = write_cli_config(temp.path());
@@ -736,7 +736,46 @@ async fn remove_json_reports_the_removed_checkout_identity() {
     assert_eq!(removed["root"], added["root"]);
     assert_eq!(removed["repo"], "json");
     assert_eq!(removed["workspace_id"], added["workspace_id"]);
+    assert!(removed["change_id"].is_null());
+    assert_eq!(removed.as_object().unwrap().len(), 4);
     assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn remove_json_change_id_round_trips_through_add_edit() {
+    let temp = tempfile::tempdir().unwrap();
+    local_repository(temp.path(), "json-edit").await;
+    let config = write_cli_config(temp.path());
+    let path = temp.path().join("checkout");
+    let added = add_checkout(temp.path(), &config, "json-edit", "root()", &path);
+    fs::write(path.join("preserved.txt"), "post-snapshot change\n").unwrap();
+
+    let output = ds_command(temp.path(), &config)
+        .arg("remove")
+        .arg(&path)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let removed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let change_id = removed["change_id"].as_str().unwrap();
+    assert_eq!(change_id, added["change_id"]);
+    assert_eq!(removed.as_object().unwrap().len(), 4);
+
+    let restored = temp.path().join("restored");
+    let readd = ds_command(temp.path(), &config)
+        .args(["add", "json-edit", "--edit", change_id])
+        .arg(&restored)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(readd.status.success(), "{}", stderr(&readd));
+    let readded: serde_json::Value = serde_json::from_slice(&readd.stdout).unwrap();
+    assert_eq!(readded["change_id"], change_id);
+    assert_eq!(
+        fs::read_to_string(restored.join("preserved.txt")).unwrap(),
+        "post-snapshot change\n"
+    );
 }
 
 #[tokio::test]

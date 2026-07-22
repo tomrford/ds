@@ -17,9 +17,23 @@ use `ds` for changes.
 - publish a sealed change with `ds bookmark set <name> -r @-`, then
   `ds git push -b <name>`
 - fetch collaborator work with `ds git fetch [--remote <name>] [-b <bookmark>]`
-- create another checkout with `ds add <repo> -r <revision> <path>`
+- choose exactly one checkout mode; create a new child change with
+  `ds add <repo> -r <revision> <path>`
+- or edit an existing mutable change in another checkout with
+  `ds add <repo> --edit <revision> <path>`
 - list every workspace for this repository with `ds list`
 - remove a checkout, but retain its repository, with `ds remove <path>`
+- `ds add --json` and `ds remove --json` emit `root`, `repo`, `workspace_id`
+  and the full canonical `change_id`; removal emits null after abandoning a
+  disposable head
+- `ds list --json` emits
+  `[{current, workspace_id, change_id, commit_id, description}]`
+- `ds repo list --json` emits `[{name, availability, checkouts}]`; availability
+  is `available-locally`, `cloud-only`, or `missing-from-cloud`
+- `ds sync status --json` emits
+  `{daemon_running, repositories: [{repo, complete, has_sync_state, pending}]}`
+- `ds git remote list --json` emits `[{name, url}]`
+- JSON modes write only one JSON document and its trailing newline to stdout
 - import a Git remote without a checkout with `ds repo add <git-url>`
 - create a repository and its first checkout with `ds init [<git-url>] [<path>]`
 - create an empty cloud repository without a checkout with `ds repo new [<name>]`

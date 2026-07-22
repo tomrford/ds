@@ -18,7 +18,7 @@ use crate::daemon::{DaemonArgs, run_daemon};
 use crate::doctor::run_doctor;
 use crate::git::{CLOUD_RUNTIME_ERROR, cloud_runtime, display_error};
 use crate::init::{InitArgs, import_git_repository, init_repository};
-use crate::list::list_workspaces;
+use crate::list::{ListArgs, list_workspaces};
 use crate::remove::{RemoveArgs, remove_checkout};
 use crate::skill::{SkillArgs, print_skill};
 use crate::sync::{SyncArgs, run_sync};
@@ -30,7 +30,7 @@ pub(crate) enum DevspaceCommand {
     /// Initialize a Devspace repository from a Git remote.
     Init(InitArgs),
     /// List every workspace of the current repository.
-    List,
+    List(ListArgs),
     /// Check this machine's Devspace setup.
     Doctor,
     /// Pin read-only Git reference repos under .repos/.
@@ -73,7 +73,14 @@ enum RepoCommand {
         force: bool,
     },
     /// List active cloud repositories.
-    List,
+    List(RepoListArgs),
+}
+
+#[derive(clap::Args)]
+struct RepoListArgs {
+    /// Print repository state as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 pub(crate) async fn run(
@@ -84,7 +91,7 @@ pub(crate) async fn run(
     match args {
         DevspaceCommand::Add(args) => add_checkout(ui, command, args).await,
         DevspaceCommand::Init(args) => init_repository(ui, command, args).await,
-        DevspaceCommand::List => list_workspaces(ui, command).await,
+        DevspaceCommand::List(args) => list_workspaces(ui, command, args).await,
         DevspaceCommand::Doctor => run_doctor(ui, command).await,
         DevspaceCommand::Context(args) => run_context(ui, command, args).await,
         DevspaceCommand::Remove(args) => remove_checkout(ui, command, args).await,
@@ -114,7 +121,7 @@ async fn run_repo(
         }
         RepoCommand::Rename { old, new } => rename_repository(ui, old, new),
         RepoCommand::Remove { name, force } => remove_repository(ui, command, name, force).await,
-        RepoCommand::List => list_repositories(ui, command).await,
+        RepoCommand::List(args) => list_repositories(ui, command, args).await,
     }
 }
 
@@ -420,7 +427,32 @@ async fn remove_repository(
     Ok(())
 }
 
-async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), CommandError> {
+async fn list_repositories(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: RepoListArgs,
+) -> Result<(), CommandError> {
+    let listings = collect_repository_listings(ui, command).await?;
+    if args.json {
+        let listings = listings
+            .iter()
+            .map(RepositoryListing::as_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        serde_json::to_writer(ui.stdout(), &listings)
+            .map_err(|error| user_error(format!("failed to encode repository list: {error}")))?;
+        writeln!(ui.stdout())?;
+    } else {
+        for listing in &listings {
+            write_repository_listing(ui, listing)?;
+        }
+    }
+    Ok(())
+}
+
+async fn collect_repository_listings(
+    ui: &mut Ui,
+    command: &CommandHelper,
+) -> Result<Vec<RepositoryListing>, CommandError> {
     let (store, client, runtime) = cloud_client()?;
     let repositories = runtime
         .block_on(client.list_repositories())
@@ -431,17 +463,17 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
             error => display_error(error),
         })?;
     let mut local = store.entries().map_err(display_error)?;
+    let mut listings = Vec::new();
     for repository in repositories {
         let matching = local
             .iter()
             .position(|entry| entry.identity == repository.identity);
         let Some(index) = matching else {
-            write_repository_listing(
-                ui,
-                repository.name.as_str(),
-                RepositoryAvailability::CloudOnly,
-                &[],
-            )?;
+            listings.push(RepositoryListing {
+                name: repository.name.to_string(),
+                availability: RepositoryAvailability::CloudOnly,
+                checkouts: Vec::new(),
+            });
             continue;
         };
         let mut entry = local.remove(index);
@@ -462,12 +494,11 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
             RepositoryAvailability::CloudOnly
         };
         let inventory = workspace_inventory(&entry, command).await?;
-        write_repository_listing(
-            ui,
-            repository.name.as_str(),
+        listings.push(RepositoryListing {
+            name: repository.name.to_string(),
             availability,
-            &inventory.checkout_paths,
-        )?;
+            checkouts: inventory.checkout_paths,
+        });
     }
     for entry in local {
         match runtime.block_on(client.resolve_repository(&entry.name)) {
@@ -484,12 +515,11 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
                         entry.name
                     )?;
                 } else {
-                    write_repository_listing(
-                        ui,
-                        entry.name.as_str(),
-                        RepositoryAvailability::MissingFromCloud,
-                        &inventory.checkout_paths,
-                    )?;
+                    listings.push(RepositoryListing {
+                        name: entry.name.to_string(),
+                        availability: RepositoryAvailability::MissingFromCloud,
+                        checkouts: inventory.checkout_paths,
+                    });
                 }
             }
             Ok(repository) => writeln!(
@@ -505,14 +535,50 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
             )?,
         }
     }
-    Ok(())
+    Ok(listings)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 enum RepositoryAvailability {
     AvailableLocally,
     CloudOnly,
     MissingFromCloud,
+}
+
+struct RepositoryListing {
+    name: String,
+    availability: RepositoryAvailability,
+    checkouts: Vec<std::path::PathBuf>,
+}
+
+#[derive(serde::Serialize)]
+struct RepositoryListingJson<'a> {
+    name: &'a str,
+    availability: RepositoryAvailability,
+    checkouts: Vec<&'a str>,
+}
+
+impl RepositoryListing {
+    fn as_json(&self) -> Result<RepositoryListingJson<'_>, CommandError> {
+        let checkouts = self
+            .checkouts
+            .iter()
+            .map(|path| {
+                path.to_str().ok_or_else(|| {
+                    user_error(format!(
+                        "repository `{}` has a checkout path that cannot be represented as UTF-8",
+                        self.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RepositoryListingJson {
+            name: &self.name,
+            availability: self.availability,
+            checkouts,
+        })
+    }
 }
 
 impl RepositoryAvailability {
@@ -536,20 +602,15 @@ impl RepositoryAvailability {
 /// One repository entry: a colored availability marker and name, then one
 /// indented line per checkout. No checkout lines means there is no workspace
 /// on this machine; the marker still distinguishes local data from cloud-only.
-fn write_repository_listing(
-    ui: &mut Ui,
-    name: &str,
-    availability: RepositoryAvailability,
-    checkout_paths: &[std::path::PathBuf],
-) -> Result<(), CommandError> {
+fn write_repository_listing(ui: &mut Ui, listing: &RepositoryListing) -> Result<(), CommandError> {
     let mut output = ui.stdout_formatter();
     {
         let mut node = output.labeled("node");
-        let mut marker = node.labeled(availability.color_label());
-        write!(marker, "{}", availability.marker())?;
+        let mut marker = node.labeled(listing.availability.color_label());
+        write!(marker, "{}", listing.availability.marker())?;
     }
-    writeln!(output, " {name}")?;
-    for path in checkout_paths {
+    writeln!(output, " {}", listing.name)?;
+    for path in &listing.checkouts {
         write!(output, "  ")?;
         let mut node = output.labeled("node");
         let mut path_output = node.labeled("elided");

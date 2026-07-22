@@ -38,7 +38,14 @@ enum SyncCommand {
         sync_repository: String,
     },
     /// Show local synchronization state for every catalog repository.
-    Status,
+    Status(SyncStatusArgs),
+}
+
+#[derive(clap::Args)]
+struct SyncStatusArgs {
+    /// Print synchronization state as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 pub(crate) async fn run_sync(
@@ -50,7 +57,9 @@ pub(crate) async fn run_sync(
         SyncCommand::Run {
             sync_repository: name,
         } => sync_repository(ui, command, name).await,
-        SyncCommand::Status => crate::sync_status::write_catalog_status(ui, command).await,
+        SyncCommand::Status(args) => {
+            crate::sync_status::write_catalog_status(ui, command, args.json).await
+        }
     }
 }
 

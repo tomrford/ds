@@ -33,6 +33,12 @@ use crate::tx::{
 use crate::working_copy::{devspace_working_copy_factories, devspace_working_copy_factory};
 
 #[derive(clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("position")
+        .required(true)
+        .multiple(false)
+        .args(["revision", "edit"])
+))]
 pub(crate) struct AddArgs {
     /// Repository name in the local machine catalog or cloud directory.
     repo: String,
@@ -42,8 +48,18 @@ pub(crate) struct AddArgs {
     path: PathBuf,
 
     /// Base revision, resolved against the local accepted repository heads.
-    #[arg(short = 'r', long = "rev", alias = "revision", value_name = "REV")]
-    revision: RevisionArg,
+    #[arg(
+        short = 'r',
+        long = "rev",
+        alias = "revision",
+        value_name = "REV",
+        group = "position"
+    )]
+    revision: Option<RevisionArg>,
+
+    /// Existing mutable revision to edit directly.
+    #[arg(short = 'e', long, value_name = "REV", group = "position")]
+    edit: Option<RevisionArg>,
 
     /// Print the checkout identity as JSON.
     #[arg(long)]
@@ -55,7 +71,8 @@ impl AddArgs {
         Self {
             repo: repo.as_str().to_owned(),
             path,
-            revision: RevisionArg::from("root()".to_owned()),
+            revision: Some(RevisionArg::from("root()".to_owned())),
+            edit: None,
             json: false,
         }
     }
@@ -66,13 +83,26 @@ struct AddedCheckout<'a> {
     root: &'a Path,
     repo: &'a str,
     workspace_id: &'a str,
+    change_id: &'a str,
 }
 
 #[derive(Clone, Copy)]
 enum AddOutcome {
     Created,
     Rebuilt,
-    AlreadyExists { requested_revision_applied: bool },
+    AlreadyExists { requested_target_applied: bool },
+}
+
+#[derive(Clone, Copy)]
+enum AddMode {
+    NewChild,
+    Edit,
+}
+
+struct ResolvedAddTarget {
+    commit: Commit,
+    mode: AddMode,
+    refresh_source_workspace: bool,
 }
 
 pub(crate) async fn add_checkout(
@@ -87,7 +117,13 @@ pub(crate) async fn add_checkout(
             "`ds add --json` requires a checkout path representable as UTF-8",
         ));
     }
-    let name = RepositoryName::parse(args.repo).map_err(|error| user_error(error.to_string()))?;
+    let (revision, mode) = match (&args.revision, &args.edit) {
+        (Some(revision), None) => (revision, AddMode::NewChild),
+        (None, Some(revision)) => (revision, AddMode::Edit),
+        _ => unreachable!("clap requires exactly one add position mode"),
+    };
+    let name =
+        RepositoryName::parse(args.repo.clone()).map_err(|error| user_error(error.to_string()))?;
     let store = MachineStore::platform_default().map_err(|error| user_error(error.to_string()))?;
     let machine = store
         .load_config()
@@ -133,8 +169,7 @@ pub(crate) async fn add_checkout(
     } else {
         command.settings_for_new_workspace(ui, &requested_path)?.0
     };
-    let (base_commit_id, refresh_source_workspace) =
-        resolve_base_revision(ui, command, &entry, &args.revision).await?;
+    let target = resolve_add_target(ui, command, &entry, revision, mode).await?;
     let repository = MachineRepository::open(&entry.native_repository_path, &settings)
         .await
         .map_err(|error| user_error(error.to_string()))?;
@@ -144,7 +179,10 @@ pub(crate) async fn add_checkout(
         .get_wc_commit_id(&workspace_name)
         .cloned();
 
-    let (outcome, operation_id) = match (destination_exists, current_workspace_commit) {
+    let (outcome, operation_id, working_copy_commit) = match (
+        destination_exists,
+        current_workspace_commit,
+    ) {
         (true, Some(current_id)) => {
             let current = registered_workspace_commit(
                 repository.repo().as_ref(),
@@ -153,7 +191,7 @@ pub(crate) async fn add_checkout(
             )
             .await
             .map_err(user_error)?;
-            let requested_revision_applied = current.parent_ids() == [base_commit_id.clone()];
+            let requested_target_applied = target.matches(&current);
             record_workspace_destination(
                 &entry.native_repository_path,
                 &workspace_name,
@@ -162,9 +200,10 @@ pub(crate) async fn add_checkout(
             .map_err(user_error)?;
             (
                 AddOutcome::AlreadyExists {
-                    requested_revision_applied,
+                    requested_target_applied,
                 },
                 repository.repo().op_id().clone(),
+                current,
             )
         }
         (true, None) => {
@@ -175,11 +214,11 @@ pub(crate) async fn add_checkout(
             )));
         }
         (false, Some(current_id)) => {
-            let working_copy_commit = require_requested_parent(
+            let working_copy_commit = require_requested_target(
                 repository.repo().as_ref(),
                 &workspace_name,
                 &current_id,
-                &base_commit_id,
+                &target,
             )
             .await
             .map_err(user_error)?;
@@ -194,13 +233,21 @@ pub(crate) async fn add_checkout(
             )
             .await
             .map_err(user_error)?;
-            (AddOutcome::Rebuilt, repository.repo().op_id().clone())
+            (
+                AddOutcome::Rebuilt,
+                repository.repo().op_id().clone(),
+                working_copy_commit,
+            )
         }
         (false, None) => {
-            let (repo, working_copy_commit) =
-                register_workspace(repository.repo(), &workspace_name, &base_commit_id)
-                    .await
-                    .map_err(user_error)?;
+            let (repo, working_copy_commit) = register_workspace(
+                repository.repo(),
+                &workspace_name,
+                &target.commit,
+                target.mode,
+            )
+            .await
+            .map_err(user_error)?;
             failpoint("after_workspace_registration");
             let operation_id = repo.op_id().clone();
             rebuild_checkout(
@@ -214,11 +261,11 @@ pub(crate) async fn add_checkout(
             )
             .await
             .map_err(user_error)?;
-            (AddOutcome::Created, operation_id)
+            (AddOutcome::Created, operation_id, working_copy_commit)
         }
     };
 
-    if refresh_source_workspace {
+    if target.refresh_source_workspace {
         update_source_operation(command, operation_id)
             .await
             .map_err(|error| {
@@ -230,10 +277,12 @@ pub(crate) async fn add_checkout(
 
     crate::boundary_sync::record_checkout(&requested_path);
 
+    let change_id = working_copy_commit.change_id().reverse_hex();
     let checkout = AddedCheckout {
         root: &requested_path,
         repo: name.as_str(),
         workspace_id: workspace_name.as_str(),
+        change_id: &change_id,
     };
     if args.json {
         serde_json::to_writer_pretty(ui.stdout(), &checkout)
@@ -242,13 +291,10 @@ pub(crate) async fn add_checkout(
         if matches!(
             outcome,
             AddOutcome::AlreadyExists {
-                requested_revision_applied: false
+                requested_target_applied: false
             }
         ) {
-            writeln!(
-                ui.status(),
-                "The requested revision was not applied because the existing checkout is at a different working-copy parent."
-            )?;
+            writeln!(ui.status(), "{}", existing_position_mismatch(mode))?;
         }
     } else {
         match outcome {
@@ -265,7 +311,7 @@ pub(crate) async fn add_checkout(
                 requested_path.display()
             )?,
             AddOutcome::AlreadyExists {
-                requested_revision_applied: true,
+                requested_target_applied: true,
             } => writeln!(
                 ui.status(),
                 "Workspace {} for `{name}` already exists at {}.",
@@ -273,12 +319,13 @@ pub(crate) async fn add_checkout(
                 requested_path.display()
             )?,
             AddOutcome::AlreadyExists {
-                requested_revision_applied: false,
+                requested_target_applied: false,
             } => writeln!(
                 ui.status(),
-                "Workspace {} for `{name}` already exists at {}; the requested revision was not applied because the existing checkout is at a different working-copy parent.",
+                "Workspace {} for `{name}` already exists at {}; {}",
                 workspace_name.as_symbol(),
-                requested_path.display()
+                requested_path.display(),
+                existing_position_mismatch(mode)
             )?,
         }
     }
@@ -366,12 +413,13 @@ async fn clone_repository(
     Ok(())
 }
 
-async fn resolve_base_revision(
+async fn resolve_add_target(
     ui: &Ui,
     command: &CommandHelper,
     entry: &CatalogEntry,
     revision: &RevisionArg,
-) -> Result<(CommitId, bool), CommandError> {
+    mode: AddMode,
+) -> Result<ResolvedAddTarget, CommandError> {
     if matches!(revision.as_ref(), "@" | "@-" | "@+") {
         if command.workspace_loader().is_err() {
             return Err(unavailable_at_revision(&entry.name, revision));
@@ -391,14 +439,13 @@ async fn resolve_base_revision(
         if source_repo != target_repo {
             return Err(unavailable_at_revision(&entry.name, revision));
         }
-        return Ok((
-            workspace
-                .resolve_single_rev(ui, revision)
-                .await?
-                .id()
-                .clone(),
-            true,
-        ));
+        let commit = workspace.resolve_single_rev(ui, revision).await?;
+        check_editable(&workspace, &commit, revision, mode).await?;
+        return Ok(ResolvedAddTarget {
+            commit,
+            mode,
+            refresh_source_workspace: true,
+        });
     }
 
     let repository = MachineRepository::open(&entry.native_repository_path, command.settings())
@@ -407,10 +454,34 @@ async fn resolve_base_revision(
     let repo = repository.repo().clone();
     let workspace = workspace_for_repository(entry.native_repository_path.clone(), repo.clone());
     let helper = command.for_workable_repo(ui, workspace, repo)?;
-    Ok((
-        helper.resolve_single_rev(ui, revision).await?.id().clone(),
-        false,
-    ))
+    let commit = helper.resolve_single_rev(ui, revision).await?;
+    check_editable(&helper, &commit, revision, mode).await?;
+    Ok(ResolvedAddTarget {
+        commit,
+        mode,
+        refresh_source_workspace: false,
+    })
+}
+
+async fn check_editable(
+    helper: &jj_cli::cli_util::WorkspaceCommandHelper,
+    commit: &Commit,
+    revision: &RevisionArg,
+    mode: AddMode,
+) -> Result<(), CommandError> {
+    if matches!(mode, AddMode::NewChild) {
+        return Ok(());
+    }
+    helper
+        .check_rewritable([commit.id()])
+        .await
+        .map_err(|mut error| {
+            error.add_hint(format!(
+                "Use `-r {}` to create a child working-copy change instead.",
+                revision.as_ref()
+            ));
+            error
+        })
 }
 
 fn unavailable_at_revision(name: &RepositoryName, revision: &RevisionArg) -> CommandError {
@@ -422,20 +493,22 @@ fn unavailable_at_revision(name: &RepositoryName, revision: &RevisionArg) -> Com
 async fn register_workspace(
     repo: &std::sync::Arc<jj_lib::repo::ReadonlyRepo>,
     workspace_name: &WorkspaceName,
-    base_commit_id: &CommitId,
+    target_commit: &Commit,
+    mode: AddMode,
 ) -> Result<(std::sync::Arc<jj_lib::repo::ReadonlyRepo>, Commit), String> {
-    let base_commit = repo
-        .store()
-        .get_commit_async(base_commit_id)
-        .await
-        .map_err(|error| format!("failed to load checkout base commit: {error}"))?;
     let mut transaction = repo.start_transaction();
-    let working_copy_commit = transaction
-        .repo_mut()
-        .new_commit(vec![base_commit.id().clone()], base_commit.tree())
-        .write()
-        .await
-        .map_err(|error| format!("failed to create checkout working-copy commit: {error}"))?;
+    let working_copy_commit = match mode {
+        AddMode::NewChild => transaction
+            .repo_mut()
+            .new_commit(
+                vec![target_commit.id().clone()],
+                target_commit.tree().clone(),
+            )
+            .write()
+            .await
+            .map_err(|error| format!("failed to create checkout working-copy commit: {error}"))?,
+        AddMode::Edit => target_commit.clone(),
+    };
     transaction
         .repo_mut()
         .edit(workspace_name.to_owned(), &working_copy_commit)
@@ -444,7 +517,7 @@ async fn register_workspace(
     let repo = commit_repo_transaction(
         transaction,
         format!(
-            "create initial working-copy commit in workspace {}",
+            "register working-copy commit in workspace {}",
             workspace_name.as_symbol()
         ),
     )
@@ -476,29 +549,59 @@ async fn registered_workspace_commit(
         })
 }
 
-async fn require_requested_parent(
+async fn require_requested_target(
     repo: &jj_lib::repo::ReadonlyRepo,
     workspace_name: &WorkspaceName,
     current_id: &CommitId,
-    requested_base: &CommitId,
+    requested: &ResolvedAddTarget,
 ) -> Result<Commit, String> {
     let current = registered_workspace_commit(repo, workspace_name, current_id).await?;
-    if current.parent_ids() == [requested_base.clone()] {
+    if requested.matches(&current) {
         return Ok(current);
     }
-    let parents = current
-        .parent_ids()
-        .iter()
-        .map(|id| id.hex())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(format!(
-        "workspace {} is registered at working-copy commit {}, whose parent position is [{}], not requested base {}; pass the matching parent commit to `--revision`",
-        workspace_name.as_symbol(),
-        current.id().hex(),
-        parents,
-        requested_base.hex()
-    ))
+    match requested.mode {
+        AddMode::NewChild => {
+            let parents = current
+                .parent_ids()
+                .iter()
+                .map(|id| id.hex())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "workspace {} is registered at working-copy commit {}, whose parent position is [{}], not requested base {}; pass the matching parent commit to `--rev`",
+                workspace_name.as_symbol(),
+                current.id().hex(),
+                parents,
+                requested.commit.id().hex()
+            ))
+        }
+        AddMode::Edit => Err(format!(
+            "workspace {} is registered at working-copy commit {}, not requested edit target {}; pass the matching working-copy commit to `--edit`",
+            workspace_name.as_symbol(),
+            current.id().hex(),
+            requested.commit.id().hex()
+        )),
+    }
+}
+
+impl ResolvedAddTarget {
+    fn matches(&self, working_copy_commit: &Commit) -> bool {
+        match self.mode {
+            AddMode::NewChild => working_copy_commit.parent_ids() == [self.commit.id().clone()],
+            AddMode::Edit => working_copy_commit.id() == self.commit.id(),
+        }
+    }
+}
+
+fn existing_position_mismatch(mode: AddMode) -> &'static str {
+    match mode {
+        AddMode::NewChild => {
+            "The requested revision was not applied because the existing checkout is at a different working-copy parent."
+        }
+        AddMode::Edit => {
+            "The requested edit target was not applied because the existing checkout is at a different working-copy commit."
+        }
+    }
 }
 
 async fn rebuild_checkout(

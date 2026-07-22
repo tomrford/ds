@@ -70,6 +70,7 @@ pub fn run() -> ExitCode {
         )))
         .add_extra_config_migration(devspace_alias_migration())
         .add_subcommand::<repo::DevspaceCommand, _>(repo::run)
+        .add_global_args::<git::GitRemoteListJsonArgs, _>(|_ui, _args| Ok(()))
         .add_global_args::<ParsedRepositoryArgs, _>(move |_ui, args| {
             selector_for_args.set_parsed_repository(args.repository);
             Ok(())
@@ -175,7 +176,8 @@ fn intercept_help(args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Option<E
 }
 
 fn devspace_app() -> clap::Command {
-    let mut app = repo::DevspaceCommand::augment_subcommands(jj_cli::commands::default_app());
+    let app = repo::DevspaceCommand::augment_subcommands(jj_cli::commands::default_app());
+    let mut app = <git::GitRemoteListJsonArgs as clap::Args>::augment_args(app);
     if let Some(config) = app.find_subcommand_mut("config") {
         *config = std::mem::take(config).about("Manage jj configuration through `ds jj config`");
     }
@@ -255,11 +257,18 @@ async fn restrict_bare_repository_commands(
     if matches!(command.matches().subcommand_name(), Some("daemon" | "sync")) {
         return stock_dispatch.call(ui, command).await;
     }
-    if command.matches().subcommand_name() == Some("git")
-        && let Ok(loader) = command.workspace_loader()
-        && crate::checkout::read_checkout_owner(loader.workspace_root()).is_ok()
-    {
-        return git::run_git(ui, command).await;
+    if command.matches().subcommand_name() == Some("git") {
+        let devspace_checkout = command.workspace_loader().is_ok_and(|loader| {
+            crate::checkout::read_checkout_owner(loader.workspace_root()).is_ok()
+        });
+        if devspace_checkout {
+            return git::run_git(ui, command).await;
+        }
+        if git::remote_list_json_requested(command.matches()) {
+            return Err(user_error(
+                "`ds git remote list --json` is available only inside a Devspace checkout.",
+            ));
+        }
     }
     let repository_selector = REPOSITORY_SELECTOR
         .get()
