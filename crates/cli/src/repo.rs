@@ -8,6 +8,7 @@ use devspace_machine::{
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
+use jj_cli::formatter::FormatterExt as _;
 use jj_cli::ui::Ui;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
@@ -435,7 +436,12 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
             .iter()
             .position(|entry| entry.identity == repository.identity);
         let Some(index) = matching else {
-            writeln!(ui.stdout(), "{}", repository.name)?;
+            write_repository_listing(
+                ui,
+                repository.name.as_str(),
+                RepositoryAvailability::CloudOnly,
+                &[],
+            )?;
             continue;
         };
         let mut entry = local.remove(index);
@@ -450,22 +456,18 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
                     ))
                 })?;
         }
-        let inventory = workspace_inventory(&entry, command).await?;
-        if inventory.checkout_paths.is_empty() {
-            writeln!(ui.stdout(), "{} (local)", repository.name)?;
+        let availability = if entry.native_repository_path.exists() {
+            RepositoryAvailability::AvailableLocally
         } else {
-            writeln!(
-                ui.stdout(),
-                "{} (local: {})",
-                repository.name,
-                inventory
-                    .checkout_paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )?;
-        }
+            RepositoryAvailability::CloudOnly
+        };
+        let inventory = workspace_inventory(&entry, command).await?;
+        write_repository_listing(
+            ui,
+            repository.name.as_str(),
+            availability,
+            &inventory.checkout_paths,
+        )?;
     }
     for entry in local {
         match runtime.block_on(client.resolve_repository(&entry.name)) {
@@ -482,16 +484,11 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
                         entry.name
                     )?;
                 } else {
-                    writeln!(
-                        ui.stdout(),
-                        "{} (deleted in cloud; local checkouts remain: {})",
-                        entry.name,
-                        inventory
-                            .checkout_paths
-                            .iter()
-                            .map(|path| path.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                    write_repository_listing(
+                        ui,
+                        entry.name.as_str(),
+                        RepositoryAvailability::MissingFromCloud,
+                        &inventory.checkout_paths,
                     )?;
                 }
             }
@@ -507,6 +504,56 @@ async fn list_repositories(ui: &mut Ui, command: &CommandHelper) -> Result<(), C
                 entry.name
             )?,
         }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RepositoryAvailability {
+    AvailableLocally,
+    CloudOnly,
+    MissingFromCloud,
+}
+
+impl RepositoryAvailability {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::AvailableLocally => "●",
+            Self::CloudOnly => "○",
+            Self::MissingFromCloud => "◆",
+        }
+    }
+
+    fn color_label(self) -> &'static str {
+        match self {
+            Self::AvailableLocally => "working_copy",
+            Self::CloudOnly => "immutable",
+            Self::MissingFromCloud => "conflicted",
+        }
+    }
+}
+
+/// One repository entry: a colored availability marker and name, then one
+/// indented line per checkout. No checkout lines means there is no workspace
+/// on this machine; the marker still distinguishes local data from cloud-only.
+fn write_repository_listing(
+    ui: &mut Ui,
+    name: &str,
+    availability: RepositoryAvailability,
+    checkout_paths: &[std::path::PathBuf],
+) -> Result<(), CommandError> {
+    let mut output = ui.stdout_formatter();
+    {
+        let mut node = output.labeled("node");
+        let mut marker = node.labeled(availability.color_label());
+        write!(marker, "{}", availability.marker())?;
+    }
+    writeln!(output, " {name}")?;
+    for path in checkout_paths {
+        write!(output, "  ")?;
+        let mut node = output.labeled("node");
+        let mut path_output = node.labeled("elided");
+        writeln!(path_output, "{}", path.display())?;
     }
     Ok(())
 }

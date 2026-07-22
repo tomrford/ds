@@ -244,8 +244,13 @@ async fn repo_list_preserves_deleted_cloud_repository_with_local_checkouts() {
     let output = ds(temp.path(), &config, &["repo", "list"]);
     server.join().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("deleted in cloud; local checkouts remain"));
-    assert!(stdout(&output).contains(&checkout.display().to_string()));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "◆ {REPOSITORY_NAME}\n  {}\n",
+            dunce::canonicalize(&checkout).unwrap().display()
+        )
+    );
     assert_eq!(
         machine_store(temp.path())
             .resolve(&entry.name)

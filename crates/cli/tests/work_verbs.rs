@@ -235,34 +235,53 @@ fn repo_new_chooses_a_bounded_default_suffix_after_name_rejection() {
 }
 
 #[tokio::test]
-async fn repo_list_annotates_checkout_paths_and_repairs_an_interrupted_local_rename() {
+async fn repo_list_renders_repository_states_and_repairs_an_interrupted_local_rename() {
     let temp = tempfile::tempdir().unwrap();
-    let created_response = repository_response("old-name");
-    let (create_url, create_handle) = create_server(move |_, _, stream| {
-        respond(stream, "200 OK", &created_response);
-        true
-    });
-    configure_machine(temp.path(), &create_url);
-    let config = write_cli_config(temp.path());
-    let created = ds(temp.path(), &config, &["repo", "new", "old-name"]);
-    create_handle.join().unwrap();
-    assert!(created.status.success(), "{}", stderr(&created));
-    let checkout = temp.path().join("listed-checkout");
-    let added = ds(
-        temp.path(),
-        &config,
-        &[
-            "add",
-            "old-name",
-            "-r",
-            "root()",
-            checkout.to_str().unwrap(),
-        ],
+    let bare_response = format!(
+        r#"{{"name":"bare-name","repositoryId":"{}","incarnation":"{}"}}"#,
+        "ef".repeat(32),
+        "cd".repeat(16)
     );
-    assert!(added.status.success(), "{}", stderr(&added));
+    let config = write_cli_config(temp.path());
+    for (name, response) in [
+        ("old-name", repository_response("old-name")),
+        ("bare-name", bare_response.clone()),
+    ] {
+        let (create_url, create_handle) = create_server(move |_, _, stream| {
+            respond(stream, "200 OK", &response);
+            true
+        });
+        configure_machine(temp.path(), &create_url);
+        let created = ds(temp.path(), &config, &["repo", "new", name]);
+        create_handle.join().unwrap();
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
+    let checkouts = [
+        temp.path().join("checkout-one"),
+        temp.path().join("checkout-two"),
+    ];
+    for checkout in &checkouts {
+        let added = ds(
+            temp.path(),
+            &config,
+            &[
+                "add",
+                "old-name",
+                "-r",
+                "root()",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        assert!(added.status.success(), "{}", stderr(&added));
+    }
 
-    let listed = repository_response("new-name");
-    let list_body = format!(r#"{{"repositories":[{listed}]}}"#);
+    let renamed = repository_response("new-name");
+    let cloud_only = format!(
+        r#"{{"name":"cloud-only","repositoryId":"{}","incarnation":"{}"}}"#,
+        "12".repeat(32),
+        "cd".repeat(16)
+    );
+    let list_body = format!(r#"{{"repositories":[{renamed},{bare_response},{cloud_only}]}}"#);
     let (list_url, list_server) = create_server(move |_, request, stream| {
         assert!(request.starts_with("GET /repositories HTTP/1.1"));
         respond(stream, "200 OK", &list_body);
@@ -275,10 +294,11 @@ async fn repo_list_annotates_checkout_paths_and_repairs_an_interrupted_local_ren
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
-        stdout(&output).trim(),
+        stdout(&output),
         format!(
-            "new-name (local: {})",
-            dunce::canonicalize(&checkout).unwrap().display()
+            "● new-name\n  {}\n  {}\n● bare-name\n○ cloud-only\n",
+            dunce::canonicalize(&checkouts[0]).unwrap().display(),
+            dunce::canonicalize(&checkouts[1]).unwrap().display()
         )
     );
     assert!(
