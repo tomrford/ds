@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use devspace_machine::{
-    ExportMappings, GitProjection, ImportMappings, MachineRepository, ProjectionError,
+    ExportMappings, ExportMode, GitProjection, ImportMappings, MachineRepository, ProjectionError,
 };
 use jj_lib::backend::{
     ChangeId, Commit as BackendCommit, CommitId, CopyId, MillisSinceEpoch, Signature, Timestamp,
@@ -227,6 +227,7 @@ async fn hidden_bytes_never_enter_fresh_sidecar() {
             repository.repo().store(),
             std::slice::from_ref(&head),
             &mut ExportMappings::default(),
+            ExportMode::Strict,
         )
         .await
         .unwrap();
@@ -338,6 +339,7 @@ async fn each_commit_uses_its_own_hidden_set() {
             store,
             std::slice::from_ref(&third),
             &mut ExportMappings::default(),
+            ExportMode::Strict,
         )
         .await
         .unwrap();
@@ -446,7 +448,12 @@ async fn nested_dsprivate_is_anchored_to_its_directory_and_always_hidden() {
 
     let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
     let exported = projection
-        .export_reachable(store, &[second], &mut ExportMappings::default())
+        .export_reachable(
+            store,
+            &[second],
+            &mut ExportMappings::default(),
+            ExportMode::Strict,
+        )
         .await
         .unwrap();
     let mapped = exported
@@ -521,7 +528,12 @@ async fn nested_negation_overrides_a_shallower_file_pattern() {
     .await;
     let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
     let exported = projection
-        .export_reachable(store, &[head], &mut ExportMappings::default())
+        .export_reachable(
+            store,
+            &[head],
+            &mut ExportMappings::default(),
+            ExportMode::Strict,
+        )
         .await
         .unwrap();
     assert!(
@@ -699,7 +711,12 @@ async fn hidden_directory_is_pruned_before_negation_can_reinclude_a_child() {
     .await;
     let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
     let exported = projection
-        .export_reachable(store, &[head], &mut ExportMappings::default())
+        .export_reachable(
+            store,
+            &[head],
+            &mut ExportMappings::default(),
+            ExportMode::Strict,
+        )
         .await
         .unwrap();
 
@@ -755,6 +772,7 @@ async fn conflicted_dsprivate_fails_closed_with_the_commit_id() {
             store,
             std::slice::from_ref(&head),
             &mut ExportMappings::default(),
+            ExportMode::Strict,
         )
         .await
         .unwrap_err();
@@ -817,6 +835,7 @@ async fn conflicted_nested_dsprivate_fails_closed_with_commit_and_path() {
             store,
             std::slice::from_ref(&head),
             &mut ExportMappings::default(),
+            ExportMode::Strict,
         )
         .await
         .unwrap_err();
@@ -904,6 +923,7 @@ async fn shared_subtree_cache_is_partitioned_by_nested_chain_state() {
             store,
             &[first.clone(), second.clone()],
             &mut ExportMappings::default(),
+            ExportMode::Strict,
         )
         .await
         .unwrap();
@@ -971,6 +991,7 @@ async fn directory_at_dsprivate_fails_closed_with_the_commit_id() {
             store,
             std::slice::from_ref(&head),
             &mut ExportMappings::default(),
+            ExportMode::Strict,
         )
         .await
         .unwrap_err();
@@ -982,8 +1003,8 @@ async fn directory_at_dsprivate_fails_closed_with_the_commit_id() {
 }
 
 #[tokio::test]
-async fn sidecar_rebuilds_from_durable_mapping_rows() {
-    let (temp, repository, settings, head, hidden_values) = fixture().await;
+async fn export_fails_when_mapped_git_object_is_missing() {
+    let (temp, repository, settings, head, _) = fixture().await;
     let sidecar = temp.path().join("projection");
     let first = GitProjection::init(&sidecar, &settings).unwrap();
     let first_export = first
@@ -991,27 +1012,157 @@ async fn sidecar_rebuilds_from_durable_mapping_rows() {
             repository.repo().store(),
             std::slice::from_ref(&head),
             &mut ExportMappings::default(),
+            ExportMode::Strict,
         )
         .await
         .unwrap();
     let rows = first_export.new_mappings.clone();
-    let first_head = first_export.git_heads[0].clone();
+    let mapped_head = rows
+        .iter()
+        .find(|mapping| mapping.canonical_id == head)
+        .unwrap()
+        .git_id
+        .clone();
     drop(first);
     fs::remove_dir_all(&sidecar).unwrap();
 
     let rebuilt = GitProjection::init(&sidecar, &settings).unwrap();
     let mut mappings = ExportMappings::from_rows(rows).unwrap();
-    let rebuilt_export = rebuilt
+    let error = rebuilt
         .export_reachable(
             repository.repo().store(),
             std::slice::from_ref(&head),
             &mut mappings,
+            ExportMode::Strict,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ProjectionError::MissingMappedObject {
+            canonical_id,
+            git_id
+        } if canonical_id == head && git_id == mapped_head
+    ));
+}
+
+#[tokio::test]
+async fn replay_export_rederives_when_mapped_git_object_is_missing() {
+    let (temp, repository, settings, head, _) = fixture().await;
+    let sidecar = temp.path().join("projection");
+    let first = GitProjection::init(&sidecar, &settings).unwrap();
+    let first_export = first
+        .export_reachable(
+            repository.repo().store(),
+            std::slice::from_ref(&head),
+            &mut ExportMappings::default(),
+            ExportMode::Strict,
         )
         .await
         .unwrap();
-    assert_eq!(rebuilt_export.git_heads, [first_head]);
-    assert!(rebuilt_export.new_mappings.is_empty());
-    assert_hidden_bytes_absent(rebuilt.git_repo_path(), &hidden_values);
+    let rows = first_export.new_mappings;
+    let expected_head = first_export.git_heads[0].clone();
+    drop(first);
+    fs::remove_dir_all(&sidecar).unwrap();
+
+    let rebuilt = GitProjection::init(&sidecar, &settings).unwrap();
+    let replayed = rebuilt
+        .export_reachable(
+            repository.repo().store(),
+            std::slice::from_ref(&head),
+            &mut ExportMappings::from_rows(rows).unwrap(),
+            ExportMode::Replay,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed.git_heads, [expected_head]);
+}
+
+#[tokio::test]
+async fn import_rederives_when_mapped_canonical_object_is_missing() {
+    let (temp, repository, settings, head, _) = fixture().await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let exported = projection
+        .export_reachable(
+            repository.repo().store(),
+            std::slice::from_ref(&head),
+            &mut ExportMappings::default(),
+            ExportMode::Strict,
+        )
+        .await
+        .unwrap();
+    let git_head = exported.git_heads[0].clone();
+    let first_target = MachineRepository::init(temp.path().join("first-target"), &settings)
+        .await
+        .unwrap();
+    let first_import = projection
+        .import_reachable(
+            first_target.repo().store(),
+            std::slice::from_ref(&git_head),
+            &mut ImportMappings::default(),
+        )
+        .await
+        .unwrap();
+    let canonical_head = first_import.canonical_heads[0].clone();
+
+    let rebuilt_target = MachineRepository::init(temp.path().join("rebuilt-target"), &settings)
+        .await
+        .unwrap();
+    assert!(matches!(
+        rebuilt_target
+            .repo()
+            .store()
+            .backend()
+            .read_commit(&canonical_head)
+            .await,
+        Err(jj_lib::backend::BackendError::ObjectNotFound { .. })
+    ));
+    let mut mappings = ImportMappings::from_rows(first_import.new_mappings).unwrap();
+    let rebuilt_import = projection
+        .import_reachable(
+            rebuilt_target.repo().store(),
+            std::slice::from_ref(&git_head),
+            &mut mappings,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rebuilt_import.canonical_heads, [canonical_head]);
+}
+
+#[tokio::test]
+async fn export_stops_when_mapped_git_object_is_present() {
+    let (temp, repository, settings, head, _) = fixture().await;
+    let projection = GitProjection::init(temp.path().join("projection"), &settings).unwrap();
+    let exported = projection
+        .export_reachable(
+            repository.repo().store(),
+            std::slice::from_ref(&head),
+            &mut ExportMappings::default(),
+            ExportMode::Strict,
+        )
+        .await
+        .unwrap();
+    let git_head = exported.git_heads[0].clone();
+    let missing_canonical = CommitId::new(vec![0x55; 64]);
+    let mut mappings = ExportMappings::from_rows([devspace_machine::CommitMapping {
+        canonical_id: missing_canonical.clone(),
+        git_id: git_head.clone(),
+    }])
+    .unwrap();
+
+    let stopped = projection
+        .export_reachable(
+            repository.repo().store(),
+            std::slice::from_ref(&missing_canonical),
+            &mut mappings,
+            ExportMode::Strict,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(stopped.git_heads, [git_head]);
+    assert!(stopped.new_mappings.is_empty());
 }
 
 #[tokio::test]
@@ -1236,6 +1387,7 @@ async fn hidden_leaf_is_filtered_before_its_bytes_are_read() {
             repository.repo().store(),
             &[head],
             &mut ExportMappings::default(),
+            ExportMode::Strict,
         )
         .await
         .unwrap();

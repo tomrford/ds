@@ -22,8 +22,12 @@ simple backend to encode a tree.
 
 Translation receipts are external inputs and outputs. The adapter accepts
 durable canonical-to-Git or Git-to-public mappings, reuses consistent rows and
-rejects conflicting rows. A missing sidecar can therefore be recreated from
-the native objects and accepted cloud mappings.
+rejects conflicting rows. Export seeding uses accepted rows repository-wide,
+across remotes and bookmarks. During normal export, missing mapped bytes fail
+closed with a typed error instead of re-deriving. Batch replay may re-derive a
+missing mapped Git object because recovery compares the rebuilt head with the
+journal's exact proposed Git ID before Git contact. A missing sidecar can
+therefore be recreated from the native objects and accepted cloud mappings.
 
 The machine can discover and pack a commit closure that is not reachable from
 an operation head. This makes both the selected private commit and each public

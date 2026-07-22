@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use devspace_machine::RepositoryName;
+use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
 
 mod support;
 
@@ -511,4 +511,145 @@ fn doctor_happy_path_and_invalid_config_failure() {
     assert_eq!(broken.status.code(), Some(1));
     assert!(stdout(&broken).contains("FAIL machine config:"));
     assert!(stdout(&broken).contains("FAIL cloud: machine config is unavailable"));
+    assert!(stdout(&broken).contains("WARN projection: machine config is unavailable"));
+}
+
+#[test]
+fn doctor_reports_pending_push_batches_per_repository() {
+    let temp = tempfile::tempdir().unwrap();
+    let quiet_id = "ab".repeat(32);
+    let stuck_id = "ef".repeat(32);
+    let batch_id = "56".repeat(16);
+    let vanished_batch_id = "9a".repeat(16);
+    let owner_machine = "34".repeat(16);
+    let quiet_projection = serde_json::json!({
+        "activationCursor": 0,
+        "cursors": [],
+        "mappings": [],
+        "nextAfter": 0,
+        "through": 0,
+        "hasMore": false,
+        "pending": [],
+    })
+    .to_string();
+    let stuck_projection = serde_json::json!({
+        "activationCursor": 0,
+        "cursors": [],
+        "mappings": [],
+        "nextAfter": 0,
+        "through": 0,
+        "hasMore": false,
+        "pending": [
+            {
+                "batchId": batch_id,
+                "remote": "origin",
+                "ownerMachine": owner_machine,
+                "fence": 1,
+                "refs": [
+                    {"bookmark": "main", "proposedGitOid": "12".repeat(20)},
+                    {"bookmark": "dev", "proposedGitOid": "78".repeat(20)},
+                ],
+            },
+            {
+                "batchId": vanished_batch_id,
+                "remote": "backup",
+                "ownerMachine": "bc".repeat(16),
+                "fence": 2,
+                "refs": [
+                    {"bookmark": "release", "proposedGitOid": "de".repeat(20)},
+                ],
+            },
+        ],
+    })
+    .to_string();
+    let replay = serde_json::json!({
+        "batchId": batch_id,
+        "remote": "origin",
+        "ownerMachine": owner_machine,
+        "fence": 1,
+        "updates": [],
+    })
+    .to_string();
+    let stuck_for_server = stuck_id.clone();
+    let vanished_for_server = vanished_batch_id.clone();
+    let (base_url, server) = create_server(move |index, request, stream| {
+        let request_line = request.lines().next().unwrap();
+        if request_line.starts_with("GET /repositories HTTP/1.1") {
+            respond(stream, "200 OK", r#"{"repositories":[]}"#);
+        } else if request_line.contains(&format!("/pushes/{vanished_for_server}/replay?")) {
+            respond(
+                stream,
+                "404 Not Found",
+                r#"{"error":"push batch not found"}"#,
+            );
+        } else if request_line.contains("/replay?") {
+            respond(stream, "200 OK", &replay);
+        } else if request_line.contains("/projection?") {
+            if request_line.contains(&stuck_for_server) {
+                respond(stream, "200 OK", &stuck_projection);
+            } else {
+                respond(stream, "200 OK", &quiet_projection);
+            }
+        } else {
+            panic!("unexpected doctor request: {request_line}");
+        }
+        index == 4
+    });
+    configure_machine(temp.path(), &base_url);
+    let config = write_cli_config(temp.path());
+    let store = machine_store(temp.path());
+    for (name, repository_id) in [("quiet", &quiet_id), ("stuck", &stuck_id)] {
+        store
+            .register_repository(
+                RepositoryName::parse(name).unwrap(),
+                RepositoryIdentity::new(
+                    RepositoryId::parse(repository_id.clone()).unwrap(),
+                    RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
+                ),
+            )
+            .unwrap();
+    }
+
+    let output = ds(temp.path(), &config, &["doctor"]);
+    server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(
+        report.contains("OK projection: quiet: no pending push batches"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "WARN projection: stuck: pending push batch on origin (bookmarks: main, dev; owner machine 343434343434)"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("blocked until the batch is recovered"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "WARN projection: stuck: pending push batch on backup (bookmarks: release; owner machine unknown)"
+        ),
+        "{report}"
+    );
+    assert!(
+        !report.contains("WARN projection: stuck: cloud unreachable"),
+        "{report}"
+    );
+
+    configure_machine(temp.path(), "http://127.0.0.1:1");
+    let offline = ds(temp.path(), &config, &["doctor"]);
+    assert_eq!(offline.status.code(), Some(1));
+    let offline_report = stdout(&offline);
+    assert!(offline_report.contains("FAIL cloud:"), "{offline_report}");
+    assert!(
+        offline_report.contains("WARN projection: quiet: cloud unreachable"),
+        "{offline_report}"
+    );
+    assert!(
+        offline_report.contains("WARN projection: stuck: cloud unreachable"),
+        "{offline_report}"
+    );
 }

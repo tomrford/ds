@@ -44,9 +44,66 @@ impl clap::FromArgMatches for GitRemoteListJsonArgs {
 
 impl clap::Args for GitRemoteListJsonArgs {
     fn augment_args(mut command: clap::Command) -> clap::Command {
-        let list = command
+        let git = command
             .find_subcommand_mut("git")
-            .expect("jj command tree contains git")
+            .expect("jj command tree contains git");
+        let push = git
+            .find_subcommand_mut("push")
+            .expect("jj git command tree contains push");
+        *push = std::mem::take(push)
+            .about("Push bookmarks to a registered Git remote")
+            .long_about(
+                "Push literal local bookmark names through the Devspace projection journal. \
+                 A successful push records one jj operation and tracks each pushed bookmark at \
+                 the selected remote. Use --deleted to delete every tracked, journaled remote \
+                 bookmark that has no local bookmark.",
+            )
+            .mut_arg("remote", |arg| {
+                arg.help("Registered remote to push to (default: origin)")
+                    .long_help("Registered remote to push to (default: origin)")
+            })
+            .mut_arg("bookmark", |arg| {
+                arg.help("Literal bookmark name to push (can be repeated)")
+                    .long_help("Literal bookmark name to push (can be repeated)")
+            })
+            .mut_arg("deleted", |_| {
+                clap::Arg::new("deleted")
+                    .long("deleted")
+                    .action(clap::ArgAction::SetTrue)
+                    .help(
+                        "Delete every tracked, journaled remote bookmark that has no local bookmark; can be combined with --bookmark",
+                    )
+            })
+            .mut_arg("all", |arg| arg.hide(true))
+            .mut_arg("tracked", |arg| arg.hide(true))
+            .mut_arg("allow_empty_description", |arg| arg.hide(true))
+            .mut_arg("allow_private", |arg| arg.hide(true))
+            .mut_arg("revisions", |arg| arg.hide(true))
+            .mut_arg("change", |arg| arg.hide(true))
+            .mut_arg("named", |arg| arg.hide(true))
+            .mut_arg("dry_run", |arg| arg.hide(true))
+            .mut_arg("option", |arg| arg.hide(true));
+        let fetch = git
+            .find_subcommand_mut("fetch")
+            .expect("jj git command tree contains fetch");
+        *fetch = std::mem::take(fetch)
+            .about("Fetch bookmarks from a registered Git remote")
+            .long_about(
+                "Fetch literal Git branch names through the Devspace projection journal and \
+                 update their remote-tracking bookmarks. Without --branch, fetch every branch \
+                 from the selected remote.",
+            )
+            .mut_arg("branches", |arg| {
+                arg.help("Literal branch name to fetch (can be repeated)")
+                    .long_help("Literal branch name to fetch (can be repeated)")
+            })
+            .mut_arg("remotes", |arg| {
+                arg.help("Registered remote to fetch from (default: origin)")
+                    .long_help("Registered remote to fetch from (default: origin)")
+            })
+            .mut_arg("tracked", |arg| arg.hide(true))
+            .mut_arg("all_remotes", |arg| arg.hide(true));
+        let list = git
             .find_subcommand_mut("remote")
             .expect("jj git command tree contains remote")
             .find_subcommand_mut("list")
@@ -114,17 +171,22 @@ pub(crate) async fn run_git(ui: &mut Ui, command: &CommandHelper) -> Result<(), 
             None => Err(owned_boundary_error("remote")),
         },
         Some(("push", push_matches)) => {
-            reject_command_line_values(push_matches, &["bookmark", "remote"], "git push")?;
+            reject_command_line_values(
+                push_matches,
+                &["bookmark", "remote", "deleted"],
+                "git push",
+            )?;
             let bookmarks = raw_values(push_matches, "bookmark");
-            if bookmarks.is_empty() {
+            let deleted = push_matches.get_flag("deleted");
+            if bookmarks.is_empty() && !deleted {
                 return Err(user_error(
-                    "`ds git push` requires at least one `-b <bookmark>` argument.",
+                    "`ds git push` requires at least one `-b <bookmark>` argument or `--deleted`.",
                 ));
             }
             let remote =
                 optional_raw(push_matches, "remote").unwrap_or_else(|| DEFAULT_REMOTE.to_owned());
             crate::boundary_sync::suppress();
-            push::push_bookmarks(ui, command, bookmarks, remote).await
+            push::push_bookmarks(ui, command, bookmarks, deleted, remote).await
         }
         Some(("fetch", fetch_matches)) => {
             reject_command_line_values(fetch_matches, &["branches", "remotes"], "git fetch")?;

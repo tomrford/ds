@@ -51,8 +51,8 @@ pub use git_lift::{
     TOMBSTONE_A, TOMBSTONE_B, lift_imported, select_seeds,
 };
 pub use git_projection::{
-    CommitMapping, ExportMappings, ExportResult, GitProjection, HiddenSet, HiddenSetIdentity,
-    ImportMappings, ImportResult, MAX_IMPORT_HEADS, MAX_IMPORT_TOTAL_COMMITS,
+    CommitMapping, ExportMappings, ExportMode, ExportResult, GitProjection, HiddenSet,
+    HiddenSetIdentity, ImportMappings, ImportResult, MAX_IMPORT_HEADS, MAX_IMPORT_TOTAL_COMMITS,
     MAX_IMPORT_TREE_DEPTH, MAX_IMPORT_TREE_ENTRIES, ProjectionError,
 };
 pub use git_subprocess::{

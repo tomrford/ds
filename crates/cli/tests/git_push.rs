@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -8,8 +10,10 @@ use std::time::{Duration, Instant};
 
 use devspace_machine::{
     GitProjection, HttpTransport, MachineRepository, MachineStoreError, ProjectionSnapshot,
-    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
+    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, encode_lower_hex,
 };
+use jj_lib::op_store::RemoteRef;
+use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 
 mod support;
 
@@ -143,6 +147,38 @@ async fn git_push_waits_for_the_repository_sync_lock_then_proceeds() {
 }
 
 #[tokio::test]
+async fn git_push_resolves_bookmarks_after_waiting_for_the_sync_lock() {
+    let fixture = FakePushFixture::new("post-sync-resolution").await;
+    fixture.commit("main", "first\n");
+    let created = fixture.push(&["-b", "main"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    fixture.commit("main", "second\n");
+
+    let store = machine_store(&fixture.home);
+    let guard = store
+        .try_lock_repository_sync(&fixture.entry().identity)
+        .unwrap();
+    let child = ds_command(&fixture.checkout, &fixture.home, &fixture.config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["git", "push", "-b", "main"])
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    fixture.commit("main", "third\n");
+    drop(guard);
+
+    let pushed = child.wait_with_output().unwrap();
+    assert!(pushed.status.success(), "{}", stderr(&pushed));
+    let view = fixture.bookmark_list();
+    assert_eq!(
+        bookmark_target(&view, "main"),
+        bookmark_target(&view, "main@origin"),
+        "{view}"
+    );
+}
+
+#[tokio::test]
 async fn git_push_holds_the_repository_sync_lock_after_sync_completes() {
     let (base_url, push_reached, release_push, server) = cloud_paused_at_remote_list();
     let temp = tempfile::tempdir().unwrap();
@@ -218,6 +254,449 @@ async fn remote_add_prints_the_workers_kebab_case_error_code_without_the_url() {
     );
     assert!(!diagnostic.contains(sentinel), "{diagnostic}");
     assert!(!diagnostic.contains(&url), "{diagnostic}");
+}
+
+#[tokio::test]
+async fn push_moves_the_remote_tracking_bookmark_to_the_local_target() {
+    let fixture = FakePushFixture::new("view-move").await;
+    fixture.commit("main", "first\n");
+    let created = fixture.push(&["-b", "main"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let first_view = fixture.bookmark_list();
+    assert!(
+        first_view.contains("main@origin|true|true|"),
+        "{first_view}"
+    );
+
+    fixture.commit("main", "second\n");
+    let updated = fixture.push(&["-b", "main"]);
+    assert!(updated.status.success(), "{}", stderr(&updated));
+
+    let updated_view = fixture.bookmark_list();
+    assert!(
+        updated_view.contains("main@origin|true|true|"),
+        "{updated_view}"
+    );
+    assert_ne!(updated_view, first_view);
+}
+
+#[tokio::test]
+async fn push_records_a_jj_operation_with_the_stock_description() {
+    let fixture = FakePushFixture::new("operation").await;
+    fixture.commit("main", "operation\n");
+    let pushed = fixture.push(&["-b", "main"]);
+    assert!(pushed.status.success(), "{}", stderr(&pushed));
+
+    assert_eq!(
+        fixture.operation_description(),
+        "push bookmark main to git remote origin"
+    );
+}
+
+#[tokio::test]
+async fn creation_push_tracks_the_new_remote_bookmark() {
+    let fixture = FakePushFixture::new("auto-track").await;
+    fixture.commit("main", "created\n");
+
+    let pushed = fixture.push(&["-b", "main"]);
+    assert!(pushed.status.success(), "{}", stderr(&pushed));
+
+    let view = fixture.bookmark_list();
+    assert!(view.contains("main@origin|true|true|"), "{view}");
+}
+
+#[tokio::test]
+async fn deletion_push_removes_the_remote_tracking_bookmark() {
+    let fixture = FakePushFixture::new("view-delete").await;
+    fixture.commit("feature", "created\n");
+    let created = fixture.push(&["-b", "feature"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    fixture.delete_bookmark("feature");
+
+    let deleted = fixture.push(&["-b", "feature"]);
+    assert!(deleted.status.success(), "{}", stderr(&deleted));
+
+    let view = fixture.bookmark_list();
+    assert!(!view.contains("feature@origin|"), "{view}");
+    assert_eq!(
+        fixture.operation_description(),
+        "push bookmark feature to git remote origin"
+    );
+    assert!(remote_ref(&fixture.remote, "feature").is_none());
+}
+
+#[tokio::test]
+async fn recovered_pending_deletion_is_reported_as_success() {
+    let fixture = FakePushFixture::new("recovered-deletion").await;
+    fixture.commit("feature", "created\n");
+    let created = fixture.push(&["-b", "feature"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    fixture.delete_bookmark("feature");
+
+    let crashed = ds_command(&fixture.checkout, &fixture.home, &fixture.config)
+        .env("DEVSPACE_FAILPOINT", "after_git_push_before_finalize")
+        .args(["git", "push", "-b", "feature"])
+        .output()
+        .unwrap();
+    assert_eq!(crashed.status.code(), Some(86), "{}", stderr(&crashed));
+    assert!(remote_ref(&fixture.remote, "feature").is_none());
+
+    let recovered = fixture.push(&["-b", "feature"]);
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+    assert!(
+        stderr(&recovered).contains("pushed feature to origin: deleted"),
+        "{}",
+        stderr(&recovered)
+    );
+    let view = fixture.bookmark_list();
+    assert!(!view.contains("feature@origin|"), "{view}");
+}
+
+#[tokio::test]
+async fn deleted_combines_with_explicit_bookmarks() {
+    let fixture = FakePushFixture::new("deleted-selection").await;
+    fixture.commit("feature", "created\n");
+    let created = fixture.push(&["-b", "feature"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    fixture.delete_bookmark("feature");
+    fixture.commit("main", "main\n");
+
+    let deleted = fixture.push(&["-b", "main", "--deleted"]);
+    assert!(deleted.status.success(), "{}", stderr(&deleted));
+    assert!(stderr(&deleted).contains("pushed feature to origin: deleted"));
+    assert!(stderr(&deleted).contains("pushed main to origin: created"));
+    assert!(!fixture.remote_bookmark("feature").await.is_present());
+    assert!(remote_ref(&fixture.remote, "feature").is_none());
+    assert!(remote_ref(&fixture.remote, "main").is_some());
+}
+
+#[tokio::test]
+async fn up_to_date_push_repairs_a_stale_remote_tracking_bookmark() {
+    let fixture = FakePushFixture::new("self-heal").await;
+    fixture.commit("main", "created\n");
+    let created = fixture.push(&["-b", "main"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    fixture.remove_remote_bookmark("main").await;
+
+    let repaired = fixture.push(&["-b", "main"]);
+    assert!(repaired.status.success(), "{}", stderr(&repaired));
+    assert!(stderr(&repaired).contains("up to date"));
+
+    let view = fixture.bookmark_list();
+    assert!(view.contains("main@origin|true|true|"), "{view}");
+    assert_eq!(
+        fixture.operation_description(),
+        "push bookmark main to git remote origin"
+    );
+}
+
+#[tokio::test]
+async fn multiple_explicit_bookmarks_use_sorted_operation_description() {
+    let fixture = FakePushFixture::new("operation-sorted").await;
+    fixture.commit("zeta", "zeta\n");
+    fixture.commit("alpha", "alpha\n");
+
+    let pushed = fixture.push(&["-b", "zeta", "-b", "alpha"]);
+    assert!(pushed.status.success(), "{}", stderr(&pushed));
+    assert_eq!(
+        fixture.operation_description(),
+        "push bookmarks alpha, zeta to git remote origin"
+    );
+}
+
+#[tokio::test]
+async fn explicit_push_refuses_a_present_untracked_remote_bookmark() {
+    let fixture = FakePushFixture::new("untracked-explicit").await;
+    fixture.commit("main", "first\n");
+    let created = fixture.push(&["-b", "main"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let untracked = fixture.ds(&["bookmark", "untrack", "main@origin"]);
+    assert!(untracked.status.success(), "{}", stderr(&untracked));
+    fixture.commit("main", "second\n");
+
+    let refused = fixture.push(&["-b", "main"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let diagnostic = stderr(&refused);
+    assert!(
+        diagnostic.contains("Non-tracking remote bookmark main@origin exists"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("ds bookmark track main --remote=origin"),
+        "{diagnostic}"
+    );
+}
+
+#[tokio::test]
+async fn deleted_selects_only_absent_local_tracked_bookmarks_on_the_remote() {
+    let fixture = FakePushFixture::new("deleted-matrix").await;
+
+    fixture.commit("deleted", "deleted\n");
+    assert!(fixture.push(&["-b", "deleted"]).status.success());
+    fixture.delete_bookmark("deleted");
+
+    fixture.commit("untracked", "untracked\n");
+    assert!(fixture.push(&["-b", "untracked"]).status.success());
+    let forgotten = fixture.ds(&["bookmark", "forget", "untracked"]);
+    assert!(forgotten.status.success(), "{}", stderr(&forgotten));
+
+    fixture.commit("local", "local\n");
+    assert!(fixture.push(&["-b", "local"]).status.success());
+
+    fixture.add_remote("backup");
+    fixture.commit("elsewhere", "elsewhere\n");
+    assert!(
+        fixture
+            .push(&["-b", "elsewhere", "--remote", "backup"])
+            .status
+            .success()
+    );
+    fixture.delete_bookmark("elsewhere");
+
+    let pushed = fixture.push(&["--deleted"]);
+    assert!(pushed.status.success(), "{}", stderr(&pushed));
+    let diagnostic = stderr(&pushed);
+    assert!(diagnostic.contains("pushed deleted to origin: deleted"));
+    assert!(!diagnostic.contains("pushed untracked"), "{diagnostic}");
+    assert!(!diagnostic.contains("pushed local"), "{diagnostic}");
+    assert!(!diagnostic.contains("pushed elsewhere"), "{diagnostic}");
+    assert!(remote_ref(&fixture.remote, "deleted").is_none());
+    assert!(remote_ref(&fixture.remote, "untracked").is_some());
+    assert!(remote_ref(&fixture.remote, "local").is_some());
+    assert!(remote_ref(&fixture.remote, "elsewhere").is_some());
+    assert_eq!(
+        fixture.operation_description(),
+        "push all deleted bookmarks to git remote origin"
+    );
+}
+
+#[tokio::test]
+async fn push_surfaces_missing_mapped_sidecar_object_repair() {
+    let fixture = FakePushFixture::new("missing-mapped-object").await;
+    fixture.commit("main", "first\n");
+    let created = fixture.push(&["-b", "main"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let oid = remote_ref(&fixture.remote, "main").unwrap();
+    let hex = encode_lower_hex(&oid);
+    let projection = GitProjection::open(fixture.projection_path(), &settings()).unwrap();
+    let object_path = projection
+        .git_repo_path()
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    drop(projection);
+    fs::remove_file(&object_path).unwrap();
+    fixture.commit("main", "second\n");
+
+    let pushed = fixture.push(&["-b", "main"]);
+    assert_eq!(pushed.status.code(), Some(1));
+    let diagnostic = stderr(&pushed);
+    assert!(
+        diagnostic.contains("Git projection sidecar is missing mapped Git object"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("ds git fetch --remote origin -b main"),
+        "{diagnostic}"
+    );
+}
+
+#[tokio::test]
+async fn new_bookmark_reuses_the_git_oid_of_imported_history() {
+    let fixture = FakePushFixture::new("imported-history").await;
+    let imported_oid = signed_commit(&fixture.remote, "main");
+
+    let fetched = fixture.fetch(&["-b", "main"]);
+    assert!(fetched.status.success(), "{}", stderr(&fetched));
+    let tracked = ds(
+        &fixture.checkout,
+        &fixture.home,
+        &fixture.config,
+        &["bookmark", "track", "main@origin"],
+    );
+    assert!(tracked.status.success(), "{}", stderr(&tracked));
+    let checked_out = ds(
+        &fixture.checkout,
+        &fixture.home,
+        &fixture.config,
+        &["new", "main"],
+    );
+    assert!(checked_out.status.success(), "{}", stderr(&checked_out));
+
+    fixture.commit("main", "descendant\n");
+    let main = fixture.push(&["-b", "main"]);
+    assert!(main.status.success(), "{}", stderr(&main));
+    let main_oid = remote_ref(&fixture.remote, "main").unwrap();
+    assert_eq!(
+        parse_git_oid(git_output(&["rev-parse", "main^"], Some(&fixture.remote)).trim()),
+        imported_oid
+    );
+
+    set_bookmark(
+        &fixture.checkout,
+        &fixture.home,
+        &fixture.config,
+        "release",
+        "main",
+    );
+    let release = fixture.push(&["-b", "release"]);
+    assert!(release.status.success(), "{}", stderr(&release));
+
+    assert_eq!(remote_ref(&fixture.remote, "release"), Some(main_oid));
+}
+
+struct FakePushFixture {
+    _temp: tempfile::TempDir,
+    _server: JoinHandle<Vec<String>>,
+    home: PathBuf,
+    config: PathBuf,
+    checkout: PathBuf,
+    remote: PathBuf,
+    repository_name: String,
+}
+
+impl FakePushFixture {
+    async fn new(label: &str) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("origin.git");
+        git(&["init", "--bare", remote.to_str().unwrap()], None);
+        let (base_url, server) = create_push_server(remote.to_str().unwrap().to_owned());
+        let home = temp.path().join("machine");
+        fs::create_dir_all(&home).unwrap();
+        configure_machine(&home, &base_url, FIRST_MACHINE_ID, DEVELOPMENT_SECRET);
+        let config = write_cli_config(&home);
+        let repository_name = format!("git-push-{label}");
+        let checkout = local_checkout(&home, &config, &repository_name).await;
+        let added = ds(
+            &checkout,
+            &home,
+            &config,
+            &["git", "remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        assert!(added.status.success(), "{}", stderr(&added));
+        Self {
+            _temp: temp,
+            _server: server,
+            home,
+            config,
+            checkout,
+            remote,
+            repository_name,
+        }
+    }
+
+    fn commit(&self, bookmark: &str, contents: &str) {
+        fs::write(self.checkout.join("visible.txt"), contents).unwrap();
+        seal_commit(
+            &self.checkout,
+            &self.home,
+            &self.config,
+            &format!("{bookmark} commit"),
+        );
+        set_bookmark(&self.checkout, &self.home, &self.config, bookmark, "@-");
+    }
+
+    fn delete_bookmark(&self, bookmark: &str) {
+        let deleted = ds(
+            &self.checkout,
+            &self.home,
+            &self.config,
+            &["bookmark", "delete", bookmark],
+        );
+        assert!(deleted.status.success(), "{}", stderr(&deleted));
+    }
+
+    fn push(&self, args: &[&str]) -> Output {
+        let mut command = ds_command(&self.checkout, &self.home, &self.config);
+        command.arg("git").arg("push").args(args).output().unwrap()
+    }
+
+    fn ds(&self, args: &[&str]) -> Output {
+        ds(&self.checkout, &self.home, &self.config, args)
+    }
+
+    fn bookmark_list(&self) -> String {
+        let output = self.ds(&[
+            "bookmark",
+            "list",
+            "--all-remotes",
+            "--ignore-working-copy",
+            "-T",
+            r#"name ++ if(remote, "@" ++ remote) ++ "|" ++ present ++ "|" ++ tracked ++ "|" ++ if(present, normal_target.commit_id().short(12)) ++ "\n""#,
+        ]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        stdout(&output)
+    }
+
+    fn operation_description(&self) -> String {
+        let output = self.ds(&[
+            "operation",
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "--limit",
+            "1",
+            "-T",
+            "description",
+        ]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        stdout(&output)
+    }
+
+    fn add_remote(&self, name: &str) {
+        let added = self.ds(&["git", "remote", "add", name, self.remote.to_str().unwrap()]);
+        assert!(added.status.success(), "{}", stderr(&added));
+    }
+
+    fn projection_path(&self) -> PathBuf {
+        machine_store(&self.home).repository_projection_path(&self.entry().identity)
+    }
+
+    fn fetch(&self, args: &[&str]) -> Output {
+        let mut command = ds_command(&self.checkout, &self.home, &self.config);
+        command.arg("git").arg("fetch").args(args).output().unwrap()
+    }
+
+    fn entry(&self) -> devspace_machine::CatalogEntry {
+        machine_store(&self.home)
+            .resolve(&RepositoryName::parse(&self.repository_name).unwrap())
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn repository(&self) -> MachineRepository {
+        MachineRepository::open(&self.entry().native_repository_path, &settings())
+            .await
+            .unwrap()
+    }
+
+    async fn remote_bookmark(&self, name: &str) -> RemoteRef {
+        self.repository()
+            .await
+            .repo()
+            .view()
+            .get_remote_bookmark(RemoteRefSymbol {
+                name: RefName::new(name),
+                remote: RemoteName::new("origin"),
+            })
+            .clone()
+    }
+
+    async fn remove_remote_bookmark(&self, name: &str) {
+        let repository = self.repository().await;
+        let mut transaction = repository.repo().start_transaction();
+        transaction.repo_mut().set_remote_bookmark(
+            RemoteRefSymbol {
+                name: RefName::new(name),
+                remote: RemoteName::new("origin"),
+            },
+            RemoteRef::absent(),
+        );
+        transaction
+            .commit("remove fixture remote bookmark")
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -623,6 +1102,298 @@ impl LiveFixture {
     }
 }
 
+fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
+    let mut head = None::<String>;
+    let mut head_cursor = 0_u64;
+    let mut activation_cursor = 0_u64;
+    let mut cursors = Vec::<serde_json::Value>::new();
+    let mut mappings = Vec::<serde_json::Value>::new();
+    let mut pending = None::<serde_json::Value>;
+    let mut pending_fence = 1_u64;
+    let mut remotes = BTreeMap::<String, String>::new();
+    create_server(move |_, request, stream| {
+        let request_line = request.lines().next().unwrap();
+        if request_line.starts_with("PUT ") && request_line.contains("/remotes/") {
+            assert_eq!(request_json(request)["url"], git_url);
+            let name = remote_name_from_request(request_line);
+            remotes.insert(name.clone(), git_url.clone());
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({"remote": {"name": name, "url": git_url}}).to_string(),
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/packs?") {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/heads?") {
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "cursor": head_cursor,
+                    "heads": head.iter().collect::<Vec<_>>(),
+                })
+                .to_string(),
+            );
+        } else if request_line.starts_with("POST ") && request_line.contains("/objects/inventory ")
+        {
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({"objects": request_json(request)["objects"]}).to_string(),
+            );
+        } else if request_line.starts_with("POST ") && request_line.contains("/heads ") {
+            let body = request_json(request);
+            head = Some(body["newHead"].as_str().unwrap().to_owned());
+            head_cursor += 1;
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "cursor": head_cursor,
+                    "heads": head.iter().collect::<Vec<_>>(),
+                })
+                .to_string(),
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "remotes": remotes
+                        .iter()
+                        .map(|(name, url)| serde_json::json!({"name": name, "url": url}))
+                        .collect::<Vec<_>>()
+                })
+                .to_string(),
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/projection?") {
+            let pending_batches = pending
+                .iter()
+                .map(|batch| {
+                    serde_json::json!({
+                        "batchId": batch["batchId"],
+                        "remote": batch["remote"],
+                        "ownerMachine": batch["machineId"],
+                        "fence": pending_fence,
+                        "refs": batch["updates"].as_array().unwrap().iter().map(|update| {
+                            let proposed = update["proposedState"]
+                                .as_u64()
+                                .map(|index| update["states"][index as usize]["gitOid"].clone())
+                                .unwrap_or(serde_json::Value::Null);
+                            serde_json::json!({
+                                "bookmark": update["bookmark"],
+                                "expectedOldOid": update["expectedOldOid"],
+                                "proposedGitOid": proposed,
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "activationCursor": activation_cursor,
+                    "cursors": cursors,
+                    "mappings": mappings,
+                    "nextAfter": activation_cursor,
+                    "through": activation_cursor,
+                    "hasMore": false,
+                    "pending": pending_batches,
+                })
+                .to_string(),
+            );
+        } else if request_line.starts_with("POST ") && request_line.contains("/git/fetches ") {
+            let body = request_json(request);
+            let remote = body["remote"].as_str().unwrap();
+            for fetch_ref in body["refs"].as_array().unwrap() {
+                let bookmark = fetch_ref["bookmark"].as_str().unwrap();
+                let current = cursors
+                    .iter()
+                    .find(|cursor| cursor["remote"] == remote && cursor["bookmark"] == bookmark)
+                    .map(|cursor| cursor["gitOid"].clone())
+                    .unwrap_or(serde_json::Value::Null);
+                assert_eq!(fetch_ref["expectedCursorOid"], current);
+                cursors
+                    .retain(|cursor| cursor["remote"] != remote || cursor["bookmark"] != bookmark);
+                for state in fetch_ref["states"].as_array().unwrap() {
+                    activation_cursor += 1;
+                    let mapping = serde_json::json!({
+                        "remote": remote,
+                        "bookmark": bookmark,
+                        "gitOid": state["gitOid"],
+                        "canonicalCommitId": state["canonicalCommitId"],
+                        "publicCommitId": state["publicCommitId"],
+                        "hiddenSetId": state["hiddenSetId"],
+                    });
+                    if !mappings.iter().any(|existing| existing == &mapping) {
+                        mappings.push(mapping);
+                    }
+                }
+                let proposed = fetch_ref["proposedState"].as_u64().unwrap() as usize;
+                let state = &fetch_ref["states"][proposed];
+                cursors.push(serde_json::json!({
+                    "remote": remote,
+                    "bookmark": bookmark,
+                    "gitOid": state["gitOid"],
+                    "canonicalCommitId": state["canonicalCommitId"],
+                    "publicCommitId": state["publicCommitId"],
+                    "hiddenSetId": state["hiddenSetId"],
+                    "activationSequence": activation_cursor,
+                }));
+            }
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "fetchId": body["fetchId"],
+                    "activationCursor": activation_cursor,
+                })
+                .to_string(),
+            );
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/pushes/")
+            && request_line.contains("/claim ")
+        {
+            let previous_fence = pending_fence;
+            pending_fence += 1;
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "fence": pending_fence,
+                    "previousFence": previous_fence,
+                })
+                .to_string(),
+            );
+        } else if request_line.starts_with("GET ")
+            && request_line.contains("/git/pushes/")
+            && request_line.contains("/replay?")
+        {
+            let batch = pending.as_ref().expect("replay follows a pending batch");
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "batchId": batch["batchId"],
+                    "remote": batch["remote"],
+                    "ownerMachine": batch["machineId"],
+                    "fence": pending_fence,
+                    "updates": batch["updates"],
+                })
+                .to_string(),
+            );
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/pushes/")
+            && request_line.contains("/recover ")
+        {
+            let body = request_json(request);
+            let batch = pending.take().expect("recover follows begin");
+            let remote = batch["remote"].as_str().unwrap();
+            activation_cursor += 1;
+            for update in batch["updates"].as_array().unwrap() {
+                let bookmark = update["bookmark"].as_str().unwrap();
+                let observation = body["observations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|observation| observation["bookmark"] == bookmark)
+                    .unwrap();
+                cursors
+                    .retain(|cursor| cursor["remote"] != remote || cursor["bookmark"] != bookmark);
+                if let Some(index) = update["proposedState"].as_u64() {
+                    let state = &update["states"][index as usize];
+                    assert_eq!(observation["liveOid"], state["gitOid"]);
+                    cursors.push(serde_json::json!({
+                        "remote": remote,
+                        "bookmark": bookmark,
+                        "gitOid": state["gitOid"],
+                        "canonicalCommitId": state["canonicalCommitId"],
+                        "publicCommitId": state["publicCommitId"],
+                        "hiddenSetId": state["hiddenSetId"],
+                        "activationSequence": activation_cursor,
+                    }));
+                    for state in update["states"].as_array().unwrap() {
+                        let mapping = serde_json::json!({
+                            "remote": remote,
+                            "bookmark": bookmark,
+                            "gitOid": state["gitOid"],
+                            "canonicalCommitId": state["canonicalCommitId"],
+                            "publicCommitId": state["publicCommitId"],
+                            "hiddenSetId": state["hiddenSetId"],
+                        });
+                        if !mappings.iter().any(|existing| existing == &mapping) {
+                            mappings.push(mapping);
+                        }
+                    }
+                } else {
+                    assert!(observation["liveOid"].is_null());
+                }
+            }
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "pending": false,
+                    "fence": pending_fence,
+                    "outcome": "accepted",
+                })
+                .to_string(),
+            );
+        } else if request_line.starts_with("POST ") && request_line.contains("/git/pushes ") {
+            let body = request_json(request);
+            for update in body["updates"].as_array().unwrap() {
+                let bookmark = &update["bookmark"];
+                let current = cursors
+                    .iter()
+                    .find(|cursor| {
+                        cursor["remote"] == body["remote"] && cursor["bookmark"] == *bookmark
+                    })
+                    .map(|cursor| cursor["gitOid"].clone())
+                    .unwrap_or(serde_json::Value::Null);
+                assert_eq!(update["expectedOldOid"], current);
+            }
+            pending = Some(body);
+            pending_fence = 1;
+            respond(
+                stream,
+                "200 OK",
+                r#"{"pending":true,"fence":1,"outcome":null}"#,
+            );
+        } else {
+            panic!("unexpected fake push request: {request_line}");
+        }
+        false
+    })
+}
+
+fn remote_name_from_request(request_line: &str) -> String {
+    request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .split("/remotes/")
+        .nth(1)
+        .unwrap()
+        .split('?')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+fn bookmark_target<'a>(view: &'a str, name: &str) -> &'a str {
+    view.lines()
+        .find_map(|line| {
+            let (symbol, rest) = line.split_once('|')?;
+            (symbol == name).then(|| rest.rsplit('|').next().unwrap())
+        })
+        .unwrap_or_else(|| panic!("bookmark `{name}` is missing from:\n{view}"))
+}
+
 fn cloud_paused_at_remote_list() -> (String, Receiver<()>, SyncSender<()>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -675,6 +1446,10 @@ fn request_body(request: &str) -> &str {
     request.split_once("\r\n\r\n").unwrap().1
 }
 
+fn request_json(request: &str) -> serde_json::Value {
+    serde_json::from_str(request_body(request)).unwrap()
+}
+
 async fn local_checkout(home: &Path, config: &Path, name: &str) -> PathBuf {
     let store = machine_store(home);
     let identity = RepositoryIdentity::new(
@@ -725,6 +1500,35 @@ fn remote_ref(remote: &Path, bookmark: &str) -> Option<[u8; 20]> {
     }
     let value = String::from_utf8(output.stdout).unwrap();
     Some(parse_git_oid(value.trim()))
+}
+
+fn signed_commit(remote: &Path, bookmark: &str) -> [u8; 20] {
+    let tree = git_output(&["mktree"], Some(remote));
+    let raw = format!(
+        "tree {}\nauthor Imported <imported@example.invalid> 0 +0000\ncommitter Imported <imported@example.invalid> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n dummy\n -----END PGP SIGNATURE-----\n\nimported history\n",
+        tree.trim()
+    );
+    let mut hash = git_command(
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        Some(remote),
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+    hash.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(raw.as_bytes())
+        .unwrap();
+    let output = hash.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let oid = String::from_utf8(output.stdout).unwrap();
+    git(
+        &["update-ref", &format!("refs/heads/{bookmark}"), oid.trim()],
+        Some(remote),
+    );
+    parse_git_oid(oid.trim())
 }
 
 fn assert_public_object_store(remote: &Path, sentinel: &[u8]) {

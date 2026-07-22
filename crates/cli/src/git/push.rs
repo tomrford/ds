@@ -2,18 +2,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 
 use devspace_machine::{
-    CatalogEntry, CommitMapping, ExportMappings, GitOid, GitProcessEnvironment, GitProjection,
-    HttpTransport, ImportMappings, LeaseUpdate, MachineRepository, MachineStore, PackOptions,
-    PendingProjectionBatch, ProjectionCursor, ProjectionMapping, ProjectionObservation,
-    ProjectionSnapshot, ProjectionState, ProjectionUpdate, PushErrorKind, PushRefStatus,
-    QualifiedRef, RegisteredRemote, RemoteUrl, upload_object_closure,
+    CatalogEntry, CommitMapping, ExportMappings, ExportMode, GitOid, GitProcessEnvironment,
+    GitProjection, HttpTransport, ImportMappings, LeaseUpdate, MachineRepository, MachineStore,
+    PackOptions, PendingProjectionBatch, ProjectionCursor, ProjectionError, ProjectionMapping,
+    ProjectionObservation, ProjectionSnapshot, ProjectionState, ProjectionUpdate, PushErrorKind,
+    PushRefStatus, QualifiedRef, RegisteredRemote, RemoteUrl, upload_object_closure,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
 use jj_lib::backend::{BackendError, CommitId};
 use jj_lib::object_id::ObjectId as _;
-use jj_lib::ref_name::RefName;
+use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
+use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 use jj_lib::repo::Repo as _;
 
 use crate::checkout::reject_unsupported_global_options;
@@ -57,6 +58,7 @@ pub(super) async fn push_bookmarks(
     ui: &mut Ui,
     command: &CommandHelper,
     bookmark_names: Vec<String>,
+    deleted: bool,
     remote_name: String,
 ) -> Result<(), CommandError> {
     reject_unsupported_global_options(command, "git push")?;
@@ -70,17 +72,31 @@ pub(super) async fn push_bookmarks(
         QualifiedRef::from_bookmark(bookmark).map_err(display_error)?;
     }
 
-    let workspace = command.workspace_helper(ui).await?;
-    let workspace_root = workspace.workspace_root().to_owned();
+    let workspace_root = command
+        .workspace_helper(ui)
+        .await?
+        .workspace_root()
+        .to_owned();
+    let locked = locked_checkout_entry(ui, &workspace_root, command.settings(), "push").await?;
+    let session = open_cloud_session(ui, command.settings(), &locked.store, &locked.entry).await?;
+
+    let view = session.repository.repo().view();
     let mut requested = Vec::with_capacity(bookmark_names.len());
     for name in bookmark_names {
-        let target = workspace
-            .repo()
-            .view()
-            .get_local_bookmark(RefName::new(name.as_str()));
+        let target = view.get_local_bookmark(RefName::new(name.as_str()));
         if target.has_conflict() {
             return Err(user_error(format!(
                 "Bookmark `{name}` is conflicted and must resolve to exactly one commit before push."
+            )));
+        }
+        let remote_ref = view.get_remote_bookmark(RemoteRefSymbol {
+            name: RefName::new(name.as_str()),
+            remote: RemoteName::new(remote_name.as_str()),
+        });
+        if remote_ref.is_present() && !remote_ref.is_tracked() {
+            return Err(user_error(format!(
+                "Non-tracking remote bookmark {}@{} exists. Run `ds bookmark track {} --remote={}` to import the remote bookmark.",
+                name, remote_name, name, remote_name
             )));
         }
         requested.push(RequestedBookmark {
@@ -88,12 +104,19 @@ pub(super) async fn push_bookmarks(
             local_target: target.as_normal().cloned(),
         });
     }
-    drop(workspace);
-
-    let locked = locked_checkout_entry(ui, &workspace_root, command.settings(), "push").await?;
-    let session = open_cloud_session(ui, command.settings(), &locked.store, &locked.entry).await?;
+    let local_bookmarks = deleted.then(|| {
+        view.local_bookmarks()
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect::<BTreeSet<_>>()
+    });
+    let tracked_remote_bookmarks = deleted.then(|| {
+        view.local_remote_bookmarks(RemoteName::new(remote_name.as_str()))
+            .filter(|(_, targets)| targets.remote_ref.is_tracked())
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect::<BTreeSet<_>>()
+    });
     let runtime = cloud_runtime()?;
-    let lines = runtime
+    let outcome = runtime
         .block_on(push_with_cloud(
             &locked.store,
             &locked.entry,
@@ -103,12 +126,23 @@ pub(super) async fn push_bookmarks(
             session.machine_id,
             &remote_name,
             &requested,
+            local_bookmarks,
+            tracked_remote_bookmarks,
+            deleted,
         ))
         .map_err(user_error)?;
-    for line in lines {
+    for line in outcome.lines {
         writeln!(ui.status(), "{line}")?;
     }
+    if let Some(warning) = outcome.warning {
+        writeln!(ui.warning_default(), "{warning}")?;
+    }
     Ok(())
+}
+
+struct PushOutcome {
+    lines: Vec<String>,
+    warning: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -121,32 +155,74 @@ async fn push_with_cloud(
     machine_id: [u8; 16],
     remote_name: &str,
     requested: &[RequestedBookmark],
-) -> Result<Vec<String>, String> {
+    deleted_locals: Option<BTreeSet<String>>,
+    tracked_remote_bookmarks: Option<BTreeSet<String>>,
+    deleted: bool,
+) -> Result<PushOutcome, String> {
     let remotes = cloud
         .list_remotes()
         .await
         .map_err(|error| error.to_string())?;
     let remote = find_remote(&remotes, remote_name)?;
+    let mut snapshot = load_projection_snapshot(&cloud).await?;
+    let mut requested = requested.to_vec();
+    if let (Some(locals), Some(tracked)) = (&deleted_locals, &tracked_remote_bookmarks) {
+        let mut names = requested
+            .iter()
+            .map(|request| request.name.clone())
+            .collect::<BTreeSet<_>>();
+        for cursor in snapshot
+            .cursors
+            .iter()
+            .filter(|cursor| cursor.remote == remote_name)
+        {
+            if !locals.contains(&cursor.bookmark)
+                && tracked.contains(&cursor.bookmark)
+                && names.insert(cursor.bookmark.clone())
+            {
+                requested.push(RequestedBookmark {
+                    name: cursor.bookmark.clone(),
+                    local_target: None,
+                });
+            }
+        }
+    }
     let requested_names = requested
         .iter()
         .map(|request| request.name.as_str())
         .collect::<BTreeSet<_>>();
-    let mut snapshot = load_projection_snapshot(&cloud).await?;
+    let mut completed_deletions = BTreeMap::new();
 
     while let Some(pending) = overlapping_pending(&snapshot, remote_name, &requested_names) {
+        let recovered = pending_deletions(&pending, &requested, &snapshot);
         recover_pending_batch(
             repository, projection, &mut cloud, machine_id, remote, &snapshot, &pending,
         )
         .await?;
+        completed_deletions.extend(recovered);
         snapshot = load_projection_snapshot(&cloud).await?;
     }
 
     loop {
-        let mut prepared =
-            prepare_updates(repository, projection, remote_name, requested, &snapshot).await?;
+        let mut prepared = prepare_updates(
+            repository,
+            projection,
+            remote_name,
+            &requested,
+            &snapshot,
+            &completed_deletions,
+        )
+        .await?;
         let mut output = prepared.output.clone();
         if prepared.updates.is_empty() {
-            return Ok(output);
+            return Ok(finish_push(
+                repository,
+                remote_name,
+                output,
+                &prepared.view_updates,
+                deleted,
+            )
+            .await);
         }
         let closure = repository
             .commit_closure(&prepared.durable_heads)
@@ -179,7 +255,14 @@ async fn push_with_cloud(
                 match finalized {
                     Ok(result) if result.outcome.as_deref() == Some("accepted") => {
                         output.append(&mut prepared.success_output);
-                        return Ok(output);
+                        return Ok(finish_push(
+                            repository,
+                            remote_name,
+                            output,
+                            &prepared.view_updates,
+                            deleted,
+                        )
+                        .await);
                     }
                     Ok(result) if result.outcome.as_deref() == Some("aborted") => {
                         return Err(format!(
@@ -199,7 +282,14 @@ async fn push_with_cloud(
             }
             Ok(result) if result.outcome.as_deref() == Some("accepted") => {
                 output.append(&mut prepared.success_output);
-                return Ok(output);
+                return Ok(finish_push(
+                    repository,
+                    remote_name,
+                    output,
+                    &prepared.view_updates,
+                    deleted,
+                )
+                .await);
             }
             Ok(_) => return Err("projection journal returned an invalid batch state".to_owned()),
             Err(begin_error) => {
@@ -211,10 +301,12 @@ async fn push_with_cloud(
                 else {
                     return Err(begin_error.to_string());
                 };
+                let recovered = pending_deletions(&pending, &requested, &refreshed);
                 recover_pending_batch(
                     repository, projection, &mut cloud, machine_id, remote, &refreshed, &pending,
                 )
                 .await?;
+                completed_deletions.extend(recovered);
                 snapshot = load_projection_snapshot(&cloud).await?;
             }
         }
@@ -227,6 +319,7 @@ struct PreparedPush {
     durable_heads: Vec<CommitId>,
     output: Vec<String>,
     success_output: Vec<String>,
+    view_updates: Vec<(String, Option<CommitId>)>,
 }
 
 async fn prepare_updates(
@@ -235,6 +328,7 @@ async fn prepare_updates(
     remote: &str,
     requested: &[RequestedBookmark],
     snapshot: &ProjectionSnapshot,
+    completed_deletions: &BTreeMap<String, GitOid>,
 ) -> Result<PreparedPush, String> {
     let cursor_by_bookmark = snapshot
         .cursors
@@ -262,19 +356,32 @@ async fn prepare_updates(
     let mut durable_heads = Vec::new();
     let mut output = Vec::new();
     let mut success_output = Vec::new();
+    let mut view_updates = Vec::new();
 
     for request in requested {
         let cursor = cursor_by_bookmark.get(request.name.as_str()).copied();
         match classify_bookmark(request.local_target.as_ref(), cursor) {
             BookmarkDisposition::Missing => {
-                return Err(format!("no such bookmark `{}`", request.name));
+                let Some(old) = completed_deletions.get(&request.name).copied() else {
+                    return Err(format!("no such bookmark `{}`", request.name));
+                };
+                output.push(format!(
+                    "pushed {} to {remote}: deleted {}",
+                    request.name,
+                    short_oid(old)
+                ));
+                view_updates.push((request.name.clone(), None));
             }
             BookmarkDisposition::UpToDate => {
-                let oid = GitOid(cursor.expect("up-to-date has cursor").git_oid);
+                let cursor = cursor.expect("up-to-date has cursor");
                 output.push(format!(
                     "pushed {} to {remote}: up to date at {}",
                     request.name,
-                    short_oid(oid)
+                    short_oid(GitOid(cursor.git_oid))
+                ));
+                view_updates.push((
+                    request.name.clone(),
+                    Some(CommitId::new(cursor.canonical_commit_id.to_vec())),
                 ));
             }
             BookmarkDisposition::Delete => {
@@ -298,17 +405,14 @@ async fn prepare_updates(
                     request.name,
                     short_oid(old)
                 ));
+                view_updates.push((request.name.clone(), None));
             }
             BookmarkDisposition::Update => {
                 let canonical_head = request
                     .local_target
                     .as_ref()
                     .expect("update has a local target");
-                let export_rows = snapshot
-                    .mappings
-                    .iter()
-                    .filter(|mapping| mapping.remote == remote && mapping.bookmark == request.name)
-                    .map(export_mapping);
+                let export_rows = snapshot.mappings.iter().map(export_mapping);
                 let mut export_mappings =
                     ExportMappings::from_rows(export_rows).map_err(|error| error.to_string())?;
                 let exported = projection
@@ -316,9 +420,19 @@ async fn prepare_updates(
                         repository.repo().store(),
                         std::slice::from_ref(canonical_head),
                         &mut export_mappings,
+                        ExportMode::Strict,
                     )
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| {
+                        if matches!(&error, ProjectionError::MissingMappedObject { .. }) {
+                            format!(
+                                "{error}. Run `ds git fetch --remote {remote} -b {}` to repair the mapped bookmark.",
+                                request.name
+                            )
+                        } else {
+                            error.to_string()
+                        }
+                    })?;
                 let git_head = exported
                     .git_heads
                     .first()
@@ -434,6 +548,7 @@ async fn prepare_updates(
                         short_oid(new)
                     ),
                 });
+                view_updates.push((request.name.clone(), Some(canonical_head.clone())));
             }
         }
     }
@@ -444,7 +559,130 @@ async fn prepare_updates(
         durable_heads,
         output,
         success_output,
+        view_updates,
     })
+}
+
+async fn finish_push(
+    repository: &MachineRepository,
+    remote: &str,
+    lines: Vec<String>,
+    pushed: &[(String, Option<CommitId>)],
+    deleted: bool,
+) -> PushOutcome {
+    let warning = update_view_after_push(repository, remote, pushed, deleted)
+        .await
+        .err()
+        .map(|error| view_repair_warning(remote, pushed, &error));
+    PushOutcome { lines, warning }
+}
+
+async fn update_view_after_push(
+    repository: &MachineRepository,
+    remote: &str,
+    pushed: &[(String, Option<CommitId>)],
+    deleted: bool,
+) -> Result<(), String> {
+    let mut updates = Vec::new();
+    for (bookmark, target) in pushed {
+        let symbol = RemoteRefSymbol {
+            name: RefName::new(bookmark),
+            remote: RemoteName::new(remote),
+        };
+        let new_ref = match target {
+            Some(id) => RemoteRef {
+                target: RefTarget::normal(id.clone()),
+                state: RemoteRefState::Tracked,
+            },
+            None => RemoteRef::absent(),
+        };
+        if repository.repo().view().get_remote_bookmark(symbol) != &new_ref {
+            updates.push((bookmark.clone(), new_ref));
+        }
+    }
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let mut transaction = repository.repo().start_transaction();
+    for (bookmark, remote_ref) in &updates {
+        let symbol = RemoteRefSymbol {
+            name: RefName::new(bookmark),
+            remote: RemoteName::new(remote),
+        };
+        transaction
+            .repo_mut()
+            .set_remote_bookmark(symbol, remote_ref.clone());
+    }
+    let mut names = updates
+        .iter()
+        .map(|(bookmark, _)| bookmark.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    let description = match (deleted, names.as_slice()) {
+        (true, _) => format!("push all deleted bookmarks to git remote {remote}"),
+        (false, [name]) => format!("push bookmark {name} to git remote {remote}"),
+        (false, names) => format!("push bookmarks {} to git remote {remote}", names.join(", ")),
+    };
+    transaction
+        .commit(description)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn view_repair_warning(remote: &str, pushed: &[(String, Option<CommitId>)], error: &str) -> String {
+    let updated = pushed
+        .iter()
+        .filter(|(_, target)| target.is_some())
+        .map(|(bookmark, _)| format!(" -b {bookmark}"))
+        .collect::<String>();
+    let deleted = pushed
+        .iter()
+        .filter(|(_, target)| target.is_none())
+        .map(|(bookmark, _)| format!(" {bookmark}"))
+        .collect::<String>();
+    let mut repairs = Vec::new();
+    if !updated.is_empty() {
+        repairs.push(format!(
+            "Run `ds git fetch --remote {remote}{updated}` to repair the updated remote bookmarks."
+        ));
+    }
+    if !deleted.is_empty() {
+        repairs.push(format!(
+            "Run `ds bookmark forget{deleted} --include-remotes` to remove the deleted remote bookmarks from the view."
+        ));
+    }
+    format!(
+        "The push updated {remote}, but recording it in the local view failed: {error}. {}",
+        repairs.join(" ")
+    )
+}
+
+fn pending_deletions(
+    pending: &PendingProjectionBatch,
+    requested: &[RequestedBookmark],
+    snapshot: &ProjectionSnapshot,
+) -> BTreeMap<String, GitOid> {
+    pending
+        .refs
+        .iter()
+        .filter(|pending_ref| pending_ref.proposed_git_oid.is_none())
+        .filter(|pending_ref| {
+            requested.iter().any(|request| {
+                request.name == pending_ref.bookmark && request.local_target.is_none()
+            })
+        })
+        .filter_map(|pending_ref| {
+            snapshot
+                .cursors
+                .iter()
+                .find(|cursor| {
+                    cursor.remote == pending.remote && cursor.bookmark == pending_ref.bookmark
+                })
+                .map(|cursor| (pending_ref.bookmark.clone(), GitOid(cursor.git_oid)))
+        })
+        .collect()
 }
 
 fn ensure_head_mapping(
@@ -602,9 +840,6 @@ async fn rebuild_replay_heads(
         let rows = snapshot
             .mappings
             .iter()
-            .filter(|mapping| {
-                mapping.remote == replay.remote && mapping.bookmark == update.bookmark
-            })
             .map(export_mapping)
             .chain(update.states.iter().map(|state| CommitMapping {
                 canonical_id: CommitId::new(state.canonical_commit_id.to_vec()),
@@ -616,6 +851,7 @@ async fn rebuild_replay_heads(
                 repository.repo().store(),
                 std::slice::from_ref(&canonical_head),
                 &mut mappings,
+                ExportMode::Replay,
             )
             .await?;
         if exported.git_heads.as_slice() != std::slice::from_ref(&expected_git_head) {

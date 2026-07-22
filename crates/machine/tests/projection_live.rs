@@ -3,9 +3,9 @@
 //! This manual probe requires an explicitly supplied live repository authority.
 
 use devspace_machine::{
-    CommitMapping, ExportMappings, GitProjection, HttpTransport, ImportMappings, MachineConfig,
-    MachineId, MachineRepository, PackOptions, ProjectionObservation, ProjectionState,
-    ProjectionUpdate, SharedSecret, SyncTransport, build_packs,
+    CommitMapping, ExportMappings, ExportMode, GitProjection, HttpTransport, ImportMappings,
+    MachineConfig, MachineId, MachineRepository, PackOptions, ProjectionObservation,
+    ProjectionState, ProjectionUpdate, SharedSecret, SyncTransport, build_packs,
 };
 use jj_lib::backend::{
     ChangeId, Commit as BackendCommit, CommitId, CopyId, MillisSinceEpoch, Signature, Timestamp,
@@ -166,6 +166,7 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
             first.repo().store(),
             std::slice::from_ref(&private_head),
             &mut ExportMappings::default(),
+            ExportMode::Strict,
         )
         .await
         .unwrap();
@@ -319,6 +320,7 @@ async fn another_machine_recovers_remote_move_and_rebuilds_an_empty_sidecar() {
             second.repo().store(),
             std::slice::from_ref(&private_head),
             &mut ExportMappings::from_rows(replay_rows).unwrap(),
+            ExportMode::Replay,
         )
         .await
         .unwrap();

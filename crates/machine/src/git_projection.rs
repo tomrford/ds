@@ -233,6 +233,18 @@ pub struct ExportResult {
     pub new_mappings: Vec<CommitMapping>,
 }
 
+/// Controls how accepted canonical-to-Git mappings are handled when their Git
+/// objects are absent from the rebuildable sidecar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportMode {
+    /// Normal exports require every accepted mapping to name an existing Git
+    /// object. Missing objects indicate a sidecar that must be repaired first.
+    Strict,
+    /// Journal replay may deterministically rebuild missing Git objects. The
+    /// caller must validate the rebuilt head against the journaled Git ID.
+    Replay,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportResult {
     pub canonical_heads: Vec<CommitId>,
@@ -304,6 +316,7 @@ impl GitProjection {
         canonical_store: &Arc<Store>,
         canonical_heads: &[CommitId],
         mappings: &mut ExportMappings,
+        mode: ExportMode,
     ) -> Result<ExportResult, ProjectionError> {
         let translated = translate_reachable(
             canonical_store,
@@ -312,7 +325,7 @@ impl GitProjection {
             &mut mappings.by_canonical,
             None,
             None,
-            TranslationDirection::Export,
+            TranslationDirection::Export(mode),
         )
         .await?;
         Ok(ExportResult {
@@ -426,7 +439,7 @@ struct TranslationResult {
 
 #[derive(Clone, Copy)]
 enum TranslationDirection {
-    Export,
+    Export(ExportMode),
     Import,
 }
 
@@ -521,6 +534,7 @@ struct TranslationStops<'a> {
     source_to_target: &'a mut BTreeMap<CommitId, CommitId>,
     stop_at: Option<&'a BTreeMap<CommitId, CommitId>>,
     reached_pairs: &'a mut BTreeMap<CommitId, CommitId>,
+    direction: TranslationDirection,
 }
 
 impl AncestryStops for TranslationStops<'_> {
@@ -545,7 +559,16 @@ impl AncestryStops for TranslationStops<'_> {
                 self.reached_pairs.insert(source_id.clone(), target_id);
                 Ok(true)
             }
-            Err(jj_lib::backend::BackendError::ObjectNotFound { .. }) => Ok(false),
+            Err(jj_lib::backend::BackendError::ObjectNotFound { .. }) => match self.direction {
+                TranslationDirection::Export(ExportMode::Strict) => {
+                    Err(ProjectionError::MissingMappedObject {
+                        canonical_id: source_id.clone(),
+                        git_id: target_id,
+                    })
+                }
+                TranslationDirection::Export(ExportMode::Replay) => Ok(false),
+                TranslationDirection::Import => Ok(false),
+            },
             Err(source) => Err(source.into()),
         }
     }
@@ -565,7 +588,7 @@ async fn translate_reachable(
     let mut reached_pairs = BTreeMap::new();
     let limit = match direction {
         TranslationDirection::Import => MAX_IMPORT_TOTAL_COMMITS,
-        TranslationDirection::Export => usize::MAX,
+        TranslationDirection::Export(_) => usize::MAX,
     };
     let walk = walk_ancestry_bounded(
         source,
@@ -575,6 +598,7 @@ async fn translate_reachable(
             source_to_target,
             stop_at,
             reached_pairs: &mut reached_pairs,
+            direction,
         },
         limit,
     )
@@ -587,7 +611,7 @@ async fn translate_reachable(
             .map(|parent_id| mapped_commit_id(source, target, source_to_target, parent_id))
             .collect::<Result<Vec<_>, _>>()?;
         let hidden_set = match direction {
-            TranslationDirection::Export => Some(
+            TranslationDirection::Export(_) => Some(
                 resolve_hidden_set(source, &source_id, &source_commit, &mut cache.hidden_sets)
                     .await?,
             ),
@@ -1121,6 +1145,13 @@ pub enum ProjectionError {
         git_id: CommitId,
         leaked: Vec<RepoPathBuf>,
     },
+    #[error(
+        "Git projection sidecar is missing mapped Git object {git_id} for canonical commit {canonical_id}; fetching the mapped bookmark repairs it"
+    )]
+    MissingMappedObject {
+        canonical_id: CommitId,
+        git_id: CommitId,
+    },
     #[error("cannot {operation} Git link at {path:?}")]
     GitLink {
         path: RepoPathBuf,
@@ -1151,7 +1182,7 @@ pub enum ProjectionError {
 impl TranslationDirection {
     fn label(self) -> &'static str {
         match self {
-            Self::Export => "export",
+            Self::Export(_) => "export",
             Self::Import => "import",
         }
     }
