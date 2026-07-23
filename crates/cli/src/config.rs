@@ -29,6 +29,8 @@ enum ConfigCommand {
 #[derive(Clone, clap::ValueEnum)]
 enum ConfigKey {
     GitShim,
+    #[value(name = "context.auto-sync")]
+    ContextAutoSync,
 }
 
 pub(crate) fn intercept(args: &[OsString]) -> Option<ExitCode> {
@@ -68,17 +70,19 @@ fn run_inner(args: ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
         ConfigCommand::Path => {
             println!("{}", store.config_path().display());
         }
-        ConfigCommand::Get {
-            key: ConfigKey::GitShim,
-        } => {
-            println!("{}", store.load_config()?.git_shim());
+        ConfigCommand::Get { key } => {
+            let config = store.load_config()?;
+            let value = match key {
+                ConfigKey::GitShim => config.git_shim(),
+                ConfigKey::ContextAutoSync => config.context_auto_sync(),
+            };
+            println!("{value}");
         }
-        ConfigCommand::Set {
-            key: ConfigKey::GitShim,
-            value,
-        } => {
-            let config = store.load_config()?.with_git_shim(value);
-            store.write_config(&config)?;
+        ConfigCommand::Set { key, value } => {
+            store.update_config(|config| match key {
+                ConfigKey::GitShim => config.with_git_shim(value),
+                ConfigKey::ContextAutoSync => config.with_context_auto_sync(value),
+            })?;
         }
     }
     Ok(())

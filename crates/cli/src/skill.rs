@@ -54,7 +54,9 @@ paths are tracked automatically. Run `ds skill private` for details.
 ## Pinned context
 
 A checkout containing `.repos/` holds read-only reference repositories
-pinned by `.repos/.lock`. Run `ds skill context` for details.
+pinned by `.repos/.lock`. Materialize them with `ds context sync`, or enable
+automatic reconciliation after working-copy movement with `ds config set
+context.auto-sync true`. Run `ds skill context` for details.
 
 ## Synchronization
 
@@ -121,8 +123,15 @@ unrecorded changes inside it.
 
 `.repos/.lock` is the tracked source of truth for pinned sources and
 revisions. Review it when you need to establish which upstream version the
-checkout uses. If `.repos/` or its lock is absent, the checkout does not
-provide pinned repository context.
+checkout uses. Run `ds context sync` to materialize its aliases. Set
+`context.auto-sync` for this machine with `ds config set context.auto-sync
+true` to clear generated links before a working-copy transition and reconcile
+the destination lock afterward, including for `ds add` and revision movement
+commands. A destination without a regular `.repos/.lock` does not run the
+reload side. Links that do not match the snapshots recorded by the source lock
+are left untouched. Clear or reload failures warn without failing or undoing
+the checkout transition. If `.repos/` or its lock is absent, the checkout does
+not provide pinned repository context.
 "#;
 
 const JJ: &str = r#"# Devspace and jj

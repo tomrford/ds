@@ -193,6 +193,7 @@ pub(crate) async fn add_checkout(
             .await
             .map_err(user_error)?;
             let requested_target_applied = target.matches(&current);
+            crate::boundary_sync::record_checkout_movement(&requested_path, Default::default());
             record_workspace_destination(
                 &entry.native_repository_path,
                 &workspace_name,
@@ -634,7 +635,12 @@ async fn rebuild_checkout(
         })?;
     sync_directory(&staging).map_err(|error| format!("failed to sync staged checkout: {error}"))?;
     failpoint("after_checkout_staging");
-    publish_directory_noclobber(&staging, destination)?;
+    if let Err(error) = publish_directory_noclobber(&staging, destination) {
+        if owned_directory_matches(destination, owner).unwrap_or(false) {
+            crate::boundary_sync::relocate_checkout(&staging, destination);
+        }
+        return Err(error);
+    }
     failpoint("after_final_publication");
     if !owned_directory_matches(destination, owner)? {
         return Err(
@@ -642,6 +648,7 @@ async fn rebuild_checkout(
                 .to_owned(),
         );
     }
+    crate::boundary_sync::relocate_checkout(&staging, destination);
     record_workspace_destination(&repository_path, workspace_name, destination)?;
     Ok(())
 }

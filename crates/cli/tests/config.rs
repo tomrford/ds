@@ -19,9 +19,11 @@ fn devspace_config_path_get_and_set_use_the_machine_config() {
         store.config_path().display().to_string()
     );
 
-    let initial = ds(temp.path(), &jj_config, &["config", "get", "git-shim"]);
-    assert!(initial.status.success(), "{}", stderr(&initial));
-    assert_eq!(stdout(&initial), "false\n");
+    for key in ["git-shim", "context.auto-sync"] {
+        let initial = ds(temp.path(), &jj_config, &["config", "get", key]);
+        assert!(initial.status.success(), "{}", stderr(&initial));
+        assert_eq!(stdout(&initial), "false\n");
+    }
 
     let enabled = ds(
         temp.path(),
@@ -32,8 +34,22 @@ fn devspace_config_path_get_and_set_use_the_machine_config() {
     assert!(stdout(&enabled).is_empty());
     assert!(stderr(&enabled).is_empty());
 
+    let context_enabled = ds(
+        temp.path(),
+        &jj_config,
+        &["config", "set", "context.auto-sync", "true"],
+    );
+    assert!(
+        context_enabled.status.success(),
+        "{}",
+        stderr(&context_enabled)
+    );
+    assert!(stdout(&context_enabled).is_empty());
+    assert!(stderr(&context_enabled).is_empty());
+
     let config = store.load_config().unwrap();
     assert!(config.git_shim());
+    assert!(config.context_auto_sync());
     assert_eq!(config.base_url(), "https://worker.example.test");
 }
 
@@ -92,7 +108,8 @@ fn jj_config_is_available_only_through_the_jj_escape_hatch() {
     let nested_help = ds(temp.path(), &jj_config, &["help", "config", "set"]);
     assert!(nested_help.status.success(), "{}", stderr(&nested_help));
     assert!(stdout(&nested_help).contains("Set a Devspace config value"));
-    assert!(stdout(&nested_help).contains("possible values: git-shim"));
+    assert!(stdout(&nested_help).contains("git-shim"));
+    assert!(stdout(&nested_help).contains("context.auto-sync"));
     assert!(!stdout(&nested_help).contains("--user"));
 
     let jj_help = ds(temp.path(), &jj_config, &["jj", "config", "--help"]);

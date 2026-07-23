@@ -37,6 +37,8 @@ use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
 use jj_lib::file_util::persist_temp_file;
+use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 
 use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
 use git::{Git, ResolveSpec};
@@ -44,6 +46,25 @@ use manifest::{GitLockEntry, LockEntry, LockMode, Lockfile};
 use store::Store;
 
 pub const PROJECT_DIR: &str = ".repos";
+pub(crate) const ALIASES_NOT_IGNORED_WARNING: &str = ".repos/ aliases are not ignored; absolute cache symlinks may be committed (add `.repos/*` and `!.repos/.lock` to .gitignore)";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SyncMessageKind {
+    Output,
+    Diagnostic,
+    Warning,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SyncMessage {
+    pub kind: SyncMessageKind,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SyncReport {
+    pub warned: bool,
+}
 
 #[derive(clap::Args)]
 pub(crate) struct ContextArgs {
@@ -118,6 +139,24 @@ pub(crate) async fn run_context(
     } else {
         Ok(())
     }
+}
+
+/// Materialize the context lockfile discovered from `cwd` without changing
+/// process state. Messages are emitted as each entry completes so callers can
+/// choose their destination without capturing a child process's output.
+pub(crate) fn sync_at(
+    cwd: &Path,
+    emit: &mut dyn FnMut(SyncMessage) -> Result<()>,
+) -> Result<SyncReport> {
+    App::from_dir(cwd.to_owned())?.sync_with(emit, false)
+}
+
+pub(crate) fn clear_at(cwd: &Path) -> Result<Vec<SyncMessage>> {
+    App::from_dir(cwd.to_owned())?.clear()
+}
+
+pub(crate) fn aliases_not_ignored_at(cwd: &Path) -> Result<bool> {
+    App::from_dir(cwd.to_owned())?.aliases_not_ignored()
 }
 
 impl App {
@@ -209,27 +248,48 @@ struct ProjectRoot {
 }
 
 impl ProjectRoot {
-    fn discover(start: &Path) -> Option<Self> {
-        for ancestor in start.ancestors() {
-            let dir = ancestor.join(PROJECT_DIR);
-            let lock_path = dir.join(".lock");
-            if lock_path.is_file() {
-                return Some(Self { dir, lock_path });
-            }
+    fn at(cwd: &Path) -> Option<Self> {
+        let dir = cwd.join(PROJECT_DIR);
+        if !fs::symlink_metadata(&dir).is_ok_and(|metadata| metadata.is_dir()) {
+            return None;
         }
-        None
+        let lock_path = dir.join(".lock");
+        fs::symlink_metadata(&lock_path)
+            .is_ok_and(|metadata| metadata.is_file())
+            .then_some(Self { dir, lock_path })
+    }
+
+    fn discover(start: &Path) -> Option<Self> {
+        start.ancestors().find_map(Self::at)
     }
 
     fn create_at(cwd: &Path) -> Result<Self> {
         let dir = cwd.join(PROJECT_DIR);
-        if dir.exists() && !dir.is_dir() {
-            bail!("{} exists and is not a directory", dir.display());
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) if !metadata.is_dir() => {
+                bail!("{} exists and is not a directory", dir.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", dir.display()));
+            }
         }
-        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
 
         let lock_path = dir.join(".lock");
-        if !lock_path.exists() {
-            write_atomic_str(&lock_path, "")?;
+        match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if !metadata.is_file() => {
+                bail!("{} exists and is not a regular file", lock_path.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_atomic_str(&lock_path, "")?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", lock_path.display()));
+            }
         }
         write_atomic_str(&dir.join(".gitignore"), "*\n!.lock\n")?;
         Ok(Self { dir, lock_path })
@@ -242,6 +302,10 @@ impl ProjectRoot {
     fn link_path(&self, alias: &str) -> PathBuf {
         self.dir.join(alias)
     }
+}
+
+pub(crate) fn has_project_lock(cwd: &Path) -> bool {
+    ProjectRoot::at(cwd).is_some()
 }
 
 impl App {
@@ -265,26 +329,32 @@ impl App {
     }
 
     fn warn_if_aliases_not_ignored(&self, ui: &mut Ui) -> Result<()> {
-        let Some(root) = ProjectRoot::discover(&self.cwd) else {
-            return Ok(());
-        };
-        let Ok(lockfile) = root.load_lockfile() else {
-            return Ok(());
-        };
-        if lockfile.aliases().is_empty() {
-            return Ok(());
-        }
-        let Some(worktree) = root.dir.parent() else {
-            return Ok(());
-        };
-        let path = root.link_path(".devspace-ignore-probe");
-        if matches!(path_is_ignored(worktree, &path), Ok(false)) {
-            writeln!(
-                ui.warning_default(),
-                ".repos/ aliases are not ignored; absolute cache symlinks may be committed (add `.repos/*` and `!.repos/.lock` to .gitignore)"
-            )?;
+        if self.aliases_not_ignored()? {
+            writeln!(ui.warning_default(), "{ALIASES_NOT_IGNORED_WARNING}")?;
         }
         Ok(())
+    }
+
+    fn aliases_not_ignored(&self) -> Result<bool> {
+        let Some(root) = ProjectRoot::discover(&self.cwd) else {
+            return Ok(false);
+        };
+        let Ok(lockfile) = root.load_lockfile() else {
+            return Ok(false);
+        };
+        let aliases = lockfile.aliases();
+        if aliases.is_empty() {
+            return Ok(false);
+        }
+        let Some(worktree) = root.dir.parent() else {
+            return Ok(false);
+        };
+        Ok(aliases.into_iter().any(|alias| {
+            matches!(
+                path_is_ignored(worktree, &root.link_path(&alias)),
+                Ok(false)
+            )
+        }))
     }
 
     fn required_root(&self) -> Result<ProjectRoot> {
@@ -302,7 +372,7 @@ impl App {
     }
 
     fn init(&self, ui: &mut Ui) -> Result<bool> {
-        let existed = self.cwd.join(PROJECT_DIR).join(".lock").is_file();
+        let existed = ProjectRoot::at(&self.cwd).is_some();
         let root = ProjectRoot::create_at(&self.cwd)?;
         let store = self.prepared_store()?;
         let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
@@ -396,6 +466,25 @@ impl App {
     }
 
     fn sync(&self, ui: &mut Ui) -> Result<bool> {
+        let report = self.sync_with(
+            &mut |message| {
+                match message.kind {
+                    SyncMessageKind::Output => writeln!(ui.stdout(), "{}", message.text)?,
+                    SyncMessageKind::Diagnostic => writeln!(ui.status(), "{}", message.text)?,
+                    SyncMessageKind::Warning => writeln!(ui.warning_default(), "{}", message.text)?,
+                }
+                Ok(())
+            },
+            true,
+        )?;
+        Ok(report.warned)
+    }
+
+    fn sync_with(
+        &self,
+        emit: &mut dyn FnMut(SyncMessage) -> Result<()>,
+        prune_leftovers: bool,
+    ) -> Result<SyncReport> {
         let root = self.required_root()?;
         let store = self.prepared_store()?;
         let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
@@ -408,10 +497,12 @@ impl App {
             let entry = match lockfile.get(&alias) {
                 Some(LockEntry::Git(entry)) => entry.clone(),
                 Some(LockEntry::Foreign(_)) => {
-                    writeln!(
-                        ui.status(),
-                        "note: skipped {alias}: source-bearing entry or unsupported backend"
-                    )?;
+                    emit(SyncMessage {
+                        kind: SyncMessageKind::Diagnostic,
+                        text: format!(
+                            "note: skipped {alias}: source-bearing entry or unsupported backend"
+                        ),
+                    })?;
                     continue;
                 }
                 None => continue,
@@ -422,38 +513,94 @@ impl App {
                         if realized != entry {
                             dirty = true;
                         }
-                        writeln!(
-                            ui.stdout(),
-                            "synced {} -> {}",
-                            realized.alias,
-                            snapshot.display()
-                        )?;
+                        emit(SyncMessage {
+                            kind: SyncMessageKind::Output,
+                            text: format!("synced {} -> {}", realized.alias, snapshot.display()),
+                        })?;
                     }
                     Err(error) => {
-                        warn(
-                            ui,
-                            &mut warned,
-                            format!("failed to sync {alias}: {error:#}"),
-                        )?;
+                        warned = true;
+                        emit(SyncMessage {
+                            kind: SyncMessageKind::Warning,
+                            text: redact_url_userinfo(&format!(
+                                "failed to sync {alias}: {error:#}"
+                            )),
+                        })?;
                     }
                 },
                 Err(error) => {
-                    warn(
-                        ui,
-                        &mut warned,
-                        format!("failed to sync {alias}: {error:#}"),
-                    )?;
+                    warned = true;
+                    emit(SyncMessage {
+                        kind: SyncMessageKind::Warning,
+                        text: redact_url_userinfo(&format!("failed to sync {alias}: {error:#}")),
+                    })?;
                 }
             }
         }
 
         let keep: BTreeSet<String> = lockfile.aliases().into_iter().collect();
-        self.prune_leftover_links(ui, &root, &keep)?;
+        if prune_leftovers {
+            self.prune_leftover_links(&root, &keep, emit)?;
+        }
         if dirty {
             lockfile.write(&root.lock_path)?;
         }
         store.refresh_root(&self.git, &root.lock_path)?;
-        Ok(warned)
+        Ok(SyncReport { warned })
+    }
+
+    fn clear(&self) -> Result<Vec<SyncMessage>> {
+        let Some(root) = ProjectRoot::at(&self.cwd) else {
+            return Ok(Vec::new());
+        };
+        let store = self.prepared_store()?;
+        let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
+        let lockfile = root.load_lockfile()?;
+        let mut messages = Vec::new();
+
+        for entry in lockfile.entries() {
+            let LockEntry::Git(entry) = entry else {
+                continue;
+            };
+            let path = root.link_path(&entry.alias);
+            if !store::symlink_metadata_if_exists(&path)?
+                .is_some_and(|metadata| metadata.file_type().is_symlink())
+            {
+                continue;
+            }
+            let Some(commit) = entry.commit.as_deref() else {
+                messages.push(SyncMessage {
+                    kind: SyncMessageKind::Warning,
+                    text: format!(
+                        "left {} unchanged before working-copy movement because lock entry {} has no commit; context state may need manual repair",
+                        path.display(),
+                        entry.alias
+                    ),
+                });
+                continue;
+            };
+            let expected =
+                store.snapshot_path(&self.git, &entry.url, commit, entry.subdir.as_deref())?;
+            let actual =
+                fs::read_link(&path).with_context(|| format!("read link {}", path.display()))?;
+            if actual != expected {
+                messages.push(SyncMessage {
+                    kind: SyncMessageKind::Warning,
+                    text: format!(
+                        "left {} unchanged before working-copy movement because its target is not the snapshot recorded by `.repos/.lock`",
+                        path.display()
+                    ),
+                });
+                continue;
+            }
+            store::remove_managed_symlink(&path)?;
+            messages.push(SyncMessage {
+                kind: SyncMessageKind::Output,
+                text: format!("removed {}", path.display()),
+            });
+        }
+
+        Ok(messages)
     }
 
     fn update(&self, ui: &mut Ui, aliases: &[String]) -> Result<bool> {
@@ -668,9 +815,9 @@ impl App {
     /// Remove managed symlinks whose alias is no longer in the lockfile.
     fn prune_leftover_links(
         &self,
-        ui: &mut Ui,
         root: &ProjectRoot,
         keep: &BTreeSet<String>,
+        emit: &mut dyn FnMut(SyncMessage) -> Result<()>,
     ) -> Result<()> {
         for path in store::read_dir_paths(&root.dir)? {
             let Some(name) = path.file_name().and_then(OsStr::to_str) else {
@@ -683,7 +830,10 @@ impl App {
                 .is_some_and(|metadata| metadata.file_type().is_symlink())
             {
                 store::remove_managed_symlink(&path)?;
-                writeln!(ui.stdout(), "removed {}", path.display())?;
+                emit(SyncMessage {
+                    kind: SyncMessageKind::Output,
+                    text: format!("removed {}", path.display()),
+                })?;
             }
         }
         Ok(())
@@ -713,8 +863,23 @@ fn path_is_ignored(worktree: &Path, path: &Path) -> Result<bool> {
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => output.check().map(|_| false),
+        _ => path_is_ignored_without_git(worktree, relative),
     }
+}
+
+fn path_is_ignored_without_git(worktree: &Path, relative: &Path) -> Result<bool> {
+    let mut ignores = GitIgnoreFile::empty();
+    let root_ignore = worktree.join(".gitignore");
+    if root_ignore.is_file() {
+        ignores = ignores.chain_with_file(RepoPath::root(), root_ignore)?;
+    }
+    let context_ignore = worktree.join(PROJECT_DIR).join(".gitignore");
+    if context_ignore.is_file() {
+        let context_path = RepoPathBuf::from_internal_string(PROJECT_DIR.to_owned())?;
+        ignores = ignores.chain_with_file(&context_path, context_ignore)?;
+    }
+    let relative = RepoPathBuf::from_relative_path(relative)?;
+    Ok(ignores.matches_file(&relative))
 }
 
 // ─── shared helpers ───────────────────────────────────────────────────────────
@@ -837,7 +1002,7 @@ pub(crate) fn run_command(
     })
 }
 
-fn redact_url_userinfo(value: &str) -> String {
+pub(crate) fn redact_url_userinfo(value: &str) -> String {
     let mut redacted = value.to_owned();
     let mut search_from = 0;
     while let Some(relative_scheme_end) = redacted[search_from..].find("://") {

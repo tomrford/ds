@@ -117,6 +117,7 @@ async fn run_repo(
     match args.command {
         RepoCommand::New { name } => create_empty_repository(ui, command, name).await,
         RepoCommand::Add { git_url, name } => {
+            crate::boundary_sync::suppress();
             let imported = import_git_repository(ui, command, git_url, name).await?;
             imported.write_summary(ui)
         }

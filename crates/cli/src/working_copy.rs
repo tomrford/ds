@@ -148,6 +148,8 @@ impl WorkingCopy for DevspaceWorkingCopy {
         Ok(Box::new(LockedDevspaceWorkingCopy {
             inner: self.inner.start_mutation().await?,
             working_copy_path: self.working_copy_path.clone(),
+            checkout_tree_moved: false,
+            clear_messages: Vec::new(),
         }))
     }
 }
@@ -155,6 +157,37 @@ impl WorkingCopy for DevspaceWorkingCopy {
 struct LockedDevspaceWorkingCopy {
     inner: Box<dyn LockedWorkingCopy>,
     working_copy_path: PathBuf,
+    checkout_tree_moved: bool,
+    clear_messages: Vec<crate::context::SyncMessage>,
+}
+
+impl LockedDevspaceWorkingCopy {
+    fn capture_context_before_tree_movement(&mut self) {
+        if !crate::boundary_sync::context_auto_sync_enabled() {
+            return;
+        }
+        match crate::context::clear_at(&self.working_copy_path) {
+            Ok(messages) => self.clear_messages.extend(messages),
+            Err(error) => self.clear_messages.push(crate::context::SyncMessage {
+                kind: crate::context::SyncMessageKind::Warning,
+                text: format!(
+                    "could not clear context before working-copy movement in {} ({error:#}); the context state may be inconsistent after movement, so rewrite or rebuild it manually",
+                    self.working_copy_path.display()
+                ),
+            }),
+        }
+    }
+
+    fn tree_will_move_to(&self, commit: &Commit) -> bool {
+        self.inner.old_tree().tree_ids_and_labels() != commit.tree().tree_ids_and_labels()
+    }
+
+    fn record_failed_tree_movement(&self) {
+        crate::boundary_sync::record_checkout_movement(
+            &self.working_copy_path,
+            self.clear_messages.clone(),
+        );
+    }
 }
 
 #[async_trait]
@@ -186,7 +219,21 @@ impl LockedWorkingCopy for LockedDevspaceWorkingCopy {
     }
 
     async fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError> {
-        self.inner.check_out(commit).await
+        let tree_moved = self.tree_will_move_to(commit);
+        if tree_moved {
+            self.capture_context_before_tree_movement();
+        }
+        let stats = match self.inner.check_out(commit).await {
+            Ok(stats) => stats,
+            Err(error) => {
+                if tree_moved {
+                    self.record_failed_tree_movement();
+                }
+                return Err(error);
+            }
+        };
+        self.checkout_tree_moved |= tree_moved;
+        Ok(stats)
     }
 
     fn rename_workspace(&mut self, new_workspace_name: WorkspaceNameBuf) {
@@ -209,17 +256,46 @@ impl LockedWorkingCopy for LockedDevspaceWorkingCopy {
         &mut self,
         new_sparse_patterns: Vec<RepoPathBuf>,
     ) -> Result<CheckoutStats, CheckoutError> {
-        self.inner.set_sparse_patterns(new_sparse_patterns).await
+        self.capture_context_before_tree_movement();
+        let stats = match self.inner.set_sparse_patterns(new_sparse_patterns).await {
+            Ok(stats) => stats,
+            Err(error) => {
+                self.record_failed_tree_movement();
+                return Err(error);
+            }
+        };
+        self.checkout_tree_moved = true;
+        Ok(stats)
     }
 
     async fn finish(
         self: Box<Self>,
         operation_id: OperationId,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
-        let inner = self.inner.finish(operation_id).await?;
+        let Self {
+            inner,
+            working_copy_path,
+            checkout_tree_moved,
+            clear_messages,
+        } = *self;
+        let inner = match inner.finish(operation_id).await {
+            Ok(inner) => inner,
+            Err(error) => {
+                if checkout_tree_moved {
+                    crate::boundary_sync::record_checkout_movement(
+                        &working_copy_path,
+                        clear_messages,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if checkout_tree_moved {
+            crate::boundary_sync::record_checkout_movement(&working_copy_path, clear_messages);
+        }
         Ok(Box::new(DevspaceWorkingCopy {
             inner,
-            working_copy_path: self.working_copy_path,
+            working_copy_path,
         }))
     }
 }

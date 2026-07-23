@@ -49,7 +49,7 @@ pub(crate) async fn init_repository(
     args: InitArgs,
 ) -> Result<(), CommandError> {
     reject_unsupported_global_options(command, "init")?;
-    crate::boundary_sync::suppress();
+    crate::boundary_sync::suppress_repository_sync();
     let mode = classify_init(command.cwd(), args)?;
     match mode {
         InitMode::Blank { requested } => init_blank(ui, command, requested).await,
@@ -131,7 +131,6 @@ pub(crate) async fn import_git_repository(
     requested_name: Option<String>,
 ) -> Result<ImportedRepository, CommandError> {
     reject_unsupported_global_options(command, "repo add")?;
-    crate::boundary_sync::suppress();
     let name = crate::repo::parse_repository_name(
         requested_name.unwrap_or_else(|| repository_name_from_url(&git_url)),
     )?;

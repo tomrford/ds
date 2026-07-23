@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -23,26 +24,30 @@ const DAEMON_RETRY_DELAYS: [Duration; 4] = [
 #[derive(Default)]
 struct BoundarySyncState {
     suppressed: bool,
+    repository_sync_suppressed: bool,
     repositories: BTreeMap<RepositoryName, PathBuf>,
     checkouts: BTreeSet<PathBuf>,
+    moved_checkouts: BTreeMap<PathBuf, Vec<crate::context::SyncMessage>>,
+    context_auto_sync: bool,
     git_shim: Option<(bool, UserSettings)>,
 }
 
-pub(crate) fn configure_git_shim(settings: &UserSettings) -> Result<(), CommandError> {
+pub(crate) fn configure_checkout_hooks(settings: &UserSettings) -> Result<(), CommandError> {
     let store = MachineStore::platform_default().map_err(|error| user_error(error.to_string()))?;
-    let enabled = match store.load_config() {
-        Ok(config) => config.git_shim(),
+    let (git_shim, context_auto_sync) = match store.load_config() {
+        Ok(config) => (config.git_shim(), config.context_auto_sync()),
         Err(MachineConfigError::Read { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            false
+            (false, false)
         }
         Err(error) => return Err(user_error(error.to_string())),
     };
-    state()
+    let mut state = state()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .git_shim = Some((enabled, settings.clone()));
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.git_shim = Some((git_shim, settings.clone()));
+    state.context_auto_sync = context_auto_sync;
     Ok(())
 }
 
@@ -52,6 +57,44 @@ pub(crate) fn record_checkout(path: &Path) {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .checkouts
         .insert(path.to_owned());
+}
+
+pub(crate) fn context_auto_sync_enabled() -> bool {
+    state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .context_auto_sync
+}
+
+pub(crate) fn record_checkout_movement(
+    path: &Path,
+    clear_messages: Vec<crate::context::SyncMessage>,
+) {
+    let mut state = state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.checkouts.insert(path.to_owned());
+    state
+        .moved_checkouts
+        .entry(path.to_owned())
+        .or_default()
+        .extend(clear_messages);
+}
+
+pub(crate) fn relocate_checkout(from: &Path, to: &Path) {
+    let mut state = state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.checkouts.remove(from) {
+        state.checkouts.insert(to.to_owned());
+    }
+    if let Some(clear_messages) = state.moved_checkouts.remove(from) {
+        state
+            .moved_checkouts
+            .entry(to.to_owned())
+            .or_default()
+            .extend(clear_messages);
+    }
 }
 
 fn state() -> &'static Mutex<BoundarySyncState> {
@@ -93,21 +136,50 @@ pub(crate) fn suppress() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     state.suppressed = true;
     state.repositories.clear();
+    state.checkouts.clear();
+    state.moved_checkouts.clear();
 }
 
-pub(crate) fn spawn_recorded() {
-    let (suppressed, repositories, checkouts, git_shim) = {
+pub(crate) fn suppress_repository_sync() {
+    let mut state = state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.repository_sync_suppressed = true;
+    state.repositories.clear();
+}
+
+pub(crate) fn spawn_recorded(command_succeeded: bool) {
+    let (
+        suppressed,
+        repository_sync_suppressed,
+        repositories,
+        checkouts,
+        moved_checkouts,
+        context_auto_sync,
+        git_shim,
+    ) = {
         let mut state = state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             state.suppressed,
+            state.repository_sync_suppressed,
             std::mem::take(&mut state.repositories),
             std::mem::take(&mut state.checkouts),
+            std::mem::take(&mut state.moved_checkouts),
+            state.context_auto_sync,
             state.git_shim.take(),
         )
     };
     if suppressed {
+        return;
+    }
+    if context_auto_sync {
+        for (checkout, clear_messages) in moved_checkouts {
+            auto_sync_context(&checkout, clear_messages);
+        }
+    }
+    if !command_succeeded {
         return;
     }
     if let Some((true, settings)) = git_shim {
@@ -115,7 +187,9 @@ pub(crate) fn spawn_recorded() {
             crate::git_shim::ensure(&checkout, &settings);
         }
     }
-    if std::env::var_os(BOUNDARY_SYNC_ENV).is_some_and(|value| value == "0") {
+    if repository_sync_suppressed
+        || std::env::var_os(BOUNDARY_SYNC_ENV).is_some_and(|value| value == "0")
+    {
         return;
     }
     let Ok(executable) = std::env::current_exe() else {
@@ -141,6 +215,72 @@ pub(crate) fn spawn_recorded() {
         }
         spawn_one_shot(&executable, &name, &repository_directory);
     }
+}
+
+fn auto_sync_context(checkout_root: &Path, clear_messages: Vec<crate::context::SyncMessage>) {
+    let stderr = io::stderr();
+    let mut stderr = stderr.lock();
+    for message in clear_messages {
+        write_context_message(&mut stderr, message);
+    }
+    if !crate::context::has_project_lock(checkout_root) {
+        return;
+    }
+    let result = {
+        let mut emit = |message| {
+            write_context_message(&mut stderr, message);
+            Ok(())
+        };
+        crate::context::sync_at(checkout_root, &mut emit)
+    };
+    match result {
+        Ok(report) => {
+            match crate::context::aliases_not_ignored_at(checkout_root) {
+                Ok(true) => {
+                    let _ = writeln!(
+                        stderr,
+                        "Warning: {}",
+                        crate::context::ALIASES_NOT_IGNORED_WARNING
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let error = crate::context::redact_url_userinfo(&format!("{error:#}"));
+                    let _ = writeln!(
+                        stderr,
+                        "Warning: could not check context ignore policy in {} after working-copy movement ({error})",
+                        checkout_root.display()
+                    );
+                }
+            }
+            if report.warned {
+                let _ = writeln!(
+                    stderr,
+                    "Warning: `ds context sync` completed with warnings in {} after working-copy movement; run it manually to retry",
+                    checkout_root.display()
+                );
+            }
+        }
+        Err(error) => {
+            let error = crate::context::redact_url_userinfo(&format!("{error:#}"));
+            let _ = writeln!(
+                stderr,
+                "Warning: could not sync context in {} after working-copy movement ({error}); the context state may be inconsistent, so rewrite or rebuild it manually",
+                checkout_root.display()
+            );
+        }
+    }
+}
+
+fn write_context_message(output: &mut impl Write, message: crate::context::SyncMessage) {
+    let prefix = match message.kind {
+        crate::context::SyncMessageKind::Warning => "context auto-sync: warning: ",
+        crate::context::SyncMessageKind::Output | crate::context::SyncMessageKind::Diagnostic => {
+            "context auto-sync: "
+        }
+    };
+    let text = crate::context::redact_url_userinfo(&message.text);
+    let _ = writeln!(output, "{prefix}{text}");
 }
 
 fn spawn_daemon(executable: &Path, machine_store_root: &Path) {

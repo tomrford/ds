@@ -79,9 +79,7 @@ pub fn run() -> ExitCode {
         .add_dispatch_hook(guard_shadowed_jj_commands)
         .run()
         .into();
-    if exit_code == ExitCode::SUCCESS {
-        boundary_sync::spawn_recorded();
-    }
+    boundary_sync::spawn_recorded(exit_code == ExitCode::SUCCESS);
     exit_code
 }
 
@@ -250,7 +248,7 @@ async fn restrict_bare_repository_commands(
     stock_dispatch: jj_cli::cli_util::BoxedAsyncCliDispatch<'_>,
 ) -> Result<(), CommandError> {
     if !is_jj_config_request() && command.matches().subcommand_name() != Some("doctor") {
-        crate::boundary_sync::configure_git_shim(command.settings())?;
+        crate::boundary_sync::configure_checkout_hooks(command.settings())?;
     }
     // Daemon and sync plumbing are workspace-less. `sync run --repository-name`
     // resolves its value through the machine catalog.

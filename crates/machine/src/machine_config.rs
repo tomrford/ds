@@ -1,6 +1,6 @@
-use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,7 @@ pub struct MachineConfig {
     machine_name: Option<String>,
     shared_secret: SharedSecret,
     git_shim: bool,
+    context_auto_sync: bool,
 }
 
 impl MachineConfig {
@@ -73,6 +74,7 @@ impl MachineConfig {
             machine_name: None,
             shared_secret,
             git_shim: false,
+            context_auto_sync: false,
         })
     }
 
@@ -88,6 +90,11 @@ impl MachineConfig {
 
     pub fn with_git_shim(mut self, enabled: bool) -> Self {
         self.git_shim = enabled;
+        self
+    }
+
+    pub fn with_context_auto_sync(mut self, enabled: bool) -> Self {
+        self.context_auto_sync = enabled;
         self
     }
 
@@ -110,12 +117,30 @@ impl MachineConfig {
     pub fn git_shim(&self) -> bool {
         self.git_shim
     }
+
+    pub fn context_auto_sync(&self) -> bool {
+        self.context_auto_sync
+    }
 }
 
 impl MachineStore {
     pub fn write_config(&self, config: &MachineConfig) -> Result<(), MachineConfigError> {
+        let _lock = self.lock_config()?;
+        self.write_config_unlocked(config)
+    }
+
+    pub fn update_config(
+        &self,
+        update: impl FnOnce(MachineConfig) -> MachineConfig,
+    ) -> Result<(), MachineConfigError> {
+        let _lock = self.lock_config()?;
+        let config = update(self.load_config()?);
+        self.write_config_unlocked(&config)
+    }
+
+    fn write_config_unlocked(&self, config: &MachineConfig) -> Result<(), MachineConfigError> {
         let path = self.config_path();
-        let directory = path.parent().expect("machine config path has a parent");
+        let directory = config_directory(&path);
         fs::create_dir_all(directory).map_err(|source| MachineConfigError::CreateRoot {
             path: directory.to_owned(),
             source,
@@ -127,7 +152,52 @@ impl MachineStore {
                     source,
                 }
             })?;
-        fs::write(&path, serialized).map_err(|source| MachineConfigError::Write { path, source })
+        let mut temp = tempfile::NamedTempFile::new_in(directory).map_err(|source| {
+            MachineConfigError::Write {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        temp.write_all(serialized.as_bytes())
+            .and_then(|()| temp.as_file().sync_all())
+            .map_err(|source| MachineConfigError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        temp.persist(&path)
+            .map_err(|error| MachineConfigError::Write {
+                path: path.clone(),
+                source: error.error,
+            })?;
+        crate::sync_directory(directory).map_err(|source| MachineConfigError::SyncDirectory {
+            path: directory.to_owned(),
+            source,
+        })
+    }
+
+    fn lock_config(&self) -> Result<MachineConfigLock, MachineConfigError> {
+        let config_path = self.config_path();
+        let directory = config_directory(&config_path);
+        fs::create_dir_all(directory).map_err(|source| MachineConfigError::CreateRoot {
+            path: directory.to_owned(),
+            source,
+        })?;
+        let lock_path = config_path.with_extension("toml.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| MachineConfigError::OpenLock {
+                path: lock_path.clone(),
+                source,
+            })?;
+        file.lock().map_err(|source| MachineConfigError::Lock {
+            path: lock_path,
+            source,
+        })?;
+        Ok(MachineConfigLock { _file: file })
     }
 
     pub fn load_config(&self) -> Result<MachineConfig, MachineConfigError> {
@@ -149,8 +219,18 @@ impl MachineStore {
         if let Some(machine_name) = persisted.machine_name {
             config = config.with_machine_name(machine_name)?;
         }
-        Ok(config.with_git_shim(persisted.git_shim))
+        Ok(config
+            .with_git_shim(persisted.git_shim)
+            .with_context_auto_sync(persisted.context.auto_sync))
     }
+}
+
+struct MachineConfigLock {
+    _file: fs::File,
+}
+
+fn config_directory(path: &Path) -> &Path {
+    path.parent().expect("machine config path has a parent")
 }
 
 #[derive(Deserialize, Serialize)]
@@ -163,6 +243,15 @@ struct PersistedConfig {
     shared_secret: String,
     #[serde(default)]
     git_shim: bool,
+    #[serde(default)]
+    context: PersistedContextConfig,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedContextConfig {
+    #[serde(default, rename = "auto-sync")]
+    auto_sync: bool,
 }
 
 impl From<&MachineConfig> for PersistedConfig {
@@ -173,6 +262,9 @@ impl From<&MachineConfig> for PersistedConfig {
             machine_name: config.machine_name.clone(),
             shared_secret: config.shared_secret.0.clone(),
             git_shim: config.git_shim,
+            context: PersistedContextConfig {
+                auto_sync: config.context_auto_sync,
+            },
         }
     }
 }
@@ -227,6 +319,24 @@ pub enum MachineConfigError {
     },
     #[error("failed to write machine configuration at {path}")]
     Write {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to sync machine configuration directory at {path}")]
+    SyncDirectory {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to open machine configuration lock at {path}")]
+    OpenLock {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to lock machine configuration at {path}")]
+    Lock {
         path: PathBuf,
         #[source]
         source: io::Error,
