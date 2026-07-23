@@ -140,8 +140,8 @@ fn projection_page_json(
           }}],
           "mappings":[{{
             "remote":"origin","bookmark":"main",
-            "canonicalOid":"{mapping_oid}","publicOid":"{mapping_oid}",
-            "hiddenSetId":null
+            "canonicalOid":"{mapping_oid}","publicOid":"{public_oid}",
+            "hiddenSetId":null,"activationSequence":{next_after}
           }}],
           "nextAfter":{next_after},"through":2,"hasMore":{has_more},
           "pending":[{{
@@ -151,6 +151,7 @@ fn projection_page_json(
         }}"#,
         cursor_oid = cursor_byte.repeat(20),
         mapping_oid = mapping_byte.repeat(20),
+        public_oid = "cc".repeat(20),
         batch_id = mapping_byte.repeat(16),
         owner_machine = owner_byte.repeat(16),
     )

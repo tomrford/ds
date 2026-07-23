@@ -54,9 +54,9 @@ Malformed input returns a typed error and cannot trap the Worker.
 
 The current release build is:
 
-- `dist/kernel.wasm`: 192,676 bytes;
+- `dist/kernel.wasm`: 193,056 bytes;
 - imports: zero;
-- Worker dry-run bundle: 897.01 KiB raw, 181.92 KiB gzip.
+- Worker dry-run bundle: 904.19 KiB raw, 183.19 KiB gzip.
 
 `scripts/build-wasm.mjs` builds exactly this one module and enforces the
 200 KiB WebAssembly budget.

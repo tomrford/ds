@@ -10,9 +10,10 @@ temporary export artifacts.
 
 ## Machine projection
 
-Projection walks canonical commits parent-first. A journal mapping is a stop
-point: its public commit already defines the projection of that canonical
-lineage.
+Projection walks canonical commits parent-first. An existing pair or identity
+cursor is a stop point: its public commit already defines that canonical
+lineage. A reached identity cursor remains only a traversal seed; the machine
+does not serialize it as a pair state.
 
 For each unseeded commit the machine:
 
@@ -29,15 +30,25 @@ are produced. Signed commits on an entirely identity lineage retain their exact
 
 A rewritten commit retains the canonical author, committer, message, encoding,
 `change-id`, and foreign non-signature headers. Projection drops `gpgsig`,
-`gpgsig-sha256`, and `mergetag` because rewriting invalidates those signatures.
-It embeds no canonical-OID metadata: such metadata would disclose the existence
-of private history. The canonical/public relationship exists only in the cloud
-journal. Projection rejects conflicted canonical commits, malformed objects,
-and a proposed public tree that still contains a hidden path.
+`gpgsig-sha256`, and `mergetag` because changed tree or parent bytes invalidate
+them. It embeds no canonical-OID metadata because that would disclose the
+existence of private history.
 
-Tree rewriting is minimal and deterministic. The cache key includes the source
-tree and effective hidden-policy chain, so identical subtrees under the same
-policy reuse one public tree OID.
+Projection writes each rewritten commit directly to the object database and
+records its canonical/public pair. A seeded public commit must have a complete
+local object closure. If it is missing, push installs the cloud catalog and
+retries projection once from those exact seed bytes.
+
+Tree and commit rewriting is deterministic. The same canonical commit and
+effective hidden policy produce byte-identical public objects on every machine.
+The cache key includes the source tree and effective hidden-policy chain, so
+identical subtrees under the same policy reuse one public tree OID.
+
+This determinism pins public OIDs across machines. Any change to the rewrite
+algorithm therefore needs an explicit compatibility and rollout design.
+
+Projection rejects conflicted canonical commits, malformed objects, missing
+seed closures, and a proposed public tree that still contains a hidden path.
 
 ## Overlay lift
 
@@ -70,21 +81,33 @@ The journal stores pair-shaped projection state:
 canonicalOid  publicOid  hiddenSetId?
 ```
 
-An active remote bookmark cursor selects one pair. For identity history the
-cursor can store the one shared OID without adding a receipt row. Rewritten
-history stores the pair and the nullable 64-byte identity of the effective
-hidden set.
+An active remote bookmark cursor selects one binding. Identity history stores
+the one shared OID in an identity cursor. Pending identity pushes expose that
+OID as `identityOid`. Rewritten history stores the pair and the nullable
+64-byte identity of the effective hidden set.
 
-The receipt invariant is one-way: one canonical OID cannot map to two public
-OIDs. The Worker rejects a conflicting pair. A public OID can be reached from
-more than one canonical lineage only when fetch can resolve that lineage
-without ambiguity.
+Before mutation, the Worker checks request capacity, object durability,
+request-wide canonical bindings, hidden-set lineage, and expected cursors. It
+rejects identity-shaped pair states. The same canonical OID cannot be presented
+with conflicting public OIDs or hidden-set lineages in one request or against
+stored state.
+
+Repository history is bounded to 65,536 pair-state rows. Snapshot responses
+page activated mappings in groups of 256 under one fixed activation high-water.
+The first page also carries at most 512 cursors and pending batches. The native
+transport applies a 1 MiB JSON-response cap, validates cursor order and bounds,
+and permits at most 256 pages.
+
+The activation high-water stabilizes append-only state rows. It does not make a
+multi-page snapshot consistent with concurrent remote repointing, which deletes
+that remote's old rows. Remote generations in issue #15 remain required for
+that guarantee.
 
 Push updates use durable batches. Each batch contains:
 
 - remote and bookmark;
 - expected old public OID;
-- proposed pair state or deletion;
+- proposed pair state, identity OID, or deletion;
 - owner machine, fencing token, request hash, and idempotency key.
 
 The batch begins before the Git subprocess runs. Recovery claims the fence,
@@ -100,27 +123,34 @@ are already durable before it advances cursors.
 
 The projection suite proves:
 
-- hidden-free signed history creates no mirror objects or mapping rows;
+- signed identity history remains byte-exact;
 - hidden files and `.dsprivate` never enter public trees;
 - only affected trees and commits are rewritten;
+- rewritten commits are deterministic and unsigned;
+- invalidated signature headers and mergetags are removed while opaque header
+  order is preserved;
 - merges preserve public parent order and canonical hidden lineage;
-- repeated projection is deterministic;
 - overlay-lift preserves hidden files through public edits and deletions;
 - disclosure collisions become explicit conflicts and warnings;
 - push and fetch recover after process failure without journal drift;
-- fresh-machine recovery succeeds using cloud packs and journal state.
+- fresh-machine recovery succeeds using cloud packs and journal state;
+- identity cursors stop traversal without creating identity-shaped pair rows;
+- a settled aborted claim refreshes state without an unnecessary replay.
 
-The Worker checks all journal mutations transactionally and rejects stale
-incarnations, stale leases, missing durable commits, ambiguous mappings, and
-request-key reuse.
+The Worker checks journal mutations transactionally and rejects stale
+incarnations, stale leases, missing durable commits, identity-shaped pair
+states, conflicting bindings, ambiguous lineage, and request-key reuse. The
+native client validates snapshot page structure but relies on deterministic
+projection instead of negotiating between different machine-minted public
+objects.
 
 ## Budgets and measurements
 
 The integrated validation module and Worker dry-run currently measure:
 
-- `dist/kernel.wasm`: 192,676 bytes, zero imports;
-- Worker upload: 897.01 KiB;
-- Worker upload gzip: 181.92 KiB.
+- `dist/kernel.wasm`: 193,056 bytes, zero imports;
+- Worker upload: 904.19 KiB;
+- Worker upload gzip: 183.19 KiB.
 
 The WebAssembly build enforces a 200 KiB limit. `pnpm build` performs a Worker
 dry run only; deployment is a separate operator action.

@@ -2,6 +2,7 @@ import { GIT_OBJECT_KIND, Kernel, equalGitBytes, exactGitBuffer, gitToHex } from
 import {
   BeginProjectionGitBatchRequest,
   MAX_GIT_PROJECTION_STATES,
+  MAX_REPOSITORY_GIT_PROJECTION_HISTORY_STATES,
   MAX_REPOSITORY_GIT_PROJECTION_REFS,
   ProjectionGitFenceRequest,
   ProjectionGitObservation,
@@ -74,6 +75,7 @@ interface PendingRefSnapshotRow extends Record<string, SqlStorageValue> {
   bookmark: string;
   expected_old_oid: ArrayBuffer | null;
   proposed_public_oid: ArrayBuffer | null;
+  identity_oid: ArrayBuffer | null;
 }
 
 interface StateRow extends Record<string, SqlStorageValue> {
@@ -84,10 +86,6 @@ interface StateRow extends Record<string, SqlStorageValue> {
   public_oid: ArrayBuffer;
   hidden_set_id: ArrayBuffer | null;
   activation_seq: number;
-}
-
-interface ReceiptRow extends Record<string, SqlStorageValue> {
-  public_oid: ArrayBuffer;
 }
 
 interface RemoteRow extends Record<string, SqlStorageValue> {
@@ -111,6 +109,13 @@ interface ActiveLineageRow extends Record<string, SqlStorageValue> {
   canonical_oid: ArrayBuffer;
   public_oid: ArrayBuffer;
   hidden_set_id: ArrayBuffer | null;
+}
+
+interface CanonicalBinding {
+  canonicalOid: Uint8Array;
+  publicOid: Uint8Array;
+  hiddenSetId: Uint8Array | null;
+  identity: boolean;
 }
 
 const REPLAY_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -191,28 +196,16 @@ export class ProjectionGitStore {
     let incarnation: ArrayBuffer;
     try {
       incarnation = exactGitBuffer(decodeProjectionGitShortId(incarnationValue, "incarnation"));
-      if (typeof afterValue !== "number" || !Number.isSafeInteger(afterValue) || afterValue < 0) {
-        throw new ProjectionGitStoreError(
-          "projection cursor must be a non-negative integer",
-          400,
-          "invalid-projection-cursor",
-        );
-      }
+      this.requireSnapshotCursor(afterValue, "projection cursor");
       this.requireIncarnation(incarnation);
       const meta = this.meta();
       const through = throughValue === undefined ? meta.activation_cursor : throughValue;
-      if (
-        typeof through !== "number" ||
-        !Number.isSafeInteger(through) ||
-        through < afterValue ||
-        through > meta.activation_cursor
-      ) {
-        throw new ProjectionGitStoreError(
-          "projection high-water must be between the cursor and current activation frontier",
-          400,
-          "invalid-projection-high-water",
-        );
-      }
+      this.requireSnapshotHighWater(
+        afterValue,
+        through,
+        meta.activation_cursor,
+        "projection high-water",
+      );
       const cursors = this.sql
         .exec<CursorRow>(
           `SELECT cursors.remote, cursors.bookmark, states.canonical_oid,
@@ -268,6 +261,7 @@ export class ProjectionGitStore {
         publicOid: gitToHex(new Uint8Array(row.public_oid)),
         hiddenSetId:
           row.hidden_set_id === null ? null : gitToHex(new Uint8Array(row.hidden_set_id)),
+        activationSequence: row.activation_seq,
       }));
       const nextAfter =
         pageRows.length === 0 ? afterValue : pageRows[pageRows.length - 1].activation_seq;
@@ -377,6 +371,18 @@ export class ProjectionGitStore {
           return { ok: true as const, pending: true, fence: previous.fence };
         }
         this.requireBeginCapacity(request);
+        for (const update of request.updates) {
+          for (const state of update.states) this.requireDurableState(state);
+          if (update.identityOid !== null) {
+            this.requireDurableCommit("identity", update.identityOid);
+          }
+        }
+        this.requireCanonicalBindings(
+          request.updates.flatMap((update) => canonicalBindings(update.states, update.identityOid)),
+          "canonical-lineage-diverged",
+        );
+        // Capacity, durability, and binding checks all precede cursor validation
+        // and the first journal mutation.
         this.requireExpectedCursors(
           request.remote,
           request.updates.map((update) => ({
@@ -384,19 +390,6 @@ export class ProjectionGitStore {
             expected: update.expectedOldOid,
           })),
         );
-        for (const update of request.updates) {
-          for (const state of update.states) this.requireDurableState(state);
-          if (update.identityOid !== null) {
-            this.requireDurableCommit("identity", update.identityOid);
-            this.requireCanonicalBinding(update.identityOid, update.identityOid);
-          }
-        }
-        for (const update of request.updates) {
-          for (const state of update.states) this.storeReceipt(state);
-          if (update.identityOid !== null) {
-            this.requireCanonicalBinding(update.identityOid, update.identityOid);
-          }
-        }
         const fence = this.nextFence(this.meta());
         this.sql.exec(
           "INSERT INTO projection_git_batches VALUES (?, ?, ?, ?, ?, ?)",
@@ -529,8 +522,12 @@ export class ProjectionGitStore {
             this.requireDurableCommit("identity", ref.identityOid, "fetch-commit-not-durable");
           }
         }
-        this.requireFetchReceiptConsistency(request);
+        this.requireFetchBindings(request);
         this.requireUnambiguousFetchLineage(request);
+        this.requireHistoryStateCapacity(
+          request.refs.reduce((count, ref) => count + ref.states.length, 0),
+          "fetch-history-state-limit",
+        );
         this.requireFetchCursorCapacity(request);
 
         const existingStateIds = new Map<string, number>();
@@ -551,9 +548,6 @@ export class ProjectionGitStore {
           existingStateIds.set(ref.bookmark, existing.state_id);
         }
 
-        for (const ref of request.refs) {
-          for (const state of ref.states) this.storeReceipt(state);
-        }
         let activation = this.meta().activation_cursor;
         for (const ref of request.refs) {
           if (ref.identityOid !== null) {
@@ -663,7 +657,7 @@ export class ProjectionGitStore {
             outcome: result.outcome,
           };
         }
-        const batch = this.requireBatch(batchId);
+        this.requireBatch(batchId);
         const fence = this.nextFence(this.meta());
         this.sql.exec(
           "UPDATE projection_git_batches SET owner_machine = ?, fence = ? WHERE batch_id = ?",
@@ -672,7 +666,7 @@ export class ProjectionGitStore {
           batchId,
         );
         this.sql.exec("INSERT OR IGNORE INTO projection_git_recovery_claims VALUES (?)", batchId);
-        return { ok: true as const, fence, previousFence: batch.fence };
+        return { ok: true as const, pending: true, fence };
       });
     } catch (error) {
       return this.handleExpected(error);
@@ -726,7 +720,8 @@ export class ProjectionGitStore {
     return this.sql
       .exec<PendingRefSnapshotRow>(
         `SELECT refs.bookmark, refs.expected_old_oid,
-                coalesce(states.public_oid, refs.identity_oid) AS proposed_public_oid
+                coalesce(states.public_oid, refs.identity_oid) AS proposed_public_oid,
+                refs.identity_oid
          FROM projection_git_batch_refs AS refs
          LEFT JOIN projection_git_states AS states ON states.state_id = refs.proposed_state_id
          WHERE refs.batch_id = ? ORDER BY refs.position`,
@@ -741,6 +736,8 @@ export class ProjectionGitStore {
           row.proposed_public_oid === null
             ? null
             : gitToHex(new Uint8Array(row.proposed_public_oid)),
+        identityOid:
+          row.identity_oid === null ? null : gitToHex(new Uint8Array(row.identity_oid)),
       }));
   }
 
@@ -771,6 +768,7 @@ export class ProjectionGitStore {
         "projection-pending-state-limit",
       );
     }
+    this.requireHistoryStateCapacity(requestedStates, "projection-history-state-limit");
     const activeCursors =
       this.sql
         .exec<{ count: number }>("SELECT count(*) AS count FROM projection_git_cursors")
@@ -797,6 +795,19 @@ export class ProjectionGitStore {
         `projection cursors exceed the ${MAX_REPOSITORY_GIT_PROJECTION_REFS}-ref repository limit`,
         429,
         "projection-ref-limit",
+      );
+    }
+  }
+
+  private requireHistoryStateCapacity(requestedStates: number, code: string) {
+    const storedStates = this.sql
+      .exec<{ count: number }>("SELECT count(*) AS count FROM projection_git_states")
+      .one().count;
+    if (storedStates + requestedStates > MAX_REPOSITORY_GIT_PROJECTION_HISTORY_STATES) {
+      throw new ProjectionGitStoreError(
+        `projection history states exceed the ${MAX_REPOSITORY_GIT_PROJECTION_HISTORY_STATES}-state repository limit`,
+        429,
+        code,
       );
     }
   }
@@ -1020,50 +1031,8 @@ export class ProjectionGitStore {
     }
   }
 
-  private storeReceipt(state: Pick<ProjectionGitState, "canonicalOid" | "publicOid">) {
-    this.requireCanonicalBinding(state.canonicalOid, state.publicOid);
-    const canonicalOid = exactGitBuffer(state.canonicalOid);
-    const existing = this.sql
-      .exec<ReceiptRow>(
-        "SELECT public_oid FROM projection_git_receipts WHERE canonical_oid = ?",
-        canonicalOid,
-      )
-      .toArray()[0];
-    if (existing !== undefined) {
-      if (!equalGitBytes(new Uint8Array(existing.public_oid), state.publicOid)) {
-        throw new ProjectionGitStoreError(
-          `canonical OID ${gitToHex(state.canonicalOid)} already maps to a different public OID`,
-          409,
-          "canonical-oid-diverged",
-        );
-      }
-      return;
-    }
-    this.sql.exec(
-      "INSERT INTO projection_git_receipts VALUES (?, ?)",
-      canonicalOid,
-      exactGitBuffer(state.publicOid),
-    );
-  }
-
   private requireCanonicalBinding(canonicalOid: Uint8Array, publicOid: Uint8Array) {
     const canonical = exactGitBuffer(canonicalOid);
-    const receipt = this.sql
-      .exec<ReceiptRow>(
-        "SELECT public_oid FROM projection_git_receipts WHERE canonical_oid = ?",
-        canonical,
-      )
-      .toArray()[0];
-    if (
-      receipt !== undefined &&
-      !equalGitBytes(new Uint8Array(receipt.public_oid), publicOid)
-    ) {
-      throw new ProjectionGitStoreError(
-        `canonical OID ${gitToHex(canonicalOid)} already maps to a different public OID`,
-        409,
-        "canonical-oid-diverged",
-      );
-    }
     if (equalGitBytes(canonicalOid, publicOid)) return;
     const identityBindings =
       this.sql
@@ -1084,6 +1053,67 @@ export class ProjectionGitStore {
         409,
         "canonical-oid-diverged",
       );
+    }
+  }
+
+  private requireCanonicalBindings(bindings: CanonicalBinding[], lineageCode: string) {
+    const requested = new Map<string, CanonicalBinding>();
+    for (const binding of bindings) {
+      const canonicalOid = gitToHex(binding.canonicalOid);
+      const prior = requested.get(canonicalOid);
+      if (prior !== undefined) {
+        if (!equalGitBytes(prior.publicOid, binding.publicOid)) {
+          throw new ProjectionGitStoreError(
+            `canonical OID ${canonicalOid} maps to conflicting public OIDs in one request`,
+            409,
+            "canonical-oid-diverged",
+          );
+        }
+        if (
+          prior.identity !== binding.identity ||
+          compareNullableGitOids(prior.hiddenSetId, binding.hiddenSetId) !== 0
+        ) {
+          throw new ProjectionGitStoreError(
+            `canonical OID ${canonicalOid} has conflicting hidden-set lineage in one request`,
+            409,
+            lineageCode,
+          );
+        }
+        continue;
+      }
+      requested.set(canonicalOid, binding);
+    }
+
+    for (const [canonicalOid, binding] of requested) {
+      this.requireCanonicalBinding(binding.canonicalOid, binding.publicOid);
+      const stored = this.sql
+        .exec<ActiveLineageRow>(
+          `SELECT canonical_oid, public_oid, hidden_set_id
+           FROM projection_git_states WHERE canonical_oid = ?`,
+          exactGitBuffer(binding.canonicalOid),
+        )
+        .toArray();
+      for (const state of stored) {
+        if (
+          binding.identity ||
+          !equalGitBytes(new Uint8Array(state.public_oid), binding.publicOid)
+        ) {
+          throw new ProjectionGitStoreError(
+            `canonical OID ${canonicalOid} already has a different canonical binding`,
+            409,
+            "canonical-oid-diverged",
+          );
+        }
+        const hiddenSetId =
+          state.hidden_set_id === null ? null : new Uint8Array(state.hidden_set_id);
+        if (compareNullableGitOids(hiddenSetId, binding.hiddenSetId) !== 0) {
+          throw new ProjectionGitStoreError(
+            `canonical OID ${canonicalOid} conflicts with stored hidden-set lineage`,
+            409,
+            lineageCode,
+          );
+        }
+      }
     }
   }
 
@@ -1253,30 +1283,11 @@ export class ProjectionGitStore {
     );
   }
 
-  private requireFetchReceiptConsistency(request: RecordGitFetchRequest) {
-    const requested = new Map<string, Uint8Array>();
-    for (const ref of request.refs) {
-      const bindings = ref.states.map((state) => ({
-        canonicalOid: state.canonicalOid,
-        publicOid: state.publicOid,
-      }));
-      if (ref.identityOid !== null) {
-        bindings.push({ canonicalOid: ref.identityOid, publicOid: ref.identityOid });
-      }
-      for (const state of bindings) {
-        const key = gitToHex(state.canonicalOid);
-        const prior = requested.get(key);
-        if (prior !== undefined && !equalGitBytes(prior, state.publicOid)) {
-          throw new ProjectionGitStoreError(
-            `canonical OID ${key} maps to conflicting public OIDs in the fetch request`,
-            409,
-            "canonical-oid-diverged",
-          );
-        }
-        this.requireCanonicalBinding(state.canonicalOid, state.publicOid);
-        requested.set(key, state.publicOid);
-      }
-    }
+  private requireFetchBindings(request: RecordGitFetchRequest) {
+    this.requireCanonicalBindings(
+      request.refs.flatMap((ref) => canonicalBindings(ref.states, ref.identityOid)),
+      "fetch-lineage-ambiguous",
+    );
   }
 
   private requireUnambiguousFetchLineage(request: RecordGitFetchRequest) {
@@ -1395,6 +1406,36 @@ export class ProjectionGitStore {
       .toArray()[0];
   }
 
+  private requireSnapshotCursor(value: unknown, label: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      throw new ProjectionGitStoreError(
+        `${label} must be a non-negative integer`,
+        400,
+        "invalid-projection-cursor",
+      );
+    }
+  }
+
+  private requireSnapshotHighWater(
+    after: number,
+    through: unknown,
+    frontier: number,
+    label: string,
+  ): asserts through is number {
+    if (
+      typeof through !== "number" ||
+      !Number.isSafeInteger(through) ||
+      through < after ||
+      through > frontier
+    ) {
+      throw new ProjectionGitStoreError(
+        `${label} must be between the cursor and current frontier`,
+        400,
+        "invalid-projection-high-water",
+      );
+    }
+  }
+
   private nextFence(meta: ProjectionMetaRow): number {
     if (meta.next_fence >= Number.MAX_SAFE_INTEGER) {
       throw new Error("projection fencing token exceeds the safe integer range");
@@ -1417,6 +1458,27 @@ export class ProjectionGitStore {
     if (error instanceof ProjectionGitStoreError) return failure(error, error.status);
     throw error;
   }
+}
+
+function canonicalBindings(
+  states: ProjectionGitState[],
+  identityOid: Uint8Array | null,
+): CanonicalBinding[] {
+  const bindings = states.map((state) => ({
+    canonicalOid: state.canonicalOid,
+    publicOid: state.publicOid,
+    hiddenSetId: state.hiddenSetId,
+    identity: false,
+  }));
+  if (identityOid !== null) {
+    bindings.push({
+      canonicalOid: identityOid,
+      publicOid: identityOid,
+      hiddenSetId: null,
+      identity: true,
+    });
+  }
+  return bindings;
 }
 
 function sameLineage(

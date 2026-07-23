@@ -118,7 +118,7 @@ describe("Git projection journal v2", () => {
         { incarnation: repositoryIncarnation, machineId: recoveryMachine },
         recoveryMachine,
       ),
-    ).toEqual({ status: 200, body: { fence: 2, previousFence: 1 } });
+    ).toEqual({ status: 200, body: { pending: true, fence: 2 } });
     expect(await projectionReplay(repository, batchId)).toMatchObject({
       status: 200,
       body: { ownerMachine: recoveryMachine, fence: 2, updates: request.updates },
@@ -305,6 +305,12 @@ describe("Git projection journal v2", () => {
         ),
       ),
     ).toMatchObject({ status: 200, body: { pending: true } });
+    expect(await projectionSnapshot(repository)).toMatchObject({
+      status: 200,
+      body: {
+        pending: [{ refs: [{ bookmark: "a", proposedPublicOid: publicOne }] }],
+      },
+    });
     expect(
       await projectionRequest(
         repository,
@@ -466,13 +472,96 @@ describe("Git projection journal v2", () => {
       },
     });
     await runInDurableObject(await repositoryGitStub(repository), (_instance, state) => {
-      for (const table of ["projection_git_states", "projection_git_receipts"]) {
-        expect(
-          state.storage.sql.exec<{ count: number }>(`SELECT count(*) AS count FROM ${table}`).one()
-            .count,
-          table,
-        ).toBe(0);
-      }
+      expect(
+        state.storage.sql
+          .exec<{ count: number }>("SELECT count(*) AS count FROM projection_git_states")
+          .one().count,
+      ).toBe(0);
+    });
+  });
+
+  it("keeps an identity cursor as a stop while clean and hidden children advance", async () => {
+    const repository = "git-journal-identity-children";
+    const [identityOid, cleanOid, hiddenCanonical, hiddenPublic] =
+      await installJournalFixture(repository);
+    const repositoryIncarnation = await incarnation(repository);
+    const seedBatch = "2a".repeat(16);
+    expect(
+      await projectionRequest(repository, "pushes", {
+        incarnation: repositoryIncarnation,
+        batchId: seedBatch,
+        machineId: defaultMachine,
+        remote: "origin",
+        updates: [
+          {
+            bookmark: "seed",
+            expectedOldOid: null,
+            states: [],
+            proposedState: null,
+            identityOid,
+          },
+        ],
+      }),
+    ).toMatchObject({ status: 200, body: { fence: 1 } });
+    expect(
+      await recover(repository, seedBatch, repositoryIncarnation, defaultMachine, 1, [
+        { bookmark: "seed", liveOid: identityOid },
+      ]),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+
+    const childBatch = "2b".repeat(16);
+    expect(
+      await projectionRequest(repository, "pushes", {
+        incarnation: repositoryIncarnation,
+        batchId: childBatch,
+        machineId: defaultMachine,
+        remote: "origin",
+        updates: [
+          {
+            bookmark: "clean",
+            expectedOldOid: null,
+            states: [],
+            proposedState: null,
+            identityOid: cleanOid,
+          },
+          projectionUpdate("hidden", null, hiddenCanonical, hiddenPublic, "44".repeat(64)),
+        ],
+      }),
+    ).toMatchObject({ status: 200, body: { fence: 2 } });
+    const pendingSnapshot = await projectionSnapshot(repository);
+    expect(pendingSnapshot).toMatchObject({
+      status: 200,
+      body: {
+        pending: [{ refs: expect.any(Array) }],
+      },
+    });
+    expect(
+      (pendingSnapshot.body as { pending: Array<{ refs: unknown[] }> }).pending[0].refs,
+    ).toEqual(expect.arrayContaining([expect.objectContaining({ bookmark: "clean", identityOid: cleanOid })]));
+    expect(
+      await recover(repository, childBatch, repositoryIncarnation, defaultMachine, 2, [
+        { bookmark: "clean", liveOid: cleanOid },
+        { bookmark: "hidden", liveOid: hiddenPublic },
+      ]),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+    expect(await projectionSnapshot(repository)).toMatchObject({
+      status: 200,
+      body: {
+        mappings: [{ canonicalOid: hiddenCanonical, publicOid: hiddenPublic }],
+        pending: [],
+        cursors: expect.arrayContaining([
+          expect.objectContaining({ bookmark: "seed", canonicalOid: identityOid, publicOid: identityOid }),
+          expect.objectContaining({ bookmark: "clean", canonicalOid: cleanOid, publicOid: cleanOid }),
+          expect.objectContaining({ bookmark: "hidden", canonicalOid: hiddenCanonical, publicOid: hiddenPublic }),
+        ]),
+      },
+    });
+    await runInDurableObject(await repositoryGitStub(repository), (_instance, state) => {
+      expect(
+        state.storage.sql
+          .exec<{ count: number }>("SELECT count(*) AS count FROM projection_git_states")
+          .one().count,
+      ).toBe(1);
     });
   });
 
@@ -548,11 +637,114 @@ describe("Git projection journal v2", () => {
     ).toMatchObject({ status: 409, body: { code: "canonical-oid-diverged" } });
   });
 
-  it("keeps canonical mapping receipts immutable after an aborted batch", async () => {
-    const repository = "git-journal-receipt-immutability";
-    const [canonicalOid, publicOne, publicTwo] = await installJournalFixture(repository);
+  it("rejects identity-shaped push and fetch states without journal mutation", async () => {
+    const repository = "git-journal-identity-state-rejected";
+    const [identityOid] = await installJournalFixture(repository);
     const repositoryIncarnation = await incarnation(repository);
-    const batchId = "0d".repeat(16);
+    const state = projectionState(identityOid, identityOid);
+    expect(
+      await projectionRequest(repository, "pushes", {
+        incarnation: repositoryIncarnation,
+        batchId: "31".repeat(16),
+        machineId: defaultMachine,
+        remote: "origin",
+        updates: [
+          {
+            bookmark: "main",
+            expectedOldOid: null,
+            states: [state],
+            proposedState: 0,
+            identityOid: null,
+          },
+        ],
+      }),
+    ).toMatchObject({ status: 400, body: { code: "identity-projection-state" } });
+
+    await putRemote(repository, "origin", "/tmp/origin.git");
+    expect(
+      await projectionRequest(repository, "fetches", {
+        incarnation: repositoryIncarnation,
+        fetchId: "32".repeat(16),
+        machineId: defaultMachine,
+        remote: "origin",
+        refs: [fetchRef("main", identityOid, null, [state], 0)],
+      }),
+    ).toMatchObject({ status: 400, body: { code: "identity-projection-state" } });
+    expect(await projectionSnapshot(repository)).toMatchObject({
+      status: 200,
+      body: {
+        activationCursor: 0,
+        cursors: [],
+        mappings: [],
+        pending: [],
+      },
+    });
+  });
+
+  it("preflights request-wide identity, rewritten, and hidden-lineage bindings before mutation", async () => {
+    for (const [suffix, identityBookmark, rewrittenBookmark] of [
+      ["identity-first", "a", "b"],
+      ["rewritten-first", "b", "a"],
+    ] as const) {
+      const repository = `git-journal-request-binding-${suffix}`;
+      const [canonicalOid, publicOid, independentCanonical, independentPublic] =
+        await installJournalFixture(repository);
+      const repositoryIncarnation = await incarnation(repository);
+      expect(
+        await projectionRequest(repository, "pushes", {
+          incarnation: repositoryIncarnation,
+          batchId: (suffix === "identity-first" ? "33" : "34").repeat(16),
+          machineId: defaultMachine,
+          remote: "origin",
+          updates: [
+            projectionUpdate("independent", null, independentCanonical, independentPublic),
+            {
+              bookmark: identityBookmark,
+              expectedOldOid: null,
+              states: [],
+              proposedState: null,
+              identityOid: canonicalOid,
+            },
+            projectionUpdate(rewrittenBookmark, null, canonicalOid, publicOid),
+          ],
+        }),
+      ).toMatchObject({ status: 409, body: { code: "canonical-oid-diverged" } });
+      expect(await projectionSnapshot(repository)).toMatchObject({
+        status: 200,
+        body: { pending: [] },
+      });
+      await expectNoPairMutation(repository);
+    }
+
+    const repository = "git-journal-request-hidden-binding";
+    const [canonicalOid, publicOid, independentCanonical, independentPublic] =
+      await installJournalFixture(repository);
+    const repositoryIncarnation = await incarnation(repository);
+    expect(
+      await projectionRequest(repository, "pushes", {
+        incarnation: repositoryIncarnation,
+        batchId: "35".repeat(16),
+        machineId: defaultMachine,
+        remote: "origin",
+        updates: [
+          projectionUpdate("a", null, canonicalOid, publicOid, "11".repeat(64)),
+          projectionUpdate("b", null, canonicalOid, publicOid, "22".repeat(64)),
+          projectionUpdate("independent", null, independentCanonical, independentPublic),
+        ],
+      }),
+    ).toMatchObject({ status: 409, body: { code: "canonical-lineage-diverged" } });
+    expect(await projectionSnapshot(repository)).toMatchObject({
+      status: 200,
+      body: { pending: [] },
+    });
+    await expectNoPairMutation(repository);
+  });
+
+  it("checks hidden lineage against pending and active state", async () => {
+    const repository = "git-journal-stored-hidden-binding";
+    const [canonicalOid, publicOid] = await installJournalFixture(repository);
+    const repositoryIncarnation = await incarnation(repository);
+    const batchId = "36".repeat(16);
     expect(
       await projectionRequest(
         repository,
@@ -561,30 +753,153 @@ describe("Git projection journal v2", () => {
           repositoryIncarnation,
           batchId,
           defaultMachine,
-          projectionUpdate("a", null, canonicalOid, publicOne),
+          projectionUpdate("a", null, canonicalOid, publicOid, "11".repeat(64)),
         ),
       ),
-    ).toMatchObject({ status: 200, body: { fence: 1 } });
-    expect(
-      await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
-        { bookmark: "a", liveOid: null },
-      ]),
-    ).toMatchObject({ status: 200, body: { outcome: "aborted" } });
+    ).toMatchObject({ status: 200, body: { pending: true, fence: 1 } });
     expect(
       await projectionRequest(
         repository,
         "pushes",
         projectionBatch(
           repositoryIncarnation,
-          "0e".repeat(16),
+          "37".repeat(16),
           defaultMachine,
-          projectionUpdate("b", null, canonicalOid, publicTwo),
+          projectionUpdate("b", null, canonicalOid, publicOid, "22".repeat(64)),
+        ),
+      ),
+    ).toMatchObject({ status: 409, body: { code: "canonical-lineage-diverged" } });
+    expect(
+      await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
+        { bookmark: "a", liveOid: publicOid },
+      ]),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+    expect(
+      await projectionRequest(
+        repository,
+        "pushes",
+        projectionBatch(
+          repositoryIncarnation,
+          "38".repeat(16),
+          defaultMachine,
+          projectionUpdate("b", null, canonicalOid, publicOid, "22".repeat(64)),
+        ),
+      ),
+    ).toMatchObject({ status: 409, body: { code: "canonical-lineage-diverged" } });
+    expect(await projectionSnapshot(repository)).toMatchObject({
+      status: 200,
+      body: { pending: [], cursors: [{ bookmark: "a" }] },
+    });
+  });
+
+  it("exposes pending and active identity bindings cross-bookmark", async () => {
+    const repository = "git-journal-cross-bookmark-identity";
+    const [canonicalOid, publicOid] = await installJournalFixture(repository);
+    const repositoryIncarnation = await incarnation(repository);
+    const identityBatch = "39".repeat(16);
+    const identityUpdate = {
+      bookmark: "identity",
+      expectedOldOid: null,
+      states: [],
+      proposedState: null,
+      identityOid: canonicalOid,
+    };
+    expect(
+      await projectionRequest(repository, "pushes", {
+        incarnation: repositoryIncarnation,
+        batchId: identityBatch,
+        machineId: defaultMachine,
+        remote: "origin",
+        updates: [identityUpdate],
+      }),
+    ).toMatchObject({ status: 200, body: { pending: true, fence: 1 } });
+    expect(await projectionSnapshot(repository)).toMatchObject({
+      status: 200,
+      body: {
+        pending: [
+          {
+            refs: [
+              {
+                bookmark: "identity",
+                proposedPublicOid: canonicalOid,
+                identityOid: canonicalOid,
+              },
+            ],
+          },
+        ],
+      },
+    });
+    expect(
+      await projectionRequest(
+        repository,
+        "pushes",
+        projectionBatch(
+          repositoryIncarnation,
+          "3a".repeat(16),
+          defaultMachine,
+          projectionUpdate("rewritten", null, canonicalOid, publicOid),
+        ),
+      ),
+    ).toMatchObject({ status: 409, body: { code: "canonical-oid-diverged" } });
+    expect(
+      await recover(repository, identityBatch, repositoryIncarnation, defaultMachine, 1, [
+        { bookmark: "identity", liveOid: canonicalOid },
+      ]),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+    expect(await projectionSnapshot(repository)).toMatchObject({
+      status: 200,
+      body: {
+        pending: [],
+        cursors: [{ bookmark: "identity", canonicalOid, publicOid: canonicalOid }],
+      },
+    });
+    expect(
+      await projectionRequest(
+        repository,
+        "pushes",
+        projectionBatch(
+          repositoryIncarnation,
+          "3b".repeat(16),
+          defaultMachine,
+          projectionUpdate("rewritten", null, canonicalOid, publicOid),
         ),
       ),
     ).toMatchObject({ status: 409, body: { code: "canonical-oid-diverged" } });
   });
 
-  it("clears only a repointed remote and preserves repository-wide receipts", async () => {
+  it("returns a settled aborted result when claim races with abort", async () => {
+    const repository = "git-journal-claim-abort-race";
+    const [canonicalOid, publicOid] = await installJournalFixture(repository);
+    const repositoryIncarnation = await incarnation(repository);
+    const batchId = "3c".repeat(16);
+    expect(
+      await projectionRequest(
+        repository,
+        "pushes",
+        projectionBatch(
+          repositoryIncarnation,
+          batchId,
+          defaultMachine,
+          projectionUpdate("main", null, canonicalOid, publicOid),
+        ),
+      ),
+    ).toMatchObject({ status: 200, body: { fence: 1 } });
+    expect(
+      await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
+        { bookmark: "main", liveOid: null },
+      ]),
+    ).toMatchObject({ status: 200, body: { outcome: "aborted" } });
+    expect(
+      await projectionRequest(
+        repository,
+        `pushes/${batchId}/claim`,
+        { incarnation: repositoryIncarnation, machineId: recoveryMachine },
+        recoveryMachine,
+      ),
+    ).toEqual({ status: 200, body: { pending: false, fence: 1, outcome: "aborted" } });
+  });
+
+  it("clears only a repointed remote", async () => {
     const repository = "git-journal-remote-change";
     const [canonicalOne, publicOne, canonicalTwo, publicTwo, canonicalThree, publicThree] =
       await installJournalFixture(repository);
@@ -654,17 +969,6 @@ describe("Git projection journal v2", () => {
       status: 404,
       body: { code: "projection-batch-not-found" },
     });
-    expect(
-      await projectionRequest(repository, "pushes", {
-        ...projectionBatch(
-          repositoryIncarnation,
-          "12".repeat(16),
-          defaultMachine,
-          projectionUpdate("receipt", null, canonicalOne, publicTwo),
-        ),
-        remote: "backup",
-      }),
-    ).toMatchObject({ status: 409, body: { code: "canonical-oid-diverged" } });
     expect(await listRemotes(repository)).toEqual({
       status: 200,
       body: {
@@ -681,7 +985,7 @@ describe("Git projection journal v2", () => {
     const oids = await installJournalFixture(repository);
     expect(oids.length).toBeGreaterThanOrEqual(257);
     const repositoryIncarnation = await incarnation(repository);
-    const states = oids.slice(0, 257).map((oid) => projectionState(oid, oid));
+    const states = rewrittenStates(oids, 257);
     const batchId = "13".repeat(16);
     expect(
       await projectionRequest(repository, "pushes", {
@@ -702,7 +1006,7 @@ describe("Git projection journal v2", () => {
     ).toMatchObject({ status: 200, body: { fence: 1 } });
     expect(
       await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
-        { bookmark: "main", liveOid: oids[256] },
+        { bookmark: "main", liveOid: states[256].publicOid },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
 
@@ -814,6 +1118,10 @@ async function routeRequest(
 
 async function installJournalFixture(repository: string): Promise<string[]> {
   const fixture = (fixtures as { journal: EncodedFixture }).journal;
+  return installFixture(repository, fixture);
+}
+
+async function installFixture(repository: string, fixture: EncodedFixture): Promise<string[]> {
   const manifest = decodeHex(fixture.manifest);
   const chunks = fixture.chunks.map(decodeHex);
   expect(
@@ -842,6 +1150,16 @@ async function installJournalFixture(repository: string): Promise<string[]> {
   return decodeGitManifest(manifest).headCommits.map(gitToHex);
 }
 
+async function expectNoPairMutation(repository: string) {
+  await runInDurableObject(await repositoryGitStub(repository), (_instance, state) => {
+    expect(
+      state.storage.sql
+        .exec<{ count: number }>("SELECT count(*) AS count FROM projection_git_states")
+        .one().count,
+    ).toBe(0);
+  });
+}
+
 async function projectionRequest(
   repository: string,
   path: string,
@@ -861,12 +1179,18 @@ async function projectionRequest(
   return { status: response.status, body: await response.json() };
 }
 
-async function projectionSnapshot(repository: string, after = 0, through?: number) {
+async function projectionSnapshot(
+  repository: string,
+  after = 0,
+  through?: number,
+  machineId = defaultMachine,
+) {
   const highWater = through === undefined ? "" : `&through=${through}`;
   const response = await routeRequest(
     repository,
     `git/projection?incarnation=${await incarnation(repository)}&after=${after}${highWater}`,
     { method: "GET" },
+    machineId,
   );
   return { status: response.status, body: await response.json() };
 }
@@ -920,12 +1244,62 @@ async function listRemotes(repository: string) {
   return { status: response.status, body: await response.json() };
 }
 
+function packedObjectBytes(fixture: EncodedFixture, oid: string): Uint8Array {
+  const manifest = decodeGitManifest(decodeHex(fixture.manifest));
+  const data = Uint8Array.from(fixture.chunks.flatMap((chunk) => [...decodeHex(chunk)]));
+  const object = manifest.objects.find((entry) => gitToHex(entry.id) === oid);
+  if (object === undefined) throw new Error(`fixture does not contain object ${oid}`);
+  return data.slice(object.offset, object.offset + object.length);
+}
+
+async function downloadPackedObject(
+  repository: string,
+  packId: string,
+  oid: string,
+  machineId: string,
+): Promise<Uint8Array> {
+  const catalog = await routeRequest(repository, "git/packs?after=0", { method: "GET" }, machineId);
+  expect(catalog.status).toBe(200);
+  expect((await catalog.json()) as { packs: Array<{ id: string }> }).toMatchObject({
+    packs: [{ id: packId }],
+  });
+  const manifestResponse = await routeRequest(
+    repository,
+    `git/packs/${packId}/manifest`,
+    { method: "GET" },
+    machineId,
+  );
+  expect(manifestResponse.status).toBe(200);
+  const manifest = decodeGitManifest(new Uint8Array(await manifestResponse.arrayBuffer()));
+  const chunks: Uint8Array[] = [];
+  for (const [position] of manifest.chunks.entries()) {
+    const response = await routeRequest(
+      repository,
+      `git/packs/${packId}/chunks/${position}`,
+      { method: "GET" },
+      machineId,
+    );
+    expect(response.status).toBe(200);
+    chunks.push(new Uint8Array(await response.arrayBuffer()));
+  }
+  const data = Uint8Array.from(chunks.flatMap((chunk) => [...chunk]));
+  const object = manifest.objects.find((entry) => gitToHex(entry.id) === oid);
+  if (object === undefined) throw new Error(`downloaded pack does not contain object ${oid}`);
+  return data.slice(object.offset, object.offset + object.length);
+}
+
 function projectionState(
   canonicalOid: string,
   publicOid: string,
   hiddenSetId: string | null = null,
 ) {
   return { canonicalOid, publicOid, hiddenSetId };
+}
+
+function rewrittenStates(oids: string[], count: number) {
+  return oids.slice(0, count).map((canonicalOid, index) =>
+    projectionState(canonicalOid, oids[(index + 1) % oids.length]),
+  );
 }
 
 function projectionUpdate(

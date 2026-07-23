@@ -1,9 +1,9 @@
 # Git push
 
 `ds git push` is the only supported path from canonical Devspace history to a
-public Git remote. It projects hidden paths, uploads both sides of every
-required canonical/public pair to the cloud, and binds the Git subprocess
-result to the cloud journal.
+public Git remote. It projects hidden paths, uploads every required canonical
+and public object to the cloud, and binds the Git subprocess result to the cloud
+journal.
 
 ## Commands
 
@@ -34,13 +34,17 @@ or unjournaled deletions.
 
 One push holds the repository sync lock and performs this sequence:
 
-1. recover any pending batch that overlaps the requested remote bookmarks;
-2. read the complete projection snapshot;
-3. resolve each local bookmark to its canonical Git OID;
-4. seed projection with existing canonical/public pairs;
-5. project hidden paths parent-first;
-6. scan each complete public tree against the canonical hidden policy;
-7. upload the Git closure of every canonical and public head;
+1. read the complete projection snapshot;
+2. recover any pending batch that overlaps the requested remote bookmarks;
+3. resolve each local bookmark to its canonical Git OID and return immediately
+   if every requested cursor is already current;
+4. seed projection from active pair states, cursors, and pending identity
+   bindings;
+5. project hidden paths parent-first, installing cloud packs only if a reached
+   seed selects public bytes that are missing locally;
+6. ensure the complete canonical and public closures are local, then scan every
+   public tree against the canonical hidden policy;
+7. upload those closures;
 8. begin a durable projection batch with expected old public OIDs;
 9. invoke `git push --porcelain` with an exact force-with-lease for each ref;
 10. report the observed live OIDs to the Worker;
@@ -48,10 +52,15 @@ One push holds the repository sync lock and performs this sequence:
 12. write one native Jujutsu operation that tracks the accepted remote
     bookmarks.
 
-An identity projection sends the canonical commit itself. No public mirror or
-mapping row exists, and existing Git signature bytes remain intact. A hidden
-path or rewritten parent creates a minimal public commit in the same Git
-object database.
+An up-to-date push makes no pack-catalog, manifest, or chunk request. A
+non-no-op attempt also skips the catalog when all required closures are already
+local. One command retains its installed catalog high-water so later recovery
+or retry work downloads only new catalog entries.
+
+An identity projection sends the canonical commit itself. Its cursor is a
+projection stop point, but it does not create a pair state or public mirror.
+Existing Git signature bytes remain intact. A hidden path or rewritten parent
+creates a minimal deterministic public commit in the same Git object database.
 
 The cloud receives both canonical and public closures before the batch begins.
 This makes the batch recoverable by any client with the development credential
@@ -78,7 +87,7 @@ The subprocess receives:
 
 - the registered remote URL;
 - literal `refs/heads/<bookmark>` destinations;
-- canonical public source OIDs from the shared bare object database;
+- public source OIDs from the shared bare object database;
 - exact expected-old leases;
 - the user's Git configuration and credential helpers.
 
@@ -91,21 +100,33 @@ of waiting for interactive input.
 The remote URL is stored in the projection journal. Normal Jujutsu Git commands
 that bypass this boundary are rejected for owned Devspace repositories.
 
-## Recovery
+## Recovery and races
 
 The durable batch is written before `git push`. If the process exits after the
 remote accepted refs but before the Worker records them, the next overlapping
 push or fetch:
 
 1. claims a new recovery fence;
-2. downloads any missing cloud Git packs;
+2. checks the proposed canonical and public closures and downloads cloud packs
+   only when objects are missing;
 3. replays the exact proposed states and hidden-path scans;
 4. repeats the leased Git updates;
 5. submits the observed live OIDs;
 6. accepts or aborts the original batch.
 
 Batch IDs and request hashes make every transition idempotent. A stale recovery
-owner cannot commit after a newer fence is issued.
+owner cannot commit after a newer fence is issued. A claim that races with an
+abort returns the settled result and does not request a replay.
+
+Projection is deterministic: the same canonical commit and versioned hidden
+policy produce the same public bytes and OID on every honest machine. Concurrent
+machines therefore propose the same pair. If begin reports an overlapping push,
+the client refreshes and retries once. A stale-cursor result is retried once
+only when the refreshed snapshot changed. Other conflicts are returned
+immediately.
+
+These retries do not weaken recovery or lease checks. Remote-side divergence,
+partial multi-ref results, and stale recovery fences still fail closed.
 
 ## Credentials and diagnostics
 
@@ -124,9 +145,4 @@ The boundary deliberately excludes:
 - bypassing projection with raw `git push`;
 - force without an exact journal lease;
 - partial journal acceptance for multi-ref pushes;
-- public export of conflicted canonical commits;
-- signing newly rewritten public projection commits.
-
-Identity commits keep signatures because their exact canonical bytes are
-pushed. Signing a public commit that projection must rewrite remains the only
-open signing question.
+- public export of conflicted canonical commits.

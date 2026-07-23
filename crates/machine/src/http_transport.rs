@@ -18,6 +18,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_JSON_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
+const PROJECTION_PAGE_ROWS: usize = 256;
+const MAX_PROJECTION_SNAPSHOT_ROWS: usize = 65_536;
+const MAX_PROJECTION_SNAPSHOT_PAGES: usize = MAX_PROJECTION_SNAPSHOT_ROWS / PROJECTION_PAGE_ROWS;
+const MAX_PROJECTION_SNAPSHOT_REFS: usize = 512;
 const TEST_HOOKS_ENV: &str = "DEVSPACE_HTTP_TEST_HOOKS";
 const TEST_REQUEST_TIMEOUT_MS_ENV: &str = "DEVSPACE_HTTP_TEST_REQUEST_TIMEOUT_MS";
 
@@ -116,7 +120,6 @@ pub struct ProjectionGitClaimResult {
     #[serde(default)]
     pub pending: bool,
     pub fence: u64,
-    pub previous_fence: Option<u64>,
     pub outcome: Option<String>,
 }
 
@@ -144,6 +147,7 @@ pub struct ProjectionGitMapping {
     pub public_oid: Oid,
     #[serde(deserialize_with = "deserialize_optional_hidden_set")]
     pub hidden_set_id: Option<[u8; 64]>,
+    pub activation_sequence: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -168,6 +172,8 @@ pub struct PendingProjectionGitRef {
     pub expected_old_oid: Option<Oid>,
     #[serde(default, deserialize_with = "deserialize_optional_oid")]
     pub proposed_public_oid: Option<Oid>,
+    #[serde(default, deserialize_with = "deserialize_optional_oid")]
+    pub identity_oid: Option<Oid>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -541,22 +547,42 @@ impl GitHttpTransport {
         &self,
     ) -> Result<ProjectionGitSnapshot, GitHttpTransportError> {
         let mut snapshot = self.projection_snapshot(0, None).await?;
+        if snapshot.through != snapshot.activation_cursor {
+            return Err(GitHttpTransportError::Protocol(
+                "first projection snapshot page did not fix the current high-water".to_owned(),
+            ));
+        }
+        validate_projection_page(&snapshot, 0)?;
         let through = snapshot.through;
         let mut after = snapshot.next_after;
         let mut has_more = snapshot.has_more;
+        let mut pages = 1;
         while has_more {
+            if pages >= MAX_PROJECTION_SNAPSHOT_PAGES {
+                return Err(GitHttpTransportError::Protocol(format!(
+                    "projection snapshot exceeds the {MAX_PROJECTION_SNAPSHOT_PAGES}-page bound"
+                )));
+            }
             let mut page = self.projection_snapshot(after, Some(through)).await?;
             if page.through != through {
                 return Err(GitHttpTransportError::Protocol(
                     "projection snapshot page changed its high-water".to_owned(),
                 ));
             }
+            validate_projection_page(&page, after)?;
             after = page.next_after;
             has_more = page.has_more;
             snapshot.mappings.append(&mut page.mappings);
+            if snapshot.mappings.len() > MAX_PROJECTION_SNAPSHOT_ROWS {
+                return Err(GitHttpTransportError::Protocol(format!(
+                    "projection snapshot exceeds the {MAX_PROJECTION_SNAPSHOT_ROWS}-row bound"
+                )));
+            }
+            pages += 1;
         }
         snapshot.next_after = after;
         snapshot.has_more = false;
+        validate_projection_snapshot_rows(&snapshot)?;
         Ok(snapshot)
     }
 
@@ -884,6 +910,122 @@ impl OpSyncTransport for GitHttpTransport {
             .await
             .map_err(|error| Box::new(error) as OpTransportError)
     }
+}
+
+fn validate_projection_page(
+    page: &ProjectionGitSnapshot,
+    after: u64,
+) -> Result<(), GitHttpTransportError> {
+    if page.through > page.activation_cursor
+        || page.next_after < after
+        || page.next_after > page.through
+    {
+        return Err(GitHttpTransportError::Protocol(
+            "projection mapping page has invalid cursor bounds".to_owned(),
+        ));
+    }
+    if page.mappings.len() > PROJECTION_PAGE_ROWS {
+        return Err(GitHttpTransportError::Protocol(format!(
+            "projection page exceeds the {PROJECTION_PAGE_ROWS}-row page bound"
+        )));
+    }
+    let mut mapping_sequence = after;
+    for mapping in &page.mappings {
+        if mapping.activation_sequence <= mapping_sequence
+            || mapping.activation_sequence > page.through
+        {
+            return Err(GitHttpTransportError::Protocol(
+                "projection mapping rows are not in strictly increasing cursor order".to_owned(),
+            ));
+        }
+        mapping_sequence = mapping.activation_sequence;
+    }
+    if page.next_after != mapping_sequence {
+        return Err(GitHttpTransportError::Protocol(
+            "projection mapping page cursor does not match its final row".to_owned(),
+        ));
+    }
+    if (!page.mappings.is_empty() || page.has_more) && page.next_after <= after {
+        return Err(GitHttpTransportError::Protocol(
+            "projection mapping page did not make monotonic progress".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_projection_snapshot_rows(
+    snapshot: &ProjectionGitSnapshot,
+) -> Result<(), GitHttpTransportError> {
+    if snapshot.cursors.len() > MAX_PROJECTION_SNAPSHOT_REFS
+        || snapshot.pending.len() > MAX_PROJECTION_SNAPSHOT_REFS
+    {
+        return Err(GitHttpTransportError::Protocol(format!(
+            "projection snapshot exceeds the {MAX_PROJECTION_SNAPSHOT_REFS}-ref bound"
+        )));
+    }
+
+    for mapping in &snapshot.mappings {
+        if mapping.canonical_oid == mapping.public_oid {
+            return Err(GitHttpTransportError::Protocol(
+                "projection snapshot contains an identity-shaped mapping".to_owned(),
+            ));
+        }
+    }
+
+    let mut cursor_refs = BTreeSet::new();
+    for cursor in &snapshot.cursors {
+        if !cursor_refs.insert((cursor.remote.clone(), cursor.bookmark.clone())) {
+            return Err(GitHttpTransportError::Protocol(
+                "projection snapshot contains duplicate cursor refs".to_owned(),
+            ));
+        }
+        if cursor.activation_sequence > snapshot.activation_cursor {
+            return Err(GitHttpTransportError::Protocol(
+                "projection cursor exceeds the activation frontier".to_owned(),
+            ));
+        }
+        if cursor.canonical_oid == cursor.public_oid && cursor.hidden_set_id.is_some() {
+            return Err(GitHttpTransportError::Protocol(
+                "identity projection cursor has a hidden-set identity".to_owned(),
+            ));
+        }
+    }
+
+    let mut batch_ids = BTreeSet::new();
+    let mut pending_refs = BTreeSet::new();
+    let mut pending_ref_count = 0_usize;
+    for batch in &snapshot.pending {
+        if !batch_ids.insert(batch.batch_id) {
+            return Err(GitHttpTransportError::Protocol(
+                "projection snapshot contains a duplicate pending batch".to_owned(),
+            ));
+        }
+        pending_ref_count = pending_ref_count
+            .checked_add(batch.refs.len())
+            .ok_or_else(|| {
+                GitHttpTransportError::Protocol("pending ref count overflowed".to_owned())
+            })?;
+        for reference in &batch.refs {
+            if !pending_refs.insert((batch.remote.clone(), reference.bookmark.clone())) {
+                return Err(GitHttpTransportError::Protocol(
+                    "projection snapshot contains duplicate pending refs".to_owned(),
+                ));
+            }
+            if let Some(identity_oid) = reference.identity_oid
+                && reference.proposed_public_oid != Some(identity_oid)
+            {
+                return Err(GitHttpTransportError::Protocol(
+                    "pending identity binding disagrees with its proposed public OID".to_owned(),
+                ));
+            }
+        }
+    }
+    if pending_ref_count > MAX_PROJECTION_SNAPSHOT_REFS {
+        return Err(GitHttpTransportError::Protocol(format!(
+            "projection snapshot exceeds the {MAX_PROJECTION_SNAPSHOT_REFS}-pending-ref bound"
+        )));
+    }
+    Ok(())
 }
 
 fn request_timeout() -> Duration {

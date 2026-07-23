@@ -151,10 +151,6 @@ export function initializeGitSchema(sql: SqlStorage) {
       activation_cursor INTEGER NOT NULL CHECK (activation_cursor >= 0)
     );
     INSERT OR IGNORE INTO projection_git_meta VALUES (1, 0, 0);
-    CREATE TABLE IF NOT EXISTS projection_git_receipts (
-      canonical_oid BLOB PRIMARY KEY,
-      public_oid BLOB NOT NULL
-    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS projection_git_batches (
       batch_id BLOB PRIMARY KEY,
       remote TEXT NOT NULL,

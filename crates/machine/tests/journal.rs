@@ -1,6 +1,11 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
+#[allow(dead_code)]
+#[path = "../../cli/tests/support/fake_worker.rs"]
+mod fake_worker;
+use fake_worker::{create_server, respond};
+
 use devspace_kernel::{ObjectKind, Oid, parse_commit, validate};
 use devspace_machine::{
     GitHttpTransport, GitProcessEnvironment, GitProcessMode, JournalFlowError, LeaseUpdate,
@@ -94,6 +99,370 @@ async fn real_lease_push_preserves_signed_identity_bytes_and_observes_rejection(
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn up_to_date_push_does_not_request_the_pack_catalog_or_chunks() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = MachineGitRepository::init(temp.path().join("machine"), &settings())
+        .await
+        .unwrap();
+    let head = write_commit(
+        &repository,
+        write_tree(&repository, b"already current"),
+        &[],
+        b"already current\n",
+        false,
+    );
+    let head_hex = oid_hex(head);
+    let (base_url, server) = create_server(move |_, request, stream| {
+        let request_line = request.lines().next().unwrap();
+        if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"remotes":[{"name":"origin","url":"/tmp/unused.git"}]}"#,
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/projection?") {
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "activationCursor": 1,
+                    "cursors": [{
+                        "remote": "origin",
+                        "bookmark": "main",
+                        "canonicalOid": head_hex,
+                        "publicOid": head_hex,
+                        "hiddenSetId": null,
+                        "activationSequence": 1,
+                    }],
+                    "mappings": [],
+                    "nextAfter": 0,
+                    "through": 1,
+                    "hasMore": false,
+                    "pending": [],
+                })
+                .to_string(),
+            );
+            return true;
+        } else {
+            panic!("up-to-date push made an unnecessary request: {request_line}");
+        }
+        false
+    });
+    let transport = GitHttpTransport::new(
+        &base_url,
+        "up-to-date-secret",
+        &"11".repeat(16),
+        &"ab".repeat(32),
+        &"cd".repeat(16),
+    )
+    .unwrap();
+
+    let result = push_with_journal(
+        &repository,
+        &transport,
+        "origin",
+        &[PushHead {
+            bookmark: "main".to_owned(),
+            canonical_oid: Some(head),
+        }],
+        [0x65; 16],
+        &GitProcessEnvironment::new("git", GitProcessMode::Foreground),
+        PushFailpoint::None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.outcome, "up-to-date");
+    assert_eq!(result.public_heads["main"], Some(head));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        !request.contains("/packs?")
+            && !request.contains("/packs/")
+            && !request.contains("/chunks/")
+    }));
+}
+#[tokio::test(flavor = "current_thread")]
+async fn identity_cursor_stops_clean_and_hidden_children_without_identity_states() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = MachineGitRepository::init(temp.path().join("machine"), &settings())
+        .await
+        .unwrap();
+    let tree = write_tree(&repository, b"public root");
+    let identity = write_commit(&repository, tree, &[], b"identity root\n", false);
+    let clean = write_commit(&repository, tree, &[identity], b"clean child\n", false);
+    let (hidden, _) = write_hidden_commit(&repository, Some(identity), b"hidden child");
+    let remote = temp.path().join("remote.git");
+    let initialized = Command::new("git")
+        .args(["init", "--bare", remote.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+    let remote_url = remote.to_string_lossy().into_owned();
+    let identity_hex = oid_hex(identity);
+    let clean_hex = oid_hex(clean);
+    let hidden_hex = oid_hex(hidden);
+    let (base_url, server) = create_server(move |_, request, stream| {
+        let request_line = request.lines().next().unwrap();
+        if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({"remotes": [{"name": "origin", "url": remote_url}]})
+                    .to_string(),
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/projection?") {
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "activationCursor": 1,
+                    "cursors": [{
+                        "remote": "origin",
+                        "bookmark": "seed",
+                        "canonicalOid": identity_hex,
+                        "publicOid": identity_hex,
+                        "hiddenSetId": null,
+                        "activationSequence": 1,
+                    }],
+                    "mappings": [],
+                    "nextAfter": 0,
+                    "through": 1,
+                    "hasMore": false,
+                    "pending": [],
+                })
+                .to_string(),
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/packs?") {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
+            );
+        } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
+            respond(stream, "200 OK", r#"{"inserted":true,"installed":false}"#);
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/packs/")
+            && request_line.contains("/install ")
+        {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"installed":true,"insertedObjects":1}"#,
+            );
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/projection/pushes ")
+        {
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let updates = body["updates"].as_array().unwrap();
+            let clean_update = updates
+                .iter()
+                .find(|update| update["bookmark"] == "clean")
+                .unwrap();
+            assert_eq!(clean_update["identityOid"], clean_hex);
+            assert_eq!(clean_update["states"], serde_json::json!([]));
+            let hidden_update = updates
+                .iter()
+                .find(|update| update["bookmark"] == "hidden")
+                .unwrap();
+            assert!(hidden_update["identityOid"].is_null());
+            let states = hidden_update["states"].as_array().unwrap();
+            assert!(states.iter().all(|state| {
+                state["canonicalOid"] != identity_hex && state["canonicalOid"] != state["publicOid"]
+            }));
+            assert!(
+                states
+                    .iter()
+                    .any(|state| state["canonicalOid"] == hidden_hex)
+            );
+            respond(
+                stream,
+                "200 OK",
+                r#"{"pending":true,"fence":1,"outcome":null}"#,
+            );
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/projection/pushes/")
+            && request_line.contains("/recover ")
+        {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"pending":false,"fence":1,"outcome":"accepted"}"#,
+            );
+            return true;
+        } else {
+            panic!("unexpected identity-child request: {request_line}");
+        }
+        false
+    });
+    let transport = GitHttpTransport::new(
+        &base_url,
+        "identity-secret",
+        &"11".repeat(16),
+        &"ab".repeat(32),
+        &"cd".repeat(16),
+    )
+    .unwrap();
+    let result = push_with_journal(
+        &repository,
+        &transport,
+        "origin",
+        &[
+            PushHead {
+                bookmark: "clean".to_owned(),
+                canonical_oid: Some(clean),
+            },
+            PushHead {
+                bookmark: "hidden".to_owned(),
+                canonical_oid: Some(hidden),
+            },
+        ],
+        [0x67; 16],
+        &GitProcessEnvironment::new("git", GitProcessMode::Foreground),
+        PushFailpoint::None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.public_heads["clean"], Some(clean));
+    assert_ne!(result.public_heads["hidden"], Some(hidden));
+    server.join().unwrap();
+}
+#[tokio::test(flavor = "current_thread")]
+async fn settled_aborted_claim_refreshes_without_requesting_replay() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = MachineGitRepository::init(temp.path().join("machine"), &settings())
+        .await
+        .unwrap();
+    let tree = write_tree(&repository, b"claim race");
+    let head = write_commit(&repository, tree, &[], b"claim race\n", false);
+    let remote = temp.path().join("remote.git");
+    let initialized = Command::new("git")
+        .args(["init", "--bare", remote.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+    let remote_url = remote.to_string_lossy().into_owned();
+    let head_hex = oid_hex(head);
+    let batch_id = "68".repeat(16);
+    let mut snapshots = 0_usize;
+    let (base_url, server) = create_server(move |_, request, stream| {
+        let request_line = request.lines().next().unwrap();
+        if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({"remotes": [{"name": "origin", "url": remote_url}]})
+                    .to_string(),
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/projection?") {
+            snapshots += 1;
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "activationCursor": 0,
+                    "cursors": [],
+                    "mappings": [],
+                    "nextAfter": 0,
+                    "through": 0,
+                    "hasMore": false,
+                    "pending": if snapshots == 1 {
+                        vec![serde_json::json!({
+                            "batchId": batch_id,
+                            "remote": "origin",
+                            "ownerMachine": "22".repeat(16),
+                            "fence": 1,
+                            "refs": [{
+                                "bookmark": "main",
+                                "expectedOldOid": null,
+                                "proposedPublicOid": head_hex,
+                                "identityOid": head_hex,
+                            }],
+                        })]
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .to_string(),
+            );
+        } else if request_line.starts_with("POST ") && request_line.contains("/claim ") {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"pending":false,"fence":1,"outcome":"aborted"}"#,
+            );
+        } else if request_line.contains("/replay?") {
+            panic!("settled aborted claim must not request replay");
+        } else if request_line.starts_with("GET ") && request_line.contains("/packs?") {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
+            );
+        } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
+            respond(stream, "200 OK", r#"{"inserted":true,"installed":false}"#);
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/packs/")
+            && request_line.contains("/install ")
+        {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"installed":true,"insertedObjects":1}"#,
+            );
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/projection/pushes ")
+        {
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["updates"][0]["identityOid"], head_hex);
+            assert_eq!(body["updates"][0]["states"], serde_json::json!([]));
+            respond(
+                stream,
+                "200 OK",
+                r#"{"pending":true,"fence":2,"outcome":null}"#,
+            );
+        } else if request_line.starts_with("POST ") && request_line.contains("/recover ") {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"pending":false,"fence":2,"outcome":"accepted"}"#,
+            );
+            return true;
+        } else {
+            panic!("unexpected claim-race request: {request_line}");
+        }
+        false
+    });
+    let transport = GitHttpTransport::new(
+        &base_url,
+        "claim-secret",
+        &"11".repeat(16),
+        &"ab".repeat(32),
+        &"cd".repeat(16),
+    )
+    .unwrap();
+    let result = push_with_journal(
+        &repository,
+        &transport,
+        "origin",
+        &[PushHead {
+            bookmark: "main".to_owned(),
+            canonical_oid: Some(head),
+        }],
+        [0x69; 16],
+        &GitProcessEnvironment::new("git", GitProcessMode::Foreground),
+        PushFailpoint::None,
+    )
+    .await
+    .unwrap();
+    assert!(result.recovered_batches.is_empty());
+    assert_eq!(result.public_heads["main"], Some(head));
+    assert_eq!(remote_ref(&remote, "main"), head);
+    server.join().unwrap();
+}
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
 async fn live_v2_journal_push_recovery_and_fetch_proofs() {

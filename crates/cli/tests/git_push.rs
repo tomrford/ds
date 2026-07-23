@@ -490,10 +490,8 @@ async fn push_fails_loudly_when_a_mapped_object_is_missing() {
     let pushed = fixture.push(&["-b", "main"]);
     assert_eq!(pushed.status.code(), Some(1));
     let diagnostic = stderr(&pushed);
-    assert!(
-        diagnostic.contains("failed to read Git object"),
-        "{diagnostic}"
-    );
+    assert!(diagnostic.contains("seeded public commit"), "{diagnostic}");
+    assert!(diagnostic.contains("is unavailable"), "{diagnostic}");
 }
 
 #[tokio::test]
@@ -1224,11 +1222,16 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                                 "bookmark": update["bookmark"],
                                 "expectedOldOid": update["expectedOldOid"],
                                 "proposedPublicOid": proposed,
+                                "identityOid": update["identityOid"],
                             })
                         }).collect::<Vec<_>>(),
                     })
                 })
                 .collect::<Vec<_>>();
+            let next_after = mappings
+                .last()
+                .and_then(|mapping| mapping["activationSequence"].as_u64())
+                .unwrap_or(0);
             respond(
                 stream,
                 "200 OK",
@@ -1236,7 +1239,7 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                     "activationCursor": activation_cursor,
                     "cursors": cursors,
                     "mappings": mappings,
-                    "nextAfter": activation_cursor,
+                    "nextAfter": next_after,
                     "through": activation_cursor,
                     "hasMore": false,
                     "pending": pending_batches,
@@ -1266,6 +1269,7 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                         "canonicalOid": state["canonicalOid"],
                         "publicOid": state["publicOid"],
                         "hiddenSetId": state["hiddenSetId"],
+                        "activationSequence": activation_cursor,
                     });
                     if !mappings.iter().any(|existing| existing == &mapping) {
                         mappings.push(mapping);
@@ -1306,14 +1310,13 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
             && request_line.contains("/git/projection/pushes/")
             && request_line.contains("/claim ")
         {
-            let previous_fence = pending_fence;
             pending_fence += 1;
             respond(
                 stream,
                 "200 OK",
                 &serde_json::json!({
+                    "pending": true,
                     "fence": pending_fence,
-                    "previousFence": previous_fence,
                 })
                 .to_string(),
             );
@@ -1341,7 +1344,6 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
             let body = request_json(request);
             let batch = pending.take().expect("recover follows begin");
             let remote = batch["remote"].as_str().unwrap();
-            activation_cursor += 1;
             for update in batch["updates"].as_array().unwrap() {
                 let bookmark = update["bookmark"].as_str().unwrap();
                 let observation = body["observations"]
@@ -1352,6 +1354,19 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                     .unwrap();
                 cursors
                     .retain(|cursor| cursor["remote"] != remote || cursor["bookmark"] != bookmark);
+                let mut state_sequences = Vec::new();
+                for state in update["states"].as_array().unwrap() {
+                    activation_cursor += 1;
+                    state_sequences.push(activation_cursor);
+                    mappings.push(serde_json::json!({
+                        "remote": remote,
+                        "bookmark": bookmark,
+                        "canonicalOid": state["canonicalOid"],
+                        "publicOid": state["publicOid"],
+                        "hiddenSetId": state["hiddenSetId"],
+                        "activationSequence": activation_cursor,
+                    }));
+                }
                 if let Some(index) = update["proposedState"].as_u64() {
                     let state = &update["states"][index as usize];
                     assert_eq!(observation["liveOid"], state["publicOid"]);
@@ -1361,22 +1376,11 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                         "canonicalOid": state["canonicalOid"],
                         "publicOid": state["publicOid"],
                         "hiddenSetId": state["hiddenSetId"],
-                        "activationSequence": activation_cursor,
+                        "activationSequence": state_sequences[index as usize],
                     }));
-                    for state in update["states"].as_array().unwrap() {
-                        let mapping = serde_json::json!({
-                            "remote": remote,
-                            "bookmark": bookmark,
-                            "canonicalOid": state["canonicalOid"],
-                            "publicOid": state["publicOid"],
-                            "hiddenSetId": state["hiddenSetId"],
-                        });
-                        if !mappings.iter().any(|existing| existing == &mapping) {
-                            mappings.push(mapping);
-                        }
-                    }
                 } else if let Some(identity_oid) = update["identityOid"].as_str() {
                     assert_eq!(observation["liveOid"], identity_oid);
+                    activation_cursor += 1;
                     cursors.push(serde_json::json!({
                         "remote": remote,
                         "bookmark": bookmark,

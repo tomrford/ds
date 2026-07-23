@@ -158,20 +158,17 @@ fn create_import_server(
             let mappings = cursors
                 .iter()
                 .filter(|cursor| cursor["canonicalOid"] != cursor["publicOid"])
-                .map(|cursor| {
-                    let mut mapping = cursor.clone();
-                    mapping
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("activationSequence");
-                    mapping
-                })
+                .cloned()
                 .collect::<Vec<_>>();
+            let next_after = mappings
+                .last()
+                .and_then(|mapping| mapping["activationSequence"].as_u64())
+                .unwrap_or(0);
             projection = serde_json::json!({
                 "activationCursor": 1,
                 "cursors": cursors,
                 "mappings": mappings,
-                "nextAfter": 1,
+                "nextAfter": next_after,
                 "through": 1,
                 "hasMore": false,
                 "pending": [],

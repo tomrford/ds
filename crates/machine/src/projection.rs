@@ -19,7 +19,7 @@ use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::store::Store;
 use thiserror::Error;
 
-use crate::MachineGitRepository;
+use crate::{MachineGitRepository, ObjectClosureError};
 
 const DSPRIVATE: &str = ".dsprivate";
 const HIDDEN_SET_DOMAIN: &[u8] = b"devspace-hidden-set-v1";
@@ -204,8 +204,20 @@ impl MachineGitRepository {
                         if let Some(public_id) = mappings.by_canonical.get(&id).copied() {
                             // A mapping stops traversal, so verify that its public commit is
                             // present in the canonical object database before using it.
-                            read_object(&git_repo, public_id, GitObjectKind::Commit)?;
-                            reached_mappings.insert(id, public_id);
+                            self.object_closure([public_id]).map_err(|source| {
+                                ProjectionError::SeededPublicCommitUnavailable {
+                                    canonical_id: id,
+                                    public_id,
+                                    source,
+                                }
+                            })?;
+                            // Identity cursors are traversal stop points, not
+                            // rewritten pair state. Returning them as reached
+                            // mappings would make journal_flow serialize an
+                            // identity pair state for ordinary descendants.
+                            if id != public_id {
+                                reached_mappings.insert(id, public_id);
+                            }
                             states.insert(id, true);
                             continue;
                         }
@@ -812,6 +824,15 @@ pub enum ProjectionError {
         id: Oid,
         expected: GitObjectKind,
         actual: GitObjectKind,
+    },
+    #[error(
+        "seeded public commit {public_id:?} for canonical commit {canonical_id:?} is unavailable"
+    )]
+    SeededPublicCommitUnavailable {
+        canonical_id: Oid,
+        public_id: Oid,
+        #[source]
+        source: ObjectClosureError,
     },
     #[error("failed to write {kind:?} object")]
     WriteObject {

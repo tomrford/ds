@@ -396,16 +396,27 @@ fn build_hidden_fixture(repository: &MachineGitRepository) -> HiddenFixture {
         hidden_tree,
         &[base],
         &[
+            (b"encoding", b"ISO-8859-1"),
             (b"change-id", b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
-            (b"x-foreign", b"retained"),
+            (b"x-before", b"first opaque header"),
+            (
+                b"x-continuation",
+                b"first opaque line\n second opaque line\n third opaque line",
+            ),
             (
                 b"gpgsig",
                 b"-----BEGIN PGP SIGNATURE-----\n hidden-signature\n -----END PGP SIGNATURE-----",
+            ),
+            (b"x-foreign", b"retained"),
+            (
+                b"gpgsig-sha256",
+                b"-----BEGIN SSH SIGNATURE-----\n stale-sha256-signature\n -----END SSH SIGNATURE-----",
             ),
             (
                 b"mergetag",
                 b"object 0000000000000000000000000000000000000000\n type commit\n tag signed",
             ),
+            (b"x-after", b"last opaque header"),
         ],
         b"hidden side\n",
     );

@@ -27,16 +27,18 @@ unregistered URLs are outside this boundary.
 
 One fetch holds the repository sync lock and performs this sequence:
 
-1. recover any pending push batch that overlaps the requested bookmarks;
-2. read the complete projection snapshot;
-3. run `git fetch` into temporary refs in the shared bare object database;
-4. read the fetched public head OIDs;
-5. seed overlay-lift with journaled canonical/public pairs;
-6. replay canonical hidden state over each newly reached public commit;
-7. print every data-disclosure warning;
-8. upload the Git closure of all public and canonical heads;
-9. record one idempotent fetch transaction in the Worker;
-10. update Jujutsu remote-tracking bookmarks to the canonical heads in one
+1. read the complete projection snapshot;
+2. recover any pending push batch that overlaps the requested bookmarks;
+3. refresh the snapshot if recovery settled a batch;
+4. install the current cloud pack catalog;
+5. run `git fetch` into temporary refs in the shared bare object database;
+6. read the fetched public head OIDs;
+7. seed overlay-lift with journaled canonical/public pairs;
+8. replay canonical hidden state over each newly reached public commit;
+9. print every data-disclosure warning;
+10. upload the Git closure of all public and canonical heads;
+11. record one idempotent fetch transaction in the Worker;
+12. update Jujutsu remote-tracking bookmarks to the canonical heads in one
     native operation.
 
 Public objects retain their exact remote bytes and Git OIDs.
@@ -49,8 +51,10 @@ The journal snapshot supplies active and historical pair states:
 canonicalOid  publicOid  hiddenSetId?
 ```
 
-Each public OID in those states is a stop point for overlay-lift. Its canonical
-OID supplies the hidden lineage from which new descendants continue.
+Active pair states and cursors are stop points for overlay-lift. Their canonical
+OIDs and hidden-set identities supply the lineage from which new descendants
+continue. Identity cursors use one OID on both sides and carry no hidden-set
+identity.
 
 If a fetched ref has an active cursor, its new public head must descend from
 the cursor's public OID. Devspace rejects a rewritten remote ref instead of
@@ -112,8 +116,8 @@ Each fetched bookmark records:
 - either the proposed pair index or an `identityOid`.
 
 `identityOid` must equal the observed public OID and cannot accompany pair
-states. The Worker verifies every public and canonical commit is durable before
-it advances the cursor.
+states. The Worker verifies every public and canonical commit is durable and
+checks request-wide binding and hidden-lineage consistency before mutation.
 
 The fetch ID and canonical request hash make retries idempotent. Reusing the ID
 for different bytes is rejected. Cursor advancement is transactional across
@@ -130,11 +134,16 @@ OIDs determine the correct seed lineage. Recovery uses the original leases and
 fencing rules described in [Git push](git-push.md).
 
 Downloaded public and mirrored canonical objects are ordinary Git objects.
-Fresh-machine recovery obtains them from the cloud pack catalog.
+Fresh-machine recovery obtains them from the cloud pack catalog. One command
+tracks the installed catalog high-water and downloads only later entries when
+another recovery step needs them.
+
+Snapshot activation high-waters do not make concurrent remote repointing
+consistent. That remains the remote-generation work in issue #15.
 
 ## Exporter interaction
 
-The next push starts from the active pair cursor. Locally created canonical
+The next push starts from the active cursor. Locally created canonical
 descendants project from that seed:
 
 - an unchanged hidden-free descendant remains identity;

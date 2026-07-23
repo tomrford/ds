@@ -2,8 +2,9 @@
  * Projection journal wire contract.
  *
  * A state is a canonical/public Git OID pair plus its nullable hidden-set
- * identity. Request bytes, refs, states, repository refs, and name bounds are
- * 4 MiB, 256, 8,192, 512, and 256 UTF-8 bytes respectively.
+ * identity. Request bytes, refs, states, repository refs, retained pair-state
+ * rows, and name bounds are 4 MiB, 256, 8,192, 512, 65,536, and 256 UTF-8
+ * bytes respectively.
  */
 import { z } from "zod";
 
@@ -18,6 +19,7 @@ export const MAX_GIT_PROJECTION_REQUEST_BYTES = 4 * 1024 * 1024;
 export const MAX_GIT_PROJECTION_REFS = 256;
 export const MAX_GIT_PROJECTION_STATES = 8_192;
 export const MAX_REPOSITORY_GIT_PROJECTION_REFS = 512;
+export const MAX_REPOSITORY_GIT_PROJECTION_HISTORY_STATES = 65_536;
 export const MAX_GIT_PROJECTION_NAME_BYTES = 256;
 
 const encoder = new TextEncoder();
@@ -124,7 +126,12 @@ export class ProjectionGitProtocolError extends Error {
 
 export function decodeBeginProjectionGitBatch(value: unknown): BeginProjectionGitBatchRequest {
   const request = parseProjectionGit(beginProjectionGitBatchSchema, value);
-  for (const [index, update] of request.updates.entries()) validateUpdate(update, index);
+  for (const [index, update] of request.updates.entries()) {
+    validateUpdate(update, index);
+    for (const [stateIndex, state] of update.states.entries()) {
+      requireRewrittenState(state, `updates[${index}].states[${stateIndex}]`);
+    }
+  }
   requireStateLimit(request.updates, "updates");
   request.updates.sort((left, right) => compareNames(left.bookmark, right.bookmark));
   requireUniqueNames(request.updates, "updates");
@@ -134,6 +141,9 @@ export function decodeBeginProjectionGitBatch(value: unknown): BeginProjectionGi
 export function decodeRecordGitFetch(value: unknown): RecordGitFetchRequest {
   const request = parseProjectionGit(recordGitFetchSchema, value);
   for (const [index, ref] of request.refs.entries()) {
+    for (const [stateIndex, state] of ref.states.entries()) {
+      requireRewrittenState(state, `refs[${index}].states[${stateIndex}]`);
+    }
     if (ref.proposedState !== null && ref.proposedState >= ref.states.length) {
       throw new Error(`refs[${index}].proposedState is outside states`);
     }
@@ -251,6 +261,15 @@ function validateUpdate(update: ProjectionGitUpdate, index: number) {
     .sort();
   if (stateKeys.some((key, stateIndex) => stateIndex > 0 && key === stateKeys[stateIndex - 1])) {
     throw new Error(`updates[${index}].states must not contain duplicate mappings`);
+  }
+}
+
+function requireRewrittenState(state: ProjectionGitState, field: string) {
+  if (compareGitBytes(state.canonicalOid, state.publicOid) === 0) {
+    throw new ProjectionGitProtocolError(
+      `${field} is identity-shaped; use identityOid instead`,
+      "identity-projection-state",
+    );
   }
 }
 

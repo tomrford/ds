@@ -114,7 +114,8 @@ A journal state binds:
 canonicalOid  publicOid  hiddenSetId?
 ```
 
-An identity commit uses one OID on both sides and needs no mapping receipt.
+An identity commit uses one OID on both sides and is represented only by an
+identity cursor or pending identity binding, never by a pair state.
 A rewritten commit stores the pair and effective hidden-set identity. One
 canonical OID cannot be bound to two public OIDs.
 
