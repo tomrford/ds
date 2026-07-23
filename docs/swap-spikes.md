@@ -1,6 +1,8 @@
 # GitBackend swap decision record
 
 Status: completed; the validated GitBackend stack is now the primary implementation.
+Deployed 2026-07-23: worker wiped and redeployed on the v2 surface; dogfooding
+resumed with this repository as the first checkout of the rebuilt stack.
 
 The canonical store moved from jj's SimpleBackend to jj's GitBackend, with the
 colocated Git object database as the object store. The cutover used a Worker
