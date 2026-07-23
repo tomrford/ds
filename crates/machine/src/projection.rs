@@ -202,6 +202,8 @@ impl MachineGitRepository {
                             None => {}
                         }
                         if let Some(public_id) = mappings.by_canonical.get(&id).copied() {
+                            // A mapping stops traversal, so verify that its public commit is
+                            // present in the canonical object database before using it.
                             read_object(&git_repo, public_id, GitObjectKind::Commit)?;
                             reached_mappings.insert(id, public_id);
                             states.insert(id, true);

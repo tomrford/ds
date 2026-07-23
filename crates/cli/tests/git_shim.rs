@@ -318,7 +318,7 @@ async fn boundary_suppression_skips_git_shim_work() {
 }
 
 #[tokio::test]
-async fn checkout_removal_unlocks_a_legacy_shim_after_disabling() {
+async fn checkout_removal_unlocks_an_existing_shim_after_disabling() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
     set_git_shim(&config, true);

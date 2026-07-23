@@ -259,7 +259,7 @@ fn refuses_context_commands_in_a_plain_jj_checkout() {
 }
 
 #[test]
-fn context_help_keeps_the_v1_subcommand_surface() {
+fn context_help_lists_the_supported_subcommands() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_cli_config(temp.path());
     let output = ds(temp.path(), &config, &["context", "--help"]);

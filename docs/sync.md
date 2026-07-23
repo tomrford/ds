@@ -26,7 +26,7 @@ Commands that need the cloud send the global development-only
 
 The shared credential selects one fixed development user. The control plane
 checks that user's active repository incarnation before forwarding a request
-to `RepositoryGit`; it does not validate machine enrollment. Per-machine
+to `Repository`; it does not validate machine enrollment. Per-machine
 credentials are an open limitation, not part of the implemented protocol.
 
 ## Native repository boundary

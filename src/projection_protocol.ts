@@ -1,13 +1,9 @@
 /**
- * Projection journal v2 wire contract.
+ * Projection journal wire contract.
  *
  * A state is a canonical/public Git OID pair plus its nullable hidden-set
- * identity. The v1 `gitOid` and `publicCommitId` fields collapse into
- * `publicOid`; `canonicalCommitId` becomes `canonicalOid`. Fetch no longer
- * carries a separate Git-to-public receipt array because a public OID is the
- * immutable Git object identity. Consequently the v1 8,192 fetch-receipt
- * bound is obsolete. Request bytes, refs, states, repository refs, and name
- * bounds remain 4 MiB, 256, 8,192, 512, and 256 UTF-8 bytes respectively.
+ * identity. Request bytes, refs, states, repository refs, and name bounds are
+ * 4 MiB, 256, 8,192, 512, and 256 UTF-8 bytes respectively.
  */
 import { z } from "zod";
 

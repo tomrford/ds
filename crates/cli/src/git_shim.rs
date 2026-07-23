@@ -72,7 +72,7 @@ fn ensure_inner(checkout_root: &Path, settings: &UserSettings) -> Result<(), Str
     // particular, an unrelated invalid filesystem path must not leave the
     // guard relaxed or partially rewrite the index.
     let base_ignores = crate::working_copy::base_ignores(checkout_root, settings)?;
-    let backend_objects = backend_objects_dir(checkout_root, settings)?;
+    let canonical_objects = canonical_objects_dir(checkout_root, settings)?;
     let discovered = crate::working_copy::discover_shim_paths(checkout_root, &base_ignores)
         .map_err(|error| error.to_string())?;
     let canonical = canonical_paths(checkout_root, settings)?;
@@ -112,7 +112,7 @@ fn ensure_inner(checkout_root: &Path, settings: &UserSettings) -> Result<(), Str
 
     // A base ignore only excludes untracked paths from jj's snapshot. Restore
     // canonical public files after clearing an ignored root, including on the
-    // first shim build and after repairing an index written by an older ds.
+    // first shim build and when repairing an incomplete index.
     // An invalid policy excludes its complete subtree instead: no materialized
     // conflict or symlink target is allowed to invent projection policy.
     let canonical_public = canonical
@@ -138,9 +138,9 @@ fn ensure_inner(checkout_root: &Path, settings: &UserSettings) -> Result<(), Str
         }
         fs::write(
             git_dir.join("objects/info/alternates"),
-            format!("{}\n", backend_objects.display()),
+            format!("{}\n", canonical_objects.display()),
         )
-        .map_err(|error| format!("configure real Git object database: {error}"))?;
+        .map_err(|error| format!("configure canonical Git object database: {error}"))?;
         remove_stale_index_lock(&git_dir)?;
         ensure_info_exclude(&git_dir, excluded_paths.iter().map(|path| path.as_ref()))?;
 
@@ -164,7 +164,7 @@ fn ensure_inner(checkout_root: &Path, settings: &UserSettings) -> Result<(), Str
     finish_guard(refresh, guard)
 }
 
-fn backend_objects_dir(
+fn canonical_objects_dir(
     checkout_root: &Path,
     settings: &UserSettings,
 ) -> Result<std::path::PathBuf, String> {

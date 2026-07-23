@@ -39,8 +39,7 @@ One fetch holds the repository sync lock and performs this sequence:
 10. update Jujutsu remote-tracking bookmarks to the canonical heads in one
     native operation.
 
-The public objects are never translated or normalized. Their Git OIDs remain
-the remote OIDs.
+Public objects retain their exact remote bytes and Git OIDs.
 
 ## Seed selection
 
@@ -131,8 +130,7 @@ OIDs determine the correct seed lineage. Recovery uses the original leases and
 fencing rules described in [Git push](git-push.md).
 
 Downloaded public and mirrored canonical objects are ordinary Git objects.
-Fresh-machine recovery obtains them from the cloud pack catalog; no local
-sidecar or export cache is authoritative.
+Fresh-machine recovery obtains them from the cloud pack catalog.
 
 ## Exporter interaction
 

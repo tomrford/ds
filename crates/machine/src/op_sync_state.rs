@@ -716,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_creation_requires_an_existing_parent() {
+    fn sync_state_creation_requires_an_existing_parent() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("missing").join("sync");
         assert!(matches!(

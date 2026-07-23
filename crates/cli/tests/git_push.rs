@@ -468,7 +468,7 @@ async fn deleted_selects_only_absent_local_tracked_bookmarks_on_the_remote() {
 }
 
 #[tokio::test]
-async fn push_surfaces_missing_mapped_object_repair() {
+async fn push_fails_loudly_when_a_mapped_object_is_missing() {
     let fixture = FakePushFixture::new("missing-mapped-object").await;
     fs::write(fixture.checkout.join(".dsprivate"), b"/secret.txt\n").unwrap();
     fs::write(fixture.checkout.join("secret.txt"), b"private\n").unwrap();
@@ -492,10 +492,6 @@ async fn push_surfaces_missing_mapped_object_repair() {
     let diagnostic = stderr(&pushed);
     assert!(
         diagnostic.contains("failed to read Git object"),
-        "{diagnostic}"
-    );
-    assert!(
-        diagnostic.contains("ds git fetch --remote origin -b main"),
         "{diagnostic}"
     );
 }
@@ -826,17 +822,6 @@ async fn fresh_machine_claims_and_replays_a_push_left_pending_after_git_moved() 
         ],
     );
     assert!(added.status.success(), "{}", stderr(&added));
-    let machine_b_entry = machine_store(&fixture.home_b)
-        .resolve(&RepositoryName::parse(&fixture.repository_name).unwrap())
-        .unwrap()
-        .unwrap();
-    assert!(
-        !machine_store(&fixture.home_b)
-            .repository_legacy_projection_path(&machine_b_entry.identity)
-            .exists(),
-        "fresh machine unexpectedly has a legacy projection directory"
-    );
-
     let recovered = fixture.push(&checkout_b, &fixture.home_b, &config_b, "main");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
     assert_eq!(remote_ref(&fixture.remote, "main"), Some(first_remote));

@@ -41,10 +41,10 @@ One logical repository has three parts:
 - a machine catalog entry with the cloud repository identity and local bare
   repository path;
 - one bare Git object database shared by every checkout on that machine;
-- one cloud `RepositoryGit` Durable Object containing validated Git packs,
+- one cloud `Repository` Durable Object containing validated Git packs,
   operation objects, operation heads, and the public-Git projection journal.
 
-The Worker `ControlPlaneV2` Durable Object owns repository names, repository
+The Worker `ControlPlane` Durable Object owns repository names, repository
 authorization, retirement, and creation. A repository Durable Object can
 initialize only while the control plane confirms its incarnation and
 single-repository creation nonce.

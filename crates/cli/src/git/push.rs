@@ -222,7 +222,7 @@ async fn push_requested(
         Err(devspace_machine::JournalFlowError::AfterPushFailpoint { .. }) => {
             std::process::exit(86);
         }
-        Err(error) => return Err(projection_error(remote, requested, error)),
+        Err(error) => return Err(error.to_string()),
         Ok(result) => result,
     };
 
@@ -279,28 +279,6 @@ async fn push_requested(
         .err()
         .map(|error| view_repair_warning(remote, &pushed, &error));
     Ok(PushOutcome { lines, warning })
-}
-
-fn projection_error(
-    remote: &str,
-    requested: &[RequestedBookmark],
-    error: devspace_machine::JournalFlowError,
-) -> String {
-    let message = error.to_string();
-    if matches!(
-        error,
-        devspace_machine::JournalFlowError::Projection(
-            devspace_machine::ProjectionError::ReadObject { .. }
-        )
-    ) && requested.len() == 1
-    {
-        format!(
-            "{message}. Run `ds git fetch --remote {remote} -b {}` to repair the mapped bookmark.",
-            requested[0].name
-        )
-    } else {
-        message
-    }
 }
 
 async fn update_view_after_push(

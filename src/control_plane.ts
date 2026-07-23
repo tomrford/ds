@@ -615,13 +615,6 @@ function initializeControlPlaneSchema(sql: SqlStorage) {
       PRIMARY KEY (user_id, idempotency_key)
     ) WITHOUT ROWID;
   `);
-  const repositoryColumns = sql.exec<{ name: string }>("PRAGMA table_info(repositories)").toArray();
-  if (!repositoryColumns.some((column) => column.name === "creation_nonce")) {
-    sql.exec("ALTER TABLE repositories ADD COLUMN creation_nonce TEXT");
-    sql.exec(
-      "UPDATE repositories SET creation_nonce = lower(hex(randomblob(16))) WHERE creation_nonce IS NULL",
-    );
-  }
 }
 
 function decodeIdentity(value: unknown): AuthenticatedPrincipal {

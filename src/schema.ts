@@ -231,31 +231,4 @@ export function initializeGitSchema(sql: SqlStorage) {
       url TEXT NOT NULL
     ) WITHOUT ROWID;
   `);
-  const repositoryColumns = sql
-    .exec<{ name: string }>("PRAGMA table_info(repository_state)")
-    .toArray();
-  if (!repositoryColumns.some((column) => column.name === "op_cursor")) {
-    sql.exec(
-      "ALTER TABLE repository_state ADD COLUMN op_cursor INTEGER NOT NULL DEFAULT 0 CHECK (op_cursor >= 0)",
-    );
-  }
-  if (!repositoryColumns.some((column) => column.name === "creation_nonce")) {
-    sql.exec("ALTER TABLE repository_state ADD COLUMN creation_nonce TEXT");
-  }
-  if (!repositoryColumns.some((column) => column.name === "op_receipt_count")) {
-    sql.exec(
-      "ALTER TABLE repository_state ADD COLUMN op_receipt_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_count >= 0)",
-    );
-  }
-  if (!repositoryColumns.some((column) => column.name === "op_receipt_head_count")) {
-    sql.exec(
-      "ALTER TABLE repository_state ADD COLUMN op_receipt_head_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_head_count >= 0)",
-    );
-  }
-  const batchRefColumns = sql
-    .exec<{ name: string }>("PRAGMA table_info(projection_git_batch_refs)")
-    .toArray();
-  if (!batchRefColumns.some((column) => column.name === "identity_oid")) {
-    sql.exec("ALTER TABLE projection_git_batch_refs ADD COLUMN identity_oid BLOB");
-  }
 }

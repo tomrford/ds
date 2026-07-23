@@ -184,12 +184,6 @@ impl MachineStore {
         self.repository_directory(identity).join("packs")
     }
 
-    /// Returns the obsolete pre-GitBackend projection directory so repository
-    /// removal and migration regression tests can prove that it is cleaned up.
-    pub fn repository_legacy_projection_path(&self, identity: &RepositoryIdentity) -> PathBuf {
-        self.repository_directory(identity).join("projection")
-    }
-
     fn repository_directory(&self, identity: &RepositoryIdentity) -> PathBuf {
         self.repository_removal_root(identity)
             .join(identity.incarnation.as_str())
