@@ -168,42 +168,56 @@ fn starter_vectors_cover_parsers_and_references() {
 }
 
 #[test]
-fn structured_truncation_smoke_returns_errors() {
-    for vector in vectors() {
-        match vector.kind {
-            // Every blob prefix is another valid opaque blob.
-            ObjectKind::Blob => {
-                for end in 0..vector.payload.len() {
-                    assert!(validate(ObjectKind::Blob, &vector.payload[..end]).is_ok());
-                }
-            }
-            ObjectKind::Tree if vector.payload.is_empty() => {
-                assert!(validate(ObjectKind::Tree, &vector.payload).is_ok());
-            }
-            // A tree can end after any complete entry, so probe inside the
-            // final OID rather than asserting that every prefix is invalid.
-            ObjectKind::Tree => {
-                let end = vector.payload.len() - 1;
-                assert!(validate(ObjectKind::Tree, &vector.payload[..end]).is_err());
-            }
-            ObjectKind::Commit => {
-                let body_start = vector
-                    .payload
-                    .windows(2)
-                    .position(|window| window == b"\n\n")
-                    .map(|offset| offset + 2)
-                    .expect("commit body separator");
-                for end in 0..body_start {
-                    assert!(
-                        validate(ObjectKind::Commit, &vector.payload[..end]).is_err(),
-                        "commit prefix {end} unexpectedly validated"
-                    );
-                }
-                // Once the blank line is present, every message prefix is a
-                // valid commit because messages are opaque bytes.
-            }
+fn every_structured_golden_mutation_returns_without_panicking() {
+    for vector in vectors()
+        .into_iter()
+        .filter(|vector| vector.kind != ObjectKind::Blob)
+    {
+        for length in 0..vector.payload.len() {
+            assert_rejected_or_reidentified(&vector, &vector.payload[..length], "truncation");
+        }
+        for index in 0..vector.payload.len() {
+            let mut mutated = vector.payload.clone();
+            mutated[index] ^= 0x80;
+            assert_rejected_or_reidentified(&vector, &mutated, "single-byte mutation");
         }
     }
+}
+
+#[test]
+fn every_blob_golden_mutation_changes_its_id() {
+    for vector in vectors()
+        .into_iter()
+        .filter(|vector| vector.kind == ObjectKind::Blob)
+    {
+        for length in 0..vector.payload.len() {
+            assert_reidentified(&vector, &vector.payload[..length], "truncation");
+        }
+        for index in 0..vector.payload.len() {
+            let mut mutated = vector.payload.clone();
+            mutated[index] ^= 0x80;
+            assert_reidentified(&vector, &mutated, "single-byte mutation");
+        }
+    }
+}
+
+fn assert_rejected_or_reidentified(vector: &Vector, candidate: &[u8], operation: &str) {
+    if let Ok(validated) = validate(vector.kind, candidate) {
+        assert_ne!(
+            validated.id, vector.expected,
+            "{operation} of {:?} was accepted with its original ID",
+            vector.kind
+        );
+    }
+}
+
+fn assert_reidentified(vector: &Vector, candidate: &[u8], operation: &str) {
+    let validated = validate(vector.kind, candidate)
+        .unwrap_or_else(|error| panic!("blob {operation} was rejected: {error}"));
+    assert_ne!(
+        validated.id, vector.expected,
+        "blob {operation} retained its original ID"
+    );
 }
 
 #[test]
