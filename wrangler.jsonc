@@ -36,7 +36,10 @@
     },
     {
       "tag": "v4",
-      "new_sqlite_classes": ["ControlPlaneV2"],
+      "new_sqlite_classes": ["ControlPlaneV2"]
+    },
+    {
+      "tag": "v5",
       "deleted_classes": ["Repository", "ControlPlane"]
     }
   ],
