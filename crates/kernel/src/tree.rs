@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use crate::{Oid, TreeError};
 
@@ -24,7 +25,7 @@ pub struct Tree<'a> {
 }
 
 pub fn parse_tree(payload: &[u8]) -> Result<Tree<'_>, TreeError> {
-    let mut entries = Vec::new();
+    let mut entries: Vec<TreeEntry<'_>> = Vec::new();
     let mut offset = 0_usize;
     while offset < payload.len() {
         let entry_offset = offset;
@@ -87,6 +88,18 @@ pub fn parse_tree(payload: &[u8]) -> Result<Tree<'_>, TreeError> {
             offset: entry_offset,
         })?;
         offset = oid_end;
+        if let Some(previous) = entries.last() {
+            if previous.name == name {
+                return Err(TreeError::DuplicateName {
+                    offset: entry_offset,
+                });
+            }
+            if compare_entries(previous.name, previous.kind, name, kind) != Ordering::Less {
+                return Err(TreeError::NonCanonicalOrder {
+                    offset: entry_offset,
+                });
+            }
+        }
         entries.push(TreeEntry { kind, name, oid });
     }
     Ok(Tree { entries })
@@ -108,4 +121,24 @@ fn valid_name(name: &[u8]) -> bool {
         && name != b"."
         && name != b".."
         && !name.iter().any(|byte| *byte == b'/' || *byte == 0)
+}
+
+fn compare_entries(
+    left_name: &[u8],
+    left_kind: TreeEntryKind,
+    right_name: &[u8],
+    right_kind: TreeEntryKind,
+) -> Ordering {
+    let shared = left_name.len().min(right_name.len());
+    match left_name[..shared].cmp(&right_name[..shared]) {
+        Ordering::Equal => entry_terminator(left_name, left_kind, shared)
+            .cmp(&entry_terminator(right_name, right_kind, shared)),
+        ordering => ordering,
+    }
+}
+
+fn entry_terminator(name: &[u8], kind: TreeEntryKind, index: usize) -> u8 {
+    name.get(index)
+        .copied()
+        .unwrap_or(if kind == TreeEntryKind::Tree { b'/' } else { 0 })
 }

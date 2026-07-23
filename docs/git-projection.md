@@ -28,10 +28,12 @@ are produced. Signed commits on an entirely identity lineage retain their exact
 `gpgsig` and `mergetag` bytes.
 
 A rewritten commit retains the canonical author, committer, message, encoding,
-and opaque headers that remain valid. Projection removes GitBackend-private
-headers and records the canonical OID in the rewritten commit metadata. It
-rejects conflicted canonical commits, malformed objects, and a proposed public
-tree that still contains a hidden path.
+`change-id`, and foreign non-signature headers. Projection drops `gpgsig`,
+`gpgsig-sha256`, and `mergetag` because rewriting invalidates those signatures.
+It embeds no canonical-OID metadata: such metadata would disclose the existence
+of private history. The canonical/public relationship exists only in the cloud
+journal. Projection rejects conflicted canonical commits, malformed objects,
+and a proposed public tree that still contains a hidden path.
 
 Tree rewriting is minimal and deterministic. The cache key includes the source
 tree and effective hidden-policy chain, so identical subtrees under the same

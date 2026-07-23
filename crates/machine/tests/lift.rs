@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use devspace_kernel::{ObjectKind, Oid, parse_commit, validate};
-use devspace_machine::{CommitMapping, MachineGitRepository, ProjectionMappings, overlay_lift};
+use devspace_machine::{
+    CommitMapping, LiftError, MachineGitRepository, ProjectionMappings, overlay_lift,
+};
 use gix::objs::{Kind as GitObjectKind, Write as _};
 use jj_lib::backend::{CommitId, TreeValue};
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
@@ -367,6 +369,107 @@ async fn hidden_free_history_is_identity_with_zero_mirrors_and_zero_rows() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn foreign_non_file_dsprivate_entries_fail_before_lift_writes() {
+    for kind in ["directory", "symlink", "gitlink", "conflict"] {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = MachineGitRepository::init(temp.path(), &settings())
+            .await
+            .unwrap();
+        let commit = foreign_invalid_dsprivate_commit(&repository, kind);
+        let before = all_objects(&repository);
+
+        let error = overlay_lift(&repository, &[commit], []).await.unwrap_err();
+
+        match (kind, error) {
+            ("conflict", LiftError::ConflictedPublicCommit(error_commit)) => {
+                assert_eq!(error_commit, commit)
+            }
+            (_, LiftError::InvalidDsprivateEntry { commit_id, path }) => {
+                assert_eq!(commit_id, commit);
+                assert_eq!(path.as_internal_file_string(), ".dsprivate");
+            }
+            (_, other) => panic!("{kind} returned {other:?}"),
+        }
+        assert_eq!(all_objects(&repository), before, "{kind}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shared_public_oid_uses_selected_parent_lineage_to_choose_canonical_seed() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = MachineGitRepository::init(temp.path(), &settings())
+        .await
+        .unwrap();
+    let root_a = write_commit(
+        &repository,
+        write_hidden_tree(&repository, b"root-a secret\n", b"root public\n"),
+        &[],
+        b"shared root\n",
+        &[],
+    );
+    let root_b = write_commit(
+        &repository,
+        write_hidden_tree(&repository, b"root-b secret\n", b"root public\n"),
+        &[],
+        b"shared root\n",
+        &[],
+    );
+    let mut mappings = ProjectionMappings::default();
+    let projected_roots = repository
+        .project_hidden_paths(&[root_a, root_b], &mut mappings)
+        .await
+        .unwrap();
+    assert_eq!(
+        projected_roots.public_heads[0],
+        projected_roots.public_heads[1]
+    );
+
+    let child_a = write_commit(
+        &repository,
+        write_hidden_tree(&repository, b"child-a secret\n", b"child public\n"),
+        &[root_a],
+        b"shared child\n",
+        &[],
+    );
+    let child_b = write_commit(
+        &repository,
+        write_hidden_tree(&repository, b"child-b secret\n", b"child public\n"),
+        &[root_b],
+        b"shared child\n",
+        &[],
+    );
+    let projected_children = repository
+        .project_hidden_paths(&[child_a, child_b], &mut mappings)
+        .await
+        .unwrap();
+    let public_child = projected_children.public_heads[0];
+    assert_eq!(public_child, projected_children.public_heads[1]);
+    let public_root = projected_roots.public_heads[0];
+    let seeds = [
+        CommitMapping {
+            canonical_id: root_a,
+            public_id: public_root,
+        },
+        CommitMapping {
+            canonical_id: child_a,
+            public_id: public_child,
+        },
+        CommitMapping {
+            canonical_id: child_b,
+            public_id: public_child,
+        },
+    ];
+
+    let lifted = overlay_lift(&repository, &[public_child], seeds)
+        .await
+        .unwrap();
+
+    assert_eq!(lifted.canonical_heads, vec![child_a]);
+    assert!(lifted.new_mappings.is_empty());
+    assert!(lifted.mirrors.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn lifted_pairs_seed_push_projection_and_short_circuit_mirror_replay() {
     let temp = tempfile::tempdir().unwrap();
     let repository = MachineGitRepository::init(temp.path(), &settings())
@@ -494,6 +597,57 @@ fn write_flat_tree(repository: &MachineGitRepository, entries: &[(&str, &[u8])])
         tree.extend_from_slice(&id.0);
     }
     write_raw(repository, ObjectKind::Tree, &tree)
+}
+
+fn write_hidden_tree(repository: &MachineGitRepository, secret: &[u8], public: &[u8]) -> Oid {
+    write_flat_tree(
+        repository,
+        &[
+            (".dsprivate", b"secret\n"),
+            ("public", public),
+            ("secret", secret),
+        ],
+    )
+}
+
+fn foreign_invalid_dsprivate_commit(repository: &MachineGitRepository, kind: &str) -> Oid {
+    if kind == "conflict" {
+        let left = write_flat_tree(repository, &[(".dsprivate", b"left\n")]);
+        let base = write_flat_tree(repository, &[("base", b"base\n")]);
+        let right = write_flat_tree(repository, &[(".dsprivate", b"right\n")]);
+        let trees = format!("{} {} {}", oid_hex(left), oid_hex(base), oid_hex(right));
+        return write_commit(
+            repository,
+            left,
+            &[],
+            b"conflicted foreign policy\n",
+            &[
+                (b"jj:trees", trees.as_bytes()),
+                (b"jj:conflict-labels", b"left\n base\n right"),
+            ],
+        );
+    }
+
+    let target = match kind {
+        "directory" => write_flat_tree(repository, &[("nested", b"value\n")]),
+        "symlink" => write_raw(repository, ObjectKind::Blob, b"target"),
+        "gitlink" => {
+            let tree = write_flat_tree(repository, &[("submodule", b"value\n")]);
+            write_commit(repository, tree, &[], b"gitlink target\n", &[])
+        }
+        _ => unreachable!(),
+    };
+    let mode = match kind {
+        "directory" => b"40000".as_slice(),
+        "symlink" => b"120000".as_slice(),
+        "gitlink" => b"160000".as_slice(),
+        _ => unreachable!(),
+    };
+    let mut tree = mode.to_vec();
+    tree.extend_from_slice(b" .dsprivate\0");
+    tree.extend_from_slice(&target.0);
+    let tree = write_raw(repository, ObjectKind::Tree, &tree);
+    write_commit(repository, tree, &[], b"invalid foreign policy\n", &[])
 }
 
 fn write_commit(

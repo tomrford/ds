@@ -69,6 +69,7 @@ pub struct ProjectionGitUpdate {
     pub expected_old_oid: Option<Oid>,
     pub states: Vec<ProjectionGitState>,
     pub proposed_state: Option<usize>,
+    pub identity_oid: Option<Oid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -539,17 +540,24 @@ impl GitHttpTransport {
     pub async fn projection_snapshot_all(
         &self,
     ) -> Result<ProjectionGitSnapshot, GitHttpTransportError> {
-        let mut page = self.projection_snapshot(0, None).await?;
-        let through = page.through;
-        let mut mappings = std::mem::take(&mut page.mappings);
-        let mut after = page.next_after;
-        while page.has_more {
-            page = self.projection_snapshot(after, Some(through)).await?;
+        let mut snapshot = self.projection_snapshot(0, None).await?;
+        let through = snapshot.through;
+        let mut after = snapshot.next_after;
+        let mut has_more = snapshot.has_more;
+        while has_more {
+            let mut page = self.projection_snapshot(after, Some(through)).await?;
+            if page.through != through {
+                return Err(GitHttpTransportError::Protocol(
+                    "projection snapshot page changed its high-water".to_owned(),
+                ));
+            }
             after = page.next_after;
-            mappings.append(&mut page.mappings);
+            has_more = page.has_more;
+            snapshot.mappings.append(&mut page.mappings);
         }
-        page.mappings = mappings;
-        Ok(page)
+        snapshot.next_after = after;
+        snapshot.has_more = false;
+        Ok(snapshot)
     }
 
     pub async fn set_remote(
@@ -986,6 +994,7 @@ fn update_json(update: &ProjectionGitUpdate) -> serde_json::Value {
         "expectedOldOid": update.expected_old_oid.map(|oid| hex(&oid.0)),
         "states": update.states.iter().map(state_json).collect::<Vec<_>>(),
         "proposedState": update.proposed_state,
+        "identityOid": update.identity_oid.map(|oid| hex(&oid.0)),
     })
 }
 
@@ -1043,6 +1052,8 @@ fn deserialize_updates<'de, D: serde::Deserializer<'de>>(
         expected_old_oid: Option<Oid>,
         states: Vec<WireState>,
         proposed_state: Option<usize>,
+        #[serde(default, deserialize_with = "deserialize_optional_oid")]
+        identity_oid: Option<Oid>,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -1070,6 +1081,7 @@ fn deserialize_updates<'de, D: serde::Deserializer<'de>>(
                     })
                     .collect(),
                 proposed_state: update.proposed_state,
+                identity_oid: update.identity_oid,
             })
             .collect()
     })

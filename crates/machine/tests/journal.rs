@@ -230,6 +230,19 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
     .unwrap();
     assert_eq!(signed_result.public_heads["signed"], Some(signed));
     assert_eq!(remote_commit(&remote, signed), signed_bytes);
+    let identity_snapshot = transport_a.projection_snapshot_all().await.unwrap();
+    assert!(
+        identity_snapshot
+            .mappings
+            .iter()
+            .all(|mapping| { mapping.canonical_oid != signed && mapping.public_oid != signed })
+    );
+    assert!(identity_snapshot.cursors.iter().any(|cursor| {
+        cursor.remote == "origin"
+            && cursor.bookmark == "signed"
+            && cursor.canonical_oid == signed
+            && cursor.public_oid == signed
+    }));
     eprintln!("LIVE_PROOF b passed in {:?}", started.elapsed());
 
     // (c) A stops after Git push; fresh B claims and recovers from packs only.
@@ -393,6 +406,54 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
     );
     assert_eq!(remote_ref(&remote, "main"), public_after_fetch);
     eprintln!("LIVE_PROOF d passed in {:?}", started.elapsed());
+
+    // (e) Two hidden-divergent canonical roots can share one public OID. Each
+    // fetched bookmark uses its cursor to select the correct private lineage.
+    let started = std::time::Instant::now();
+    let (shared_a, _) = write_hidden_commit(&a, None, b"shared-a-private");
+    let (shared_b, _) = write_hidden_commit(&a, None, b"shared-b-private");
+    assert_ne!(shared_a, shared_b);
+    let shared_push = push_with_journal(
+        &a,
+        &transport_a,
+        "origin",
+        &[
+            PushHead {
+                bookmark: "shared-a".to_owned(),
+                canonical_oid: Some(shared_a),
+            },
+            PushHead {
+                bookmark: "shared-b".to_owned(),
+                canonical_oid: Some(shared_b),
+            },
+        ],
+        [0x37; 16],
+        &environment,
+        PushFailpoint::None,
+    )
+    .await
+    .unwrap();
+    let shared_public = shared_push.public_heads["shared-a"].unwrap();
+    assert_eq!(shared_push.public_heads["shared-b"], Some(shared_public));
+    let c = MachineGitRepository::init(temp.path().join("machine-c"), &settings())
+        .await
+        .unwrap();
+    let fetched_shared = fetch_with_journal(
+        &c,
+        &transport_b,
+        "origin",
+        &["shared-a".to_owned(), "shared-b".to_owned()],
+        [0x38; 16],
+        &environment,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fetched_shared.public_heads["shared-a"], shared_public);
+    assert_eq!(fetched_shared.public_heads["shared-b"], shared_public);
+    assert_eq!(fetched_shared.canonical_heads["shared-a"], shared_a);
+    assert_eq!(fetched_shared.canonical_heads["shared-b"], shared_b);
+    assert!(fetched_shared.mirrors.is_empty());
+    eprintln!("LIVE_PROOF e passed in {:?}", started.elapsed());
     eprintln!("LIVE_PROOF total {:?}", total.elapsed());
 }
 

@@ -41,7 +41,7 @@ fn repository_data_paths(store: &MachineStore, entry: &CatalogEntry) -> [PathBuf
         entry.native_repository_path.clone(),
         store.repository_sync_path(&entry.identity),
         store.repository_packs_path(&entry.identity),
-        store.repository_projection_path(&entry.identity),
+        store.repository_legacy_projection_path(&entry.identity),
     ]
 }
 

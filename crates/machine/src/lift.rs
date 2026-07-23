@@ -86,12 +86,21 @@ pub async fn overlay_lift(
 ) -> Result<OverlayLiftResult, LiftError> {
     let git = repository.git_repo();
     let store = repository.repo().store();
-    let mut public_to_canonical = BTreeMap::new();
+    let mut seed_candidates = BTreeMap::<Oid, BTreeSet<Oid>>::new();
     for mapping in seed_mappings {
-        if let Some(previous) = public_to_canonical.insert(mapping.public_id, mapping.canonical_id)
-            && previous != mapping.canonical_id
-        {
-            return Err(LiftError::AmbiguousPublicLineage(mapping.public_id));
+        seed_candidates
+            .entry(mapping.public_id)
+            .or_default()
+            .insert(mapping.canonical_id);
+    }
+    let mut public_to_canonical = seed_candidates
+        .iter()
+        .filter(|(_, candidates)| candidates.len() == 1)
+        .map(|(public_id, candidates)| (*public_id, *candidates.first().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    for (public_id, candidates) in &seed_candidates {
+        if candidates.is_empty() {
+            return Err(LiftError::AmbiguousPublicLineage(*public_id));
         }
     }
 
@@ -136,9 +145,10 @@ pub async fn overlay_lift(
 
     let mut transaction = repository.repo().start_transaction();
     let mut indexed_ids = BTreeSet::new();
-    let mut imported = Vec::with_capacity(parent_first.len() + public_to_canonical.len() * 2);
-    for (public_id, canonical_id) in &public_to_canonical {
-        for id in [public_id, canonical_id] {
+    let seed_count = seed_candidates.values().map(BTreeSet::len).sum::<usize>();
+    let mut imported = Vec::with_capacity(parent_first.len() + seed_count * 2);
+    for (public_id, canonical_ids) in &seed_candidates {
+        for id in core::iter::once(public_id).chain(canonical_ids) {
             if indexed_ids.insert(*id) {
                 imported.push(store.get_commit_async(&CommitId::from_bytes(&id.0)).await?);
             }
@@ -168,6 +178,29 @@ pub async fn overlay_lift(
             .iter()
             .map(|parent| public_to_canonical.get(parent).copied().unwrap_or(*parent))
             .collect::<Vec<_>>();
+
+        if let Some(candidates) = seed_candidates.get(&public_id) {
+            let mut matching = Vec::new();
+            for candidate in candidates {
+                let candidate_bytes = read_commit(&git, *candidate)?;
+                let candidate_commit =
+                    parse_commit(&candidate_bytes).map_err(|source| LiftError::InvalidCommit {
+                        id: *candidate,
+                        source,
+                    })?;
+                if candidate_commit.parents == canonical_parents {
+                    matching.push(*candidate);
+                }
+            }
+            match matching.as_slice() {
+                [canonical_id] => {
+                    public_to_canonical.insert(public_id, *canonical_id);
+                    continue;
+                }
+                [] => {}
+                _ => return Err(LiftError::AmbiguousPublicLineage(public_id)),
+            }
+        }
 
         let public_backend_id = CommitId::from_bytes(&public_id.0);
         let public = store.backend().read_commit(&public_backend_id).await?;
@@ -281,7 +314,8 @@ async fn collect_hidden_paths(
         .as_resolved()
         .ok_or(LiftError::ConflictedPublicCommit(commit_id))?;
     let mut paths =
-        collect_hidden_paths_in_tree(store, RepoPath::root(), tree_id, hidden_set).await?;
+        collect_hidden_paths_in_tree(store, RepoPath::root(), tree_id, hidden_set, commit_id)
+            .await?;
     paths.sort_unstable();
     Ok(paths)
 }
@@ -291,17 +325,36 @@ fn collect_hidden_paths_in_tree<'a>(
     path: &'a RepoPath,
     tree_id: &'a TreeId,
     hidden_set: &'a HiddenSet,
+    commit_id: Oid,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<RepoPathBuf>, LiftError>> + 'a>> {
     Box::pin(async move {
         let tree = store.get_tree(path.to_owned(), tree_id).await?;
         let mut paths = Vec::new();
         for entry in tree.entries_non_recursive() {
             let entry_path = path.join(entry.name());
+            if entry.name().as_internal_str() == ".dsprivate" {
+                match entry.value() {
+                    TreeValue::File { .. } => paths.push(entry_path),
+                    TreeValue::Tree(_) | TreeValue::Symlink(_) | TreeValue::GitSubmodule(_) => {
+                        return Err(LiftError::InvalidDsprivateEntry {
+                            commit_id,
+                            path: entry_path,
+                        });
+                    }
+                }
+                continue;
+            }
             match entry.value() {
                 TreeValue::Tree(child_id) => {
                     paths.extend(
-                        collect_hidden_paths_in_tree(store, &entry_path, child_id, hidden_set)
-                            .await?,
+                        collect_hidden_paths_in_tree(
+                            store,
+                            &entry_path,
+                            child_id,
+                            hidden_set,
+                            commit_id,
+                        )
+                        .await?,
                     );
                 }
                 TreeValue::GitSubmodule(_) => {
@@ -510,6 +563,8 @@ pub enum LiftError {
     MissingStagedCommit(Oid),
     #[error("fetched public commit {0:?} is already conflicted")]
     ConflictedPublicCommit(Oid),
+    #[error("fetched public commit {commit_id:?} has non-file .dsprivate at {path:?}")]
+    InvalidDsprivateEntry { commit_id: Oid, path: RepoPathBuf },
     #[error("invalid fetched commit {id:?}")]
     InvalidCommit {
         id: Oid,

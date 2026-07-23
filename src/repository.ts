@@ -19,6 +19,7 @@ interface AuthorityRow extends Record<string, SqlStorageValue> {
   incarnation: ArrayBuffer;
   user_id: string;
   repository_id: string;
+  creation_nonce: string | null;
   retired: number;
 }
 
@@ -39,24 +40,47 @@ export class RepositoryGit extends DurableObject<Env> {
     this.projection = new ProjectionGitStore(this.ctx, sql, kernel);
   }
 
-  initializeRepository(authority: RepositoryAuthority) {
+  async initializeRepository(authority: RepositoryAuthority) {
     try {
-      return this.ctx.storage.transactionSync(() => {
-        const state = this.authorityState();
-        if (state === undefined) {
-          this.ctx.storage.sql.exec(
-            `INSERT INTO repository_state
-             (singleton, incarnation, user_id, repository_id, retired)
-             VALUES (1, ?, ?, ?, 0)`,
-            exactGitBuffer(incarnationBytes(authority.incarnation)),
-            authority.userId,
-            authority.repositoryId,
-          );
-          return { ok: true as const, initialized: true };
-        }
+      const existing = this.authorityState();
+      if (existing !== undefined) {
         this.requireAuthority(authority);
         return { ok: true as const, initialized: false };
+      }
+      const control = this.env.CONTROL_PLANE.getByName("directory");
+      const allowed = await control.validateRepositoryInitialization(authority);
+      if (!allowed.ok) {
+        throw new RepositoryGitAuthorityError(
+          "repository authority is stale",
+          "repository-authority-stale",
+        );
+      }
+      const initialized = this.ctx.storage.transactionSync(() => {
+        const state = this.authorityState();
+        if (state !== undefined) {
+          this.requireAuthority(authority);
+          return false;
+        }
+        this.ctx.storage.sql.exec(
+          `INSERT INTO repository_state
+           (singleton, incarnation, user_id, repository_id, creation_nonce, retired)
+           VALUES (1, ?, ?, ?, ?, 0)`,
+          exactGitBuffer(incarnationBytes(authority.incarnation)),
+          authority.userId,
+          authority.repositoryId,
+          authority.creationNonce,
+        );
+        return true;
       });
+      const confirmed = await control.validateRepositoryInitialization(authority);
+      if (!confirmed.ok) {
+        await this.ctx.storage.deleteAll();
+        throw new RepositoryGitAuthorityError(
+          "repository authority is stale",
+          "repository-authority-stale",
+        );
+      }
+      return { ok: true as const, initialized };
     } catch (error) {
       return authorityFailure(error);
     }
@@ -211,7 +235,7 @@ export class RepositoryGit extends DurableObject<Env> {
   private authorityState(): AuthorityRow | undefined {
     return this.ctx.storage.sql
       .exec<AuthorityRow>(
-        `SELECT incarnation, user_id, repository_id, retired
+        `SELECT incarnation, user_id, repository_id, creation_nonce, retired
          FROM repository_state WHERE singleton = 1`,
       )
       .toArray()[0];
@@ -223,6 +247,7 @@ export class RepositoryGit extends DurableObject<Env> {
       state === undefined ||
       state.user_id !== authority.userId ||
       state.repository_id !== authority.repositoryId ||
+      state.creation_nonce !== authority.creationNonce ||
       !equalGitBytes(new Uint8Array(state.incarnation), incarnationBytes(authority.incarnation))
     ) {
       throw new RepositoryGitAuthorityError(

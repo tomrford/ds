@@ -59,6 +59,7 @@ const projectionGitUpdateSchema = z.strictObject({
   expectedOldOid: nullableOidSchema("expectedOldOid"),
   states: z.array(projectionGitStateSchema),
   proposedState: nonNegativeSafeIntegerSchema.nullable(),
+  identityOid: nullableOidSchema("identityOid"),
 });
 
 const beginProjectionGitBatchSchema = z.strictObject({
@@ -191,6 +192,7 @@ export function canonicalProjectionGitBatchBytes(
           update.expectedOldOid === null ? null : gitToHex(update.expectedOldOid),
         states: update.states.map(encodeProjectionGitState),
         proposedState: update.proposedState,
+        identityOid: update.identityOid === null ? null : gitToHex(update.identityOid),
       })),
     }),
   );
@@ -241,8 +243,12 @@ function validateUpdate(update: ProjectionGitUpdate, index: number) {
   if (update.proposedState !== null && update.proposedState >= update.states.length) {
     throw new Error(`updates[${index}].proposedState is outside states`);
   }
-  if (update.proposedState === null && update.states.length !== 0) {
-    throw new Error(`updates[${index}].states must be empty for a deletion`);
+  if (update.identityOid !== null) {
+    if (update.proposedState !== null || update.states.length !== 0) {
+      throw new Error(`updates[${index}].identityOid requires no states or proposedState`);
+    }
+  } else if (update.proposedState === null && update.states.length !== 0) {
+    throw new Error(`updates[${index}].states must be empty without a proposed state`);
   }
   const stateKeys = update.states
     .map((state) => `${gitToHex(state.canonicalOid)}:${gitToHex(state.publicOid)}`)

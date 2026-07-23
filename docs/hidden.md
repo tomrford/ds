@@ -28,7 +28,7 @@ The hidden-set identity is absent when the commit contains no `.dsprivate`
 files. Otherwise it is Blake2b-512 over `devspace-hidden-set-v1` followed by
 every `.dsprivate` in repository-path byte order. Each entry contains the path
 byte length as an unsigned 64-bit little-endian integer, its UTF-8 path bytes,
-and its 64-byte Jujutsu blob ID.
+and its 20-byte Git blob OID.
 
 A conflicted `.dsprivate`, or one that is not a regular file, fails projection
 closed for that commit. The executable bit is allowed. No public commit is
@@ -85,8 +85,9 @@ Projection resolves every `.dsprivate` in each canonical commit. As the tree
 walk enters a directory, it chains that directory's policy before filtering
 entries.
 
-Policy blob reads are cached by Jujutsu blob ID. Rewritten subtrees are cached
-by source tree, path, and effective policy-chain identity. Every `.dsprivate`
+Policy blob reads are cached by 20-byte Git blob OID. Rewritten subtrees are
+cached by effective policy-chain identity, repository path, and source Git tree
+OID. Every `.dsprivate`
 is excluded. Matching files and symlinks are removed before their objects are
 read. Matching directories are pruned without descent. Empty filtered
 directories are omitted.

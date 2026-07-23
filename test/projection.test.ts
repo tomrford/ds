@@ -1,5 +1,5 @@
 import { env, exports } from "cloudflare:workers";
-import { evictDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { gitToHex } from "../src/kernel";
@@ -234,7 +234,13 @@ describe("Git projection journal v2", () => {
         machineId: defaultMachine,
         remote: "origin",
         updates: [
-          { bookmark: "main", expectedOldOid: publicOid, states: [], proposedState: null },
+          {
+            bookmark: "main",
+            expectedOldOid: publicOid,
+            states: [],
+            proposedState: null,
+            identityOid: null,
+          },
         ],
       }),
     ).toMatchObject({ status: 200, body: { fence: 2 } });
@@ -393,6 +399,155 @@ describe("Git projection journal v2", () => {
     });
   });
 
+  it("pushes identity history with cursor-only state and recovers the pending batch", async () => {
+    const repository = "git-journal-identity-push";
+    const [identityOid] = await installJournalFixture(repository);
+    const repositoryIncarnation = await incarnation(repository);
+    const batchId = "2c".repeat(16);
+    const request = {
+      incarnation: repositoryIncarnation,
+      batchId,
+      machineId: defaultMachine,
+      remote: "origin",
+      updates: [
+        {
+          bookmark: "main",
+          expectedOldOid: null,
+          states: [],
+          proposedState: null,
+          identityOid,
+        },
+      ],
+    };
+
+    expect(await projectionRequest(repository, "pushes", request)).toEqual({
+      status: 200,
+      body: { pending: true, fence: 1 },
+    });
+    expect(await projectionReplay(repository, batchId)).toMatchObject({
+      status: 200,
+      body: { updates: request.updates },
+    });
+    expect(
+      await projectionRequest(
+        repository,
+        `pushes/${batchId}/claim`,
+        { incarnation: repositoryIncarnation, machineId: recoveryMachine },
+        recoveryMachine,
+      ),
+    ).toMatchObject({ status: 200, body: { fence: 2 } });
+    expect(
+      await recover(repository, batchId, repositoryIncarnation, recoveryMachine, 2, [
+        { bookmark: "main", liveOid: null },
+      ]),
+    ).toMatchObject({ status: 409, body: { code: "projection-replay-required" } });
+    expect(await projectionReplay(repository, batchId)).toMatchObject({
+      status: 200,
+      body: { fence: 2, updates: request.updates },
+    });
+    expect(
+      await recover(repository, batchId, repositoryIncarnation, recoveryMachine, 2, [
+        { bookmark: "main", liveOid: identityOid },
+      ]),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+    expect(await projectionSnapshot(repository)).toMatchObject({
+      status: 200,
+      body: {
+        activationCursor: 1,
+        mappings: [],
+        pending: [],
+        cursors: [
+          {
+            bookmark: "main",
+            canonicalOid: identityOid,
+            publicOid: identityOid,
+          },
+        ],
+      },
+    });
+    await runInDurableObject(await repositoryGitStub(repository), (_instance, state) => {
+      for (const table of ["projection_git_states", "projection_git_receipts"]) {
+        expect(
+          state.storage.sql.exec<{ count: number }>(`SELECT count(*) AS count FROM ${table}`).one()
+            .count,
+          table,
+        ).toBe(0);
+      }
+    });
+  });
+
+  it("rejects identity then rewritten and rewritten then identity canonical bindings", async () => {
+    const identityFirst = "git-journal-identity-divergence-first";
+    const [canonicalOid, publicOid] = await installJournalFixture(identityFirst);
+    const identityIncarnation = await incarnation(identityFirst);
+    const identityBatch = "2d".repeat(16);
+    expect(
+      await projectionRequest(identityFirst, "pushes", {
+        incarnation: identityIncarnation,
+        batchId: identityBatch,
+        machineId: defaultMachine,
+        remote: "origin",
+        updates: [
+          {
+            bookmark: "identity",
+            expectedOldOid: null,
+            states: [],
+            proposedState: null,
+            identityOid: canonicalOid,
+          },
+        ],
+      }),
+    ).toMatchObject({ status: 200 });
+    expect(
+      await recover(identityFirst, identityBatch, identityIncarnation, defaultMachine, 1, [
+        { bookmark: "identity", liveOid: canonicalOid },
+      ]),
+    ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
+    expect(
+      await projectionRequest(
+        identityFirst,
+        "pushes",
+        projectionBatch(
+          identityIncarnation,
+          "2e".repeat(16),
+          defaultMachine,
+          projectionUpdate("rewritten", null, canonicalOid, publicOid),
+        ),
+      ),
+    ).toMatchObject({ status: 409, body: { code: "canonical-oid-diverged" } });
+
+    const rewrittenFirst = "git-journal-rewritten-divergence-first";
+    const [rewrittenCanonical, rewrittenPublic] = await installJournalFixture(rewrittenFirst);
+    const rewrittenIncarnation = await incarnation(rewrittenFirst);
+    expect(
+      await projectionRequest(
+        rewrittenFirst,
+        "pushes",
+        projectionBatch(
+          rewrittenIncarnation,
+          "2f".repeat(16),
+          defaultMachine,
+          projectionUpdate("rewritten", null, rewrittenCanonical, rewrittenPublic),
+        ),
+      ),
+    ).toMatchObject({ status: 200 });
+    await putRemote(rewrittenFirst, "origin", "/tmp/origin.git");
+    expect(
+      await projectionRequest(rewrittenFirst, "fetches", {
+        incarnation: rewrittenIncarnation,
+        fetchId: "30".repeat(16),
+        machineId: defaultMachine,
+        remote: "origin",
+        refs: [
+          {
+            ...fetchRef("identity", rewrittenCanonical, null, [], null),
+            identityOid: rewrittenCanonical,
+          },
+        ],
+      }),
+    ).toMatchObject({ status: 409, body: { code: "canonical-oid-diverged" } });
+  });
+
   it("keeps canonical mapping receipts immutable after an aborted batch", async () => {
     const repository = "git-journal-receipt-immutability";
     const [canonicalOid, publicOne, publicTwo] = await installJournalFixture(repository);
@@ -535,7 +690,13 @@ describe("Git projection journal v2", () => {
         machineId: defaultMachine,
         remote: "origin",
         updates: [
-          { bookmark: "main", expectedOldOid: null, states, proposedState: 256 },
+          {
+            bookmark: "main",
+            expectedOldOid: null,
+            states,
+            proposedState: 256,
+            identityOid: null,
+          },
         ],
       }),
     ).toMatchObject({ status: 200, body: { fence: 1 } });
@@ -568,7 +729,13 @@ describe("Git projection journal v2", () => {
       repositoryIncarnation,
       "14".repeat(16),
       defaultMachine,
-      { bookmark: "main", expectedOldOid: null, states: [state], proposedState: 0 },
+      {
+        bookmark: "main",
+        expectedOldOid: null,
+        states: [state],
+        proposedState: 0,
+        identityOid: null,
+      },
     );
     for (const hiddenSetId of ["aa", "AA".repeat(64), "gg".repeat(64)]) {
       expect(
@@ -773,6 +940,7 @@ function projectionUpdate(
     expectedOldOid,
     states: [projectionState(canonicalOid, publicOid, hiddenSetId)],
     proposedState: 0,
+    identityOid: null,
   };
 }
 

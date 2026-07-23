@@ -14,19 +14,20 @@ rewrites an existing object.
 synchronization. The boundary process runs the same synchronization engine as
 the hidden `ds sync run --repository-name <name>` command.
 
-`ds sync status` reports local catalog sequence, accepted cloud operation
-heads, pending outbox entries, and failures for every machine repository. It
-does not contact Git remotes.
+`ds sync status` reports whether the local daemon is running and, for each
+machine repository, whether sync state exists and how many outbox entries are
+pending. It does not report cloud heads or contact Git remotes.
 
-Commands that need the cloud authenticate with:
+Commands that need the cloud send the global development-only
+`DEVSPACE_SHARED_SECRET` as a bearer credential, the repository incarnation in
+`x-devspace-incarnation`, and a syntactically validated but non-authoritative
+`x-devspace-machine-id`. The client capability header is
+`x-devspace-client: ds/<version> git-pack/2`.
 
-- `x-devspace-machine`;
-- `x-devspace-secret`;
-- `x-devspace-incarnation`;
-- `x-devspace-client: ds/<version> git-pack/2`.
-
-The control plane checks the enrolled machine and active repository
-incarnation before forwarding a request to `RepositoryGit`.
+The shared credential selects one fixed development user. The control plane
+checks that user's active repository incarnation before forwarding a request
+to `RepositoryGit`; it does not validate machine enrollment. Per-machine
+credentials are an open limitation, not part of the implemented protocol.
 
 ## Native repository boundary
 

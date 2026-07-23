@@ -2,7 +2,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use devspace_kernel::{
-    ObjectKind, Oid, ReferenceKind, TreeEntryKind, parse_commit, parse_tree, validate,
+    ObjectKind, Oid, ReferenceKind, TreeEntryKind, TreeError, parse_commit, parse_tree, validate,
 };
 
 #[derive(Clone, Debug)]
@@ -228,4 +228,39 @@ fn invalid_jj_metadata_is_handled_without_panics() {
     let invalid_change_id = b"tree 1111111111111111111111111111111111111111\nauthor A <a@example.com> 0 +0000\ncommitter A <a@example.com> 0 +0000\nchange-id ordinary-hex-is-not-jj-reverse-hex\n\n";
     let parsed = parse_commit(invalid_change_id).expect("jj tolerates an invalid change-id");
     assert_eq!(parsed.change_id, None);
+}
+
+#[test]
+fn tree_parser_rejects_noncanonical_order_and_duplicate_names() {
+    let first = tree_entry(b"100644", b"a", 0x11);
+    let second = tree_entry(b"100644", b"b", 0x22);
+    let first_length = first.len();
+
+    let mut swapped = second.clone();
+    swapped.extend_from_slice(&first);
+    assert_eq!(
+        parse_tree(&swapped),
+        Err(TreeError::NonCanonicalOrder {
+            offset: first_length,
+        })
+    );
+
+    let mut duplicate = first;
+    duplicate.extend_from_slice(&second);
+    duplicate.extend_from_slice(&tree_entry(b"100755", b"b", 0x33));
+    assert_eq!(
+        parse_tree(&duplicate),
+        Err(TreeError::DuplicateName {
+            offset: first_length * 2,
+        })
+    );
+}
+
+fn tree_entry(mode: &[u8], name: &[u8], oid_byte: u8) -> Vec<u8> {
+    let mut entry = mode.to_vec();
+    entry.push(b' ');
+    entry.extend_from_slice(name);
+    entry.push(0);
+    entry.extend_from_slice(&[oid_byte; 20]);
+    entry
 }

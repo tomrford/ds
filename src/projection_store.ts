@@ -50,6 +50,7 @@ interface BatchRefRow extends Record<string, SqlStorageValue> {
   bookmark: string;
   expected_old_oid: ArrayBuffer | null;
   proposed_state_id: number | null;
+  identity_oid: ArrayBuffer | null;
   proposed_public_oid: ArrayBuffer | null;
 }
 
@@ -327,6 +328,8 @@ export class ProjectionGitStore {
               state.hidden_set_id === null ? null : gitToHex(new Uint8Array(state.hidden_set_id)),
           })),
           proposedState,
+          identityOid:
+            ref.identity_oid === null ? null : gitToHex(new Uint8Array(ref.identity_oid)),
         };
       });
       return {
@@ -383,9 +386,16 @@ export class ProjectionGitStore {
         );
         for (const update of request.updates) {
           for (const state of update.states) this.requireDurableState(state);
+          if (update.identityOid !== null) {
+            this.requireDurableCommit("identity", update.identityOid);
+            this.requireCanonicalBinding(update.identityOid, update.identityOid);
+          }
         }
         for (const update of request.updates) {
           for (const state of update.states) this.storeReceipt(state);
+          if (update.identityOid !== null) {
+            this.requireCanonicalBinding(update.identityOid, update.identityOid);
+          }
         }
         const fence = this.nextFence(this.meta());
         this.sql.exec(
@@ -419,13 +429,17 @@ export class ProjectionGitStore {
             update.proposedState === null ? null : stateIds[update.proposedState];
           try {
             this.sql.exec(
-              "INSERT INTO projection_git_batch_refs VALUES (?, ?, ?, ?, ?, ?)",
+              `INSERT INTO projection_git_batch_refs
+               (batch_id, position, remote, bookmark, expected_old_oid,
+                proposed_state_id, identity_oid)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
               batchId,
               position,
               request.remote,
               update.bookmark,
               update.expectedOldOid === null ? null : exactGitBuffer(update.expectedOldOid),
               proposedStateId,
+              update.identityOid === null ? null : exactGitBuffer(update.identityOid),
             );
           } catch (error) {
             if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
@@ -712,7 +726,7 @@ export class ProjectionGitStore {
     return this.sql
       .exec<PendingRefSnapshotRow>(
         `SELECT refs.bookmark, refs.expected_old_oid,
-                states.public_oid AS proposed_public_oid
+                coalesce(states.public_oid, refs.identity_oid) AS proposed_public_oid
          FROM projection_git_batch_refs AS refs
          LEFT JOIN projection_git_states AS states ON states.state_id = refs.proposed_state_id
          WHERE refs.batch_id = ? ORDER BY refs.position`,
@@ -769,11 +783,14 @@ export class ProjectionGitStore {
     const pendingAdds = this.sql
       .exec<{ count: number }>(
         `SELECT count(*) AS count FROM projection_git_batch_refs
-         WHERE expected_old_oid IS NULL AND proposed_state_id IS NOT NULL`,
+         WHERE expected_old_oid IS NULL
+           AND (proposed_state_id IS NOT NULL OR identity_oid IS NOT NULL)`,
       )
       .one().count;
     const requestedAdds = request.updates.filter(
-      (update) => update.expectedOldOid === null && update.proposedState !== null,
+      (update) =>
+        update.expectedOldOid === null &&
+        (update.proposedState !== null || update.identityOid !== null),
     ).length;
     if (activeCursors + pendingAdds + requestedAdds > MAX_REPOSITORY_GIT_PROJECTION_REFS) {
       throw new ProjectionGitStoreError(
@@ -855,25 +872,46 @@ export class ProjectionGitStore {
         );
       }
       for (const ref of this.batchRefs(batchId)) {
-        this.sql.exec(
-          "DELETE FROM projection_git_identity_cursors WHERE remote = ? AND bookmark = ?",
-          batch.remote,
-          ref.bookmark,
-        );
-        if (ref.proposed_state_id === null) {
+        if (ref.identity_oid !== null) {
+          if (activation >= Number.MAX_SAFE_INTEGER) {
+            throw new Error("projection activation cursor exceeds the safe integer range");
+          }
+          activation += 1;
           this.sql.exec(
             "DELETE FROM projection_git_cursors WHERE remote = ? AND bookmark = ?",
             batch.remote,
             ref.bookmark,
           );
-        } else {
           this.sql.exec(
-            `INSERT INTO projection_git_cursors VALUES (?, ?, ?)
-             ON CONFLICT (remote, bookmark) DO UPDATE SET state_id = excluded.state_id`,
+            `INSERT INTO projection_git_identity_cursors VALUES (?, ?, ?, ?)
+             ON CONFLICT (remote, bookmark) DO UPDATE SET
+               oid = excluded.oid, activation_seq = excluded.activation_seq`,
             batch.remote,
             ref.bookmark,
-            ref.proposed_state_id,
+            ref.identity_oid,
+            activation,
           );
+        } else {
+          this.sql.exec(
+            "DELETE FROM projection_git_identity_cursors WHERE remote = ? AND bookmark = ?",
+            batch.remote,
+            ref.bookmark,
+          );
+          if (ref.proposed_state_id === null) {
+            this.sql.exec(
+              "DELETE FROM projection_git_cursors WHERE remote = ? AND bookmark = ?",
+              batch.remote,
+              ref.bookmark,
+            );
+          } else {
+            this.sql.exec(
+              `INSERT INTO projection_git_cursors VALUES (?, ?, ?)
+               ON CONFLICT (remote, bookmark) DO UPDATE SET state_id = excluded.state_id`,
+              batch.remote,
+              ref.bookmark,
+              ref.proposed_state_id,
+            );
+          }
         }
       }
       this.sql.exec(
@@ -983,6 +1021,7 @@ export class ProjectionGitStore {
   }
 
   private storeReceipt(state: Pick<ProjectionGitState, "canonicalOid" | "publicOid">) {
+    this.requireCanonicalBinding(state.canonicalOid, state.publicOid);
     const canonicalOid = exactGitBuffer(state.canonicalOid);
     const existing = this.sql
       .exec<ReceiptRow>(
@@ -1005,6 +1044,47 @@ export class ProjectionGitStore {
       canonicalOid,
       exactGitBuffer(state.publicOid),
     );
+  }
+
+  private requireCanonicalBinding(canonicalOid: Uint8Array, publicOid: Uint8Array) {
+    const canonical = exactGitBuffer(canonicalOid);
+    const receipt = this.sql
+      .exec<ReceiptRow>(
+        "SELECT public_oid FROM projection_git_receipts WHERE canonical_oid = ?",
+        canonical,
+      )
+      .toArray()[0];
+    if (
+      receipt !== undefined &&
+      !equalGitBytes(new Uint8Array(receipt.public_oid), publicOid)
+    ) {
+      throw new ProjectionGitStoreError(
+        `canonical OID ${gitToHex(canonicalOid)} already maps to a different public OID`,
+        409,
+        "canonical-oid-diverged",
+      );
+    }
+    if (equalGitBytes(canonicalOid, publicOid)) return;
+    const identityBindings =
+      this.sql
+        .exec<{ count: number }>(
+          "SELECT count(*) AS count FROM projection_git_identity_cursors WHERE oid = ?",
+          canonical,
+        )
+        .one().count +
+      this.sql
+        .exec<{ count: number }>(
+          "SELECT count(*) AS count FROM projection_git_batch_refs WHERE identity_oid = ?",
+          canonical,
+        )
+        .one().count;
+    if (identityBindings !== 0) {
+      throw new ProjectionGitStoreError(
+        `canonical OID ${gitToHex(canonicalOid)} already has an identity binding`,
+        409,
+        "canonical-oid-diverged",
+      );
+    }
   }
 
   private requireExpectedCursors(
@@ -1053,7 +1133,8 @@ export class ProjectionGitStore {
     return this.sql
       .exec<BatchRefRow>(
         `SELECT refs.bookmark, refs.expected_old_oid, refs.proposed_state_id,
-                states.public_oid AS proposed_public_oid
+                refs.identity_oid,
+                coalesce(states.public_oid, refs.identity_oid) AS proposed_public_oid
          FROM projection_git_batch_refs AS refs
          LEFT JOIN projection_git_states AS states ON states.state_id = refs.proposed_state_id
          WHERE refs.batch_id = ? ORDER BY refs.position`,
@@ -1175,7 +1256,14 @@ export class ProjectionGitStore {
   private requireFetchReceiptConsistency(request: RecordGitFetchRequest) {
     const requested = new Map<string, Uint8Array>();
     for (const ref of request.refs) {
-      for (const state of ref.states) {
+      const bindings = ref.states.map((state) => ({
+        canonicalOid: state.canonicalOid,
+        publicOid: state.publicOid,
+      }));
+      if (ref.identityOid !== null) {
+        bindings.push({ canonicalOid: ref.identityOid, publicOid: ref.identityOid });
+      }
+      for (const state of bindings) {
         const key = gitToHex(state.canonicalOid);
         const prior = requested.get(key);
         if (prior !== undefined && !equalGitBytes(prior, state.publicOid)) {
@@ -1185,22 +1273,7 @@ export class ProjectionGitStore {
             "canonical-oid-diverged",
           );
         }
-        const existing = this.sql
-          .exec<ReceiptRow>(
-            "SELECT public_oid FROM projection_git_receipts WHERE canonical_oid = ?",
-            exactGitBuffer(state.canonicalOid),
-          )
-          .toArray()[0];
-        if (
-          existing !== undefined &&
-          !equalGitBytes(new Uint8Array(existing.public_oid), state.publicOid)
-        ) {
-          throw new ProjectionGitStoreError(
-            `canonical OID ${key} already maps to a different public OID`,
-            409,
-            "canonical-oid-diverged",
-          );
-        }
+        this.requireCanonicalBinding(state.canonicalOid, state.publicOid);
         requested.set(key, state.publicOid);
       }
     }

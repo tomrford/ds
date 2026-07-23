@@ -20,7 +20,13 @@ nix develop -c pnpm test
 
 `pnpm check` regenerates Worker types, builds the validation WebAssembly
 module, type-checks the Worker, runs Clippy for every Rust target, and checks
-Rust formatting. `pnpm test` runs the complete Rust and Worker test suites.
+Rust formatting. `pnpm test` runs the default Rust and Worker suites; tests
+that require live credentials remain ignored.
+
+Before deployment, run the ignored live journal, push, and fetch suites against
+a local `wrangler dev` instance with `DEVSPACE_URL` and
+`DEVSPACE_SHARED_SECRET` set. This credentialed rung exercises the real
+Rust-to-Worker boundary without deploying it.
 
 Build the Worker without deploying it:
 
@@ -38,10 +44,10 @@ One logical repository has three parts:
 - one cloud `RepositoryGit` Durable Object containing validated Git packs,
   operation objects, operation heads, and the public-Git projection journal.
 
-The Worker `ControlPlaneV2` Durable Object owns repository names, machine
-enrollment, authorization, retirement, and repository creation. A repository
-Durable Object accepts requests only while the control plane confirms its
-incarnation.
+The Worker `ControlPlaneV2` Durable Object owns repository names, repository
+authorization, retirement, and creation. A repository Durable Object can
+initialize only while the control plane confirms its incarnation and
+single-repository creation nonce.
 
 Canonical commits, trees, and blobs are ordinary Git objects. Jujutsu
 operations and views use jj's simple operation-store protobuf encoding and
@@ -164,13 +170,18 @@ See [Hidden files](docs/hidden.md), [Git projection](docs/git-projection.md),
 
 ## Current authentication
 
-Machines authenticate with an enrolled machine ID and shared secret. The
-Worker hashes the secret before lookup and authorizes every repository request
-through the control plane. Repository incarnations prevent a retired Durable
-Object from becoming active again.
+Authentication is development-only. Every client uses one global
+`DEVSPACE_SHARED_SECRET` bearer credential, and the Worker maps it to the fixed
+`DEVSPACE_DEVELOPMENT_USER_ID`. The `x-devspace-machine-id` header is
+caller-supplied metadata; the Worker validates its syntax but does not enroll
+the machine or bind the header to a credential. The control plane authorizes
+the fixed user against the repository ID, incarnation, and creation nonce.
 
-Authentication is intentionally machine-scoped. User accounts, interactive
-login, and delegated repository sharing are outside the current contract.
+### Authentication limitations and open items
+
+Per-machine credentials, machine enrollment, user accounts, interactive login,
+and delegated repository sharing are not implemented. Per-machine credentials
+remain an open product decision.
 
 ## Reference
 

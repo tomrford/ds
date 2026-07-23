@@ -1,76 +1,75 @@
-# GitBackend swap — spike plan
+# GitBackend swap decision record
 
 Status: completed; the validated GitBackend stack is now the primary implementation.
 
-The canonical store moves from jj's SimpleBackend to jj's GitBackend
-(colocated git odb as the object store). Clean cut: the worker is wiped and
-redeployed; no migration code, ever. Three spikes mirror the repository's
-original v3 spike phase: each is validated in isolation with its own proof
-tests before any integrated intermediate state exists.
+The canonical store moved from jj's SimpleBackend to jj's GitBackend, with the
+colocated Git object database as the object store. The cutover used a Worker
+data wipe and redeploy. No repository data migration code was added.
+`wrangler.jsonc` still contains Durable Object class migrations because those
+are Cloudflare platform lifecycle declarations, not repository data
+migrations.
 
-Verified foundation (jj-lib 0.42): GitBackend is self-contained in git object
-bytes — change IDs ride in the `change-id` commit header or derive
-deterministically from the commit OID (bit reversal); conflicted root trees
-ride in the `jj:trees` header plus conflict-label headers; the `extra/`
-TableStore is a rebuildable cache. Content identity is the SHA-1 of the
-object bytes, so kernel validation loses the proto re-encode check and gains
-git-format parsing.
+Three spikes mirrored the repository's original v3 spike phase. Each was
+validated in isolation before the integrated cutover.
 
-## Spike 1 — validation kernel on git formats
+The verified jj-lib 0.42 foundation was that GitBackend is self-contained in
+Git object bytes. Change IDs ride in the `change-id` commit header or derive
+deterministically from the commit OID by bit reversal. Conflicted root trees
+ride in the `jj:trees` header plus conflict-label headers. The `extra/`
+TableStore is a rebuildable cache. Content identity is the SHA-1 of the object
+bytes, so kernel validation replaced the proto re-encode check with Git format
+parsing.
 
-New crate `crates/kernel-git` (the existing kernel stays untouched until
-cutover). Proves the cloud can validate git objects under the existing
-doctrine: no reachable panics, no jj-lib/gix dependency, zero-import wasm.
+## Spike 1 — validation kernel on Git formats
 
-- Hand-written no-panic parsers for git commit, tree, and blob object bytes:
+The spike began as `crates/kernel-git`; it became `crates/kernel` at cutover.
+It proved that the cloud could validate Git objects with no reachable panics,
+no jj-lib or gix dependency, and a zero-import WebAssembly module.
+
+- Hand-written no-panic parsers covered Git commit, tree, and blob object bytes:
   header/continuation-line handling (`gpgsig`, `mergetag`, `encoding`,
   `jj:trees`, `change-id`, conflict labels, unknown headers preserved
   opaquely), binary tree entries (mode, name, OID), blob passthrough.
-- Reference extraction: commit → tree + parents; tree → entry OIDs.
-- Identity: SHA-1 with collision detection (dependency chosen by health
-  check; pure Rust, no_std-capable, wasm-safe). Object ID must equal the
-  hash of the exact bytes; validation is parseability + reference
+- Reference extraction covered commit → tree + parents and tree → entry OIDs.
+- Identity used SHA-1 with collision detection in a pure Rust, `no_std`-capable,
+  WebAssembly-safe dependency. The object ID had to equal the hash of the exact
+  bytes; validation was parseability plus reference
   extraction + bounds, not re-encoding.
-- Golden vectors regenerated the original way: walked out of a real git
+- Golden vectors were regenerated from a real Git
   repository plus jj-lib 0.42 GitBackend as oracle — signed commits, merge
   commits, mergetag headers, non-UTF-8 metadata, conflicted jj commits with
   `jj:trees`, executable files, symlinks, nested trees.
-- Mutation suite: every truncation and single-byte mutation of every
-  structured vector errors without panicking.
-- Wasm: zero imports, native/wasm ID parity on all vectors, measured against
-  the 200 KiB budget (SHA-1DC code size is a known risk — measure, do not
-  assume).
+- The mutation suite made every truncation and single-byte mutation of every
+  structured vector return without panicking.
+- The WebAssembly proof had zero imports, native/WebAssembly ID parity on all
+  vectors, and a measured result under the 200 KiB budget.
 
-Standalone tags are out of scope (tags are outside the push surface;
-`mergetag` rides inside commit bytes). The op store stays proto + Blake2 and
-is untouched.
+Standalone tags remained outside the push surface; `mergetag` rides inside
+commit bytes. The operation store remained protobuf plus Blake2b.
 
-## Spike 2 — machine store on the git odb
+## Spike 2 — machine store on the Git object database
 
-Proves closure discovery, deterministic packs, and cloud sync over 20-byte
-IDs with the git odb as the object source. Re-runs the original proofs:
-pack round trip, exact cloud rebuild from a fresh machine, command-boundary
-recovery. Extras-table reconstruction from object bytes is proven here
-(imported foreign commits get deterministic synthetic change IDs).
+This spike proved closure discovery, deterministic packs, and cloud sync over
+20-byte IDs with the Git object database as the object source. It reran pack
+round-trip, exact fresh-machine cloud rebuild, and command-boundary recovery
+proofs. It also proved `store/extra` reconstruction from object bytes,
+including deterministic synthetic change IDs for imported foreign commits.
 
 ## Spike 3 — projection under the colocated shape
 
-Proves hidden-path filtering as a git-to-git rewrite with an OID→OID mapping
-table: identity fast path for hidden-free ancestry cones (mapping row only
-where filtering rewrote), filtered public commits stored as first-class
-canonical objects (cloud-durable — the byte-custody problem dissolves),
-journal/lease/recovery machinery re-plumbed to 20-byte canonical IDs.
-Push/fetch/recovery proofs re-run, including fresh-machine recovery from
+This spike proved hidden-path filtering as a Git-to-Git rewrite with an
+OID-to-OID journal. Hidden-free ancestry cones used the identity fast path and
+created no mapping row. Rewritten public commits became cloud-durable Git
+objects in the colocated database. The journal, lease, push, fetch, and recovery
+paths moved to 20-byte canonical IDs, including fresh-machine recovery from
 cloud packs alone.
 
-## Gates
+## Outcome
 
-Each spike lands only when its proof tests are green in isolation. Anything
-that meaningfully diverges from this plan stops for discussion before
-implementation continues. After all three: integration (CLI cutover, worker
-wipe/redeploy), then a simplification pass over semi-legacy machinery whose
-assumptions the swap invalidates (sign-on-export custody, rewrite handling,
-shim fabrication), then dogfooding resumes.
+All three spike proof suites passed before the CLI and Worker integration
+cutover. The final implementation removed the SimpleBackend data model,
+retained GitBackend-compatible canonical bytes, and simplified projection and
+recovery around the colocated Git object database.
 
 ## Open item
 

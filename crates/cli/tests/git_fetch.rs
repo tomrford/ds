@@ -173,9 +173,8 @@ async fn force_pushed_remote_history_fails_closed_without_journal_mutation() {
     let rejected = fixture.fetch(&["-b", "main"]);
     assert_eq!(rejected.status.code(), Some(1));
     assert!(
-        stderr(&rejected).contains(
-            "remote history for main was rewritten outside devspace; fetching rewritten history is not supported yet"
-        ),
+        stderr(&rejected)
+            .contains("remote ref origin/main does not descend from its projection cursor"),
         "{}",
         stderr(&rejected)
     );

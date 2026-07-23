@@ -54,8 +54,8 @@ path or rewritten parent creates a minimal public commit in the same Git
 object database.
 
 The cloud receives both canonical and public closures before the batch begins.
-This makes the batch recoverable by any enrolled machine with the repository
-identity.
+This makes the batch recoverable by any client with the development credential
+and repository identity.
 
 ## Leases and atomic journal state
 
@@ -80,10 +80,13 @@ The subprocess receives:
 - literal `refs/heads/<bookmark>` destinations;
 - canonical public source OIDs from the shared bare object database;
 - exact expected-old leases;
-- isolated credential and prompt settings.
+- the user's Git configuration and credential helpers.
 
 Devspace parses porcelain output and then observes the remote refs. Process
-exit alone is not proof of the final remote state.
+exit alone is not proof of the final remote state. A foreground push may invoke
+a credential helper or prompt in the terminal. Background recovery inherits the
+credential configuration but sets `GIT_TERMINAL_PROMPT=0`, so it fails instead
+of waiting for interactive input.
 
 The remote URL is stored in the projection journal. Normal Jujutsu Git commands
 that bypass this boundary are rejected for owned Devspace repositories.

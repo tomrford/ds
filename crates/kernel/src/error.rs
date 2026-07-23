@@ -40,6 +40,8 @@ pub enum TreeError {
     InvalidMode { offset: usize },
     MissingNameTerminator { offset: usize },
     InvalidName { offset: usize },
+    DuplicateName { offset: usize },
+    NonCanonicalOrder { offset: usize },
     TruncatedObjectId { offset: usize },
 }
 
@@ -125,6 +127,18 @@ impl fmt::Display for TreeError {
             }
             Self::InvalidName { offset } => {
                 write!(formatter, "tree entry at byte {offset} has an invalid name")
+            }
+            Self::DuplicateName { offset } => {
+                write!(
+                    formatter,
+                    "tree entry at byte {offset} duplicates an earlier name"
+                )
+            }
+            Self::NonCanonicalOrder { offset } => {
+                write!(
+                    formatter,
+                    "tree entry at byte {offset} is not in canonical Git order"
+                )
             }
             Self::TruncatedObjectId { offset } => {
                 write!(

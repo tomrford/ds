@@ -61,7 +61,12 @@ describe("cloud identity and repository directory", () => {
     const repository = env.REPOSITORIES.getByName(created.repositoryId);
     expect(
       await repository.putPackManifest(
-        { ...stranger, repositoryId: created.repositoryId, incarnation: created.incarnation },
+        {
+          ...stranger,
+          repositoryId: created.repositoryId,
+          incarnation: created.incarnation,
+          creationNonce: "00".repeat(16),
+        },
         packId,
         new Uint8Array(),
       ),
@@ -283,6 +288,12 @@ describe("cloud identity and repository directory", () => {
     const idempotencyKey = "42".repeat(16);
     const repository = await createRepository(machineId, "retiring-replay", idempotencyKey);
     const control = env.CONTROL_PLANE.getByName("directory");
+    const staleAuthorization = await control.authorizeRepository(
+      { userId, machineId },
+      repository.repositoryId,
+      repository.incarnation,
+    );
+    if (!staleAuthorization.ok) throw new Error(staleAuthorization.error);
     expect(
       await control.beginTestRepositoryRetirement(
         { userId, machineId },
@@ -310,14 +321,21 @@ describe("cloud identity and repository directory", () => {
     );
 
     const repositoryStub = env.REPOSITORIES.getByName(repository.repositoryId);
+    await evictDurableObject(repositoryStub);
     expect(
-      await repositoryStub.initializeRepository({
-        userId,
-        machineId,
-        repositoryId: repository.repositoryId,
-        incarnation: repository.incarnation,
-      }),
-    ).toMatchObject({ ok: false, status: 409 });
+      await repositoryStub.initializeRepository(staleAuthorization.authority),
+    ).toMatchObject({
+      ok: false,
+      status: 409,
+      code: "repository-authority-stale",
+    });
+    expect(
+      await repositoryStub.putPackManifest(
+        staleAuthorization.authority,
+        packId,
+        new Uint8Array(),
+      ),
+    ).toMatchObject({ ok: false, status: 409, code: "repository-authority-stale" });
   });
 
   it("reports a replay whose repository is concurrently retiring", async () => {
@@ -367,12 +385,13 @@ describe("cloud identity and repository directory", () => {
     const machineId = "51".repeat(16);
     const first = await createRepository(machineId, "replaceable", "51".repeat(16));
     const firstStub = env.REPOSITORIES.getByName(first.repositoryId);
-    const firstAuthority = {
-      userId: env.DEVSPACE_DEVELOPMENT_USER_ID,
-      machineId,
-      repositoryId: first.repositoryId,
-      incarnation: first.incarnation,
-    };
+    const authorized = await env.CONTROL_PLANE.getByName("directory").authorizeRepository(
+      { userId: env.DEVSPACE_DEVELOPMENT_USER_ID, machineId },
+      first.repositoryId,
+      first.incarnation,
+    );
+    if (!authorized.ok) throw new Error(authorized.error);
+    const firstAuthority = authorized.authority;
     expect(await firstStub.initializeRepository(firstAuthority)).toMatchObject({ ok: true });
     await runInDurableObject(firstStub, (_instance, state) => {
       state.storage.sql.exec(
@@ -405,12 +424,7 @@ describe("cloud identity and repository directory", () => {
     });
     expect(
       await firstStub.putPackManifest(
-        {
-          userId: env.DEVSPACE_DEVELOPMENT_USER_ID,
-          machineId,
-          repositoryId: first.repositoryId,
-          incarnation: first.incarnation,
-        },
+        firstAuthority,
         packId,
         new Uint8Array(),
       ),

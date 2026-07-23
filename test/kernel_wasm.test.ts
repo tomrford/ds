@@ -72,6 +72,19 @@ it("matches ported operation IDs and enforces 20-byte Git view references throug
   ]);
 });
 
+it("rejects swapped and duplicate tree entries through Wasm", () => {
+  const kernel = new Kernel();
+  const first = treeEntry("100644", "a", 0x11);
+  const second = treeEntry("100644", "b", 0x22);
+
+  expect(() => kernel.validate(1, concatenate(second, first))).toThrow(
+    "not in canonical Git order",
+  );
+  expect(() =>
+    kernel.validate(1, concatenate(first, second, treeEntry("100755", "b", 0x33))),
+  ).toThrow("duplicates an earlier name");
+});
+
 function validate(exports: GitKernelExports, kind: number, bytes: Uint8Array): Uint8Array {
   const inputPointer = exports.kernel_alloc(bytes.byteLength);
   try {
@@ -125,4 +138,22 @@ function decodeRle(value: string): Uint8Array {
       return Array(Number.parseInt(count, 10)).fill(Number.parseInt(byte, 16));
     }),
   );
+}
+
+function treeEntry(mode: string, name: string, oidByte: number): Uint8Array {
+  return concatenate(
+    new TextEncoder().encode(`${mode} ${name}`),
+    new Uint8Array([0]),
+    new Uint8Array(20).fill(oidByte),
+  );
+}
+
+function concatenate(...parts: Uint8Array[]): Uint8Array {
+  const result = new Uint8Array(parts.reduce((length, part) => length + part.byteLength, 0));
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.byteLength;
+  }
+  return result;
 }

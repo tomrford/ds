@@ -6,7 +6,9 @@ Cloudflare-native devspace. The current contract is in `README.md` and
 The legacy `tomrford/devspace-legacy` repository is a historical behavioural
 reference only; nothing canonical depends on it.
 
-This is a ds checkout — use `ds`, never git or jj directly.
+Detect the VCS surface before use. In a ds checkout, use `ds`, never git or jj
+directly. A plain Git checkout uses `git`; this tree becomes a ds checkout again
+after re-initialization.
 
 Gate: `nix develop -c pnpm check` and `nix develop -c pnpm test`.
 
@@ -21,6 +23,8 @@ Gate: `nix develop -c pnpm check` and `nix develop -c pnpm test`.
   conflict-label headers, unknown-header handling, and reconstruction of the
   rebuildable `store/extra` cache. Mirror changes in `commit.rs`, `tree.rs`,
   `hash.rs`, and object-reference extraction.
+- Use `crates/kernel-oracle`, which may depend on jj-lib, to generate and compare
+  oracle results during the audit. Keep jj-lib out of `crates/kernel` itself.
 - Audit operation and view encoding in `simple_op_store.rs` plus the
   `ContentHash` implementations, struct field orders, merge encodings, and enum
   ordinals in `backend.rs`, `op_store.rs`, `merge.rs`, and
@@ -32,8 +36,9 @@ Gate: `nix develop -c pnpm check` and `nix develop -c pnpm test`.
   rather than normalizing them.
 - The accepted schemas are exactly Git blob/tree/commit objects as used by
   GitBackend and jj's simple operation store. Do not add Devspace-only object
-  fields. Values GitBackend cannot store, including Git submodules, must fail
-  before a canonical commit is written.
+  fields. Gitlink rejection is Devspace projection policy, not a GitBackend
+  storage limitation; reject Gitlinks before a canonical commit crosses that
+  boundary.
 - Gitignore matching through jj-lib's gix-ignore wrapper is canonical private
   projection behavior. Audit it against the machine projection and working-copy
   tests on every jj bump.

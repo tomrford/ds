@@ -832,9 +832,9 @@ async fn fresh_machine_claims_and_replays_a_push_left_pending_after_git_moved() 
         .unwrap();
     assert!(
         !machine_store(&fixture.home_b)
-            .repository_projection_path(&machine_b_entry.identity)
+            .repository_legacy_projection_path(&machine_b_entry.identity)
             .exists(),
-        "fresh machine unexpectedly has a Git projection sidecar"
+        "fresh machine unexpectedly has a legacy projection directory"
     );
 
     let recovered = fixture.push(&checkout_b, &fixture.home_b, &config_b, "main");
@@ -1233,6 +1233,7 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                             let proposed = update["proposedState"]
                                 .as_u64()
                                 .map(|index| update["states"][index as usize]["publicOid"].clone())
+                                .or_else(|| update["identityOid"].as_str().map(serde_json::Value::from))
                                 .unwrap_or(serde_json::Value::Null);
                             serde_json::json!({
                                 "bookmark": update["bookmark"],
@@ -1389,6 +1390,16 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                             mappings.push(mapping);
                         }
                     }
+                } else if let Some(identity_oid) = update["identityOid"].as_str() {
+                    assert_eq!(observation["liveOid"], identity_oid);
+                    cursors.push(serde_json::json!({
+                        "remote": remote,
+                        "bookmark": bookmark,
+                        "canonicalOid": identity_oid,
+                        "publicOid": identity_oid,
+                        "hiddenSetId": null,
+                        "activationSequence": activation_cursor,
+                    }));
                 } else {
                     assert!(observation["liveOid"].is_null());
                 }

@@ -227,6 +227,7 @@ pub async fn push_with_journal(
     }
     for head in &journal_heads {
         if let (Some(canonical), Some(public)) = (head.canonical_oid, public_heads[&head.bookmark])
+            && canonical != public
             && !states.iter().any(|state| state.canonical_oid == canonical)
         {
             let hidden_set_id = repository
@@ -245,21 +246,32 @@ pub async fn push_with_journal(
         .iter()
         .map(|head| {
             let cursor = cursor_by_bookmark.get(head.bookmark.as_str());
-            let proposed_state = head.canonical_oid.map(|canonical| {
+            let public_head = public_heads[&head.bookmark];
+            let identity_oid = head
+                .canonical_oid
+                .filter(|canonical| public_head == Some(*canonical));
+            let own_states = public_head.map_or_else(Vec::new, |public| {
                 states
                     .iter()
-                    .position(|state| state.canonical_oid == canonical)
-                    .expect("head state was inserted")
+                    .filter(|state| reaches(repository, public, state.public_oid))
+                    .cloned()
+                    .collect::<Vec<_>>()
             });
+            let proposed_state = head.canonical_oid.and_then(|canonical| {
+                own_states
+                    .iter()
+                    .position(|state| state.canonical_oid == canonical)
+            });
+            debug_assert!(
+                head.canonical_oid.is_none() || identity_oid.is_some() || proposed_state.is_some(),
+                "rewritten push head state was inserted"
+            );
             ProjectionGitUpdate {
                 bookmark: head.bookmark.clone(),
                 expected_old_oid: cursor.map(|cursor| cursor.public_oid),
-                states: if proposed_state.is_some() {
-                    states.clone()
-                } else {
-                    Vec::new()
-                },
+                states: own_states,
                 proposed_state,
+                identity_oid,
             }
         })
         .collect::<Vec<_>>();
@@ -306,14 +318,16 @@ pub async fn push_with_journal(
     }
 
     let leases = lease_updates(&updates)?;
-    let report = match push(
+    let (report, push_error) = match push(
         repository.git_repo_path(),
         &remote_url,
         &leases,
         environment,
     ) {
-        Ok(report) => report,
-        Err(error) if error.kind == PushErrorKind::PushFailed => error.report,
+        Ok(report) => (report, None),
+        Err(error) if error.kind == PushErrorKind::PushFailed => {
+            (error.report.clone(), Some(error))
+        }
         Err(error) => return Err(error.into()),
     };
     if failpoint == PushFailpoint::AfterGitPush {
@@ -323,7 +337,14 @@ pub async fn push_with_journal(
     let recovered = transport
         .recover_push(batch_id, begun.fence, &observations)
         .await?;
-    require_accepted(&recovered)?;
+    if let Err(journal_error) = require_accepted(&recovered) {
+        if recovered.outcome.as_deref() == Some("aborted")
+            && let Some(push_error) = push_error
+        {
+            return Err(push_error.into());
+        }
+        return Err(journal_error);
+    }
     Ok(PushFlowResult {
         batch_id: Some(batch_id),
         outcome: "accepted".to_owned(),
@@ -364,37 +385,69 @@ pub async fn fetch_with_journal(
         &remote_url,
         environment,
     )?;
-    let public_heads = fetched.heads.values().copied().collect::<Vec<_>>();
-    let lifted = overlay_lift(
-        repository,
-        &public_heads,
-        snapshot.mappings.iter().map(|mapping| CommitMapping {
-            canonical_id: mapping.canonical_oid,
-            public_id: mapping.public_oid,
-        }),
-    )
-    .await?;
-    let canonical_heads = fetched
-        .heads
-        .keys()
-        .cloned()
-        .zip(lifted.canonical_heads.iter().copied())
+    // Cursor and mapping rows can select canonical commits that are not
+    // reachable from the public Git remote. Install the cloud object catalog
+    // before lift so a fresh machine can resolve those private lineages.
+    download_cloud_catalog(repository, transport).await?;
+    let cursor_by_bookmark = snapshot
+        .cursors
+        .iter()
+        .filter(|cursor| cursor.remote == remote)
+        .map(|cursor| (cursor.bookmark.as_str(), cursor))
         .collect::<BTreeMap<_, _>>();
-    let mut all_states = Vec::with_capacity(lifted.new_mappings.len());
-    for mapping in &lifted.new_mappings {
-        let hidden_set_id = repository
-            .hidden_set_for_commit(mapping.canonical_id)
-            .await?
-            .identity()
-            .to_projection_id();
-        all_states.push(ProjectionGitState {
-            canonical_oid: mapping.canonical_id,
-            public_oid: mapping.public_id,
-            hidden_set_id,
-        });
+    let mut canonical_heads = BTreeMap::new();
+    let mut states_by_bookmark = BTreeMap::<String, Vec<ProjectionGitState>>::new();
+    let mut mirrors = Vec::new();
+    let mut disclosures = Vec::new();
+    for (bookmark, public_head) in &fetched.heads {
+        let cursor = cursor_by_bookmark.get(bookmark.as_str()).copied();
+        if let Some(cursor) = cursor
+            && !reaches(repository, *public_head, cursor.public_oid)
+        {
+            return Err(JournalFlowError::RefRewritten {
+                remote: remote.to_owned(),
+                bookmark: bookmark.clone(),
+            });
+        }
+        let seed_rows = snapshot
+            .mappings
+            .iter()
+            .filter(|mapping| {
+                mapping.remote == remote
+                    && cursor.is_none_or(|cursor| {
+                        mapping.public_oid != cursor.public_oid
+                            || mapping.canonical_oid == cursor.canonical_oid
+                    })
+            })
+            .map(|mapping| CommitMapping {
+                canonical_id: mapping.canonical_oid,
+                public_id: mapping.public_oid,
+            })
+            .chain(cursor.into_iter().map(|cursor| CommitMapping {
+                canonical_id: cursor.canonical_oid,
+                public_id: cursor.public_oid,
+            }));
+        let lifted = overlay_lift(repository, &[*public_head], seed_rows).await?;
+        let canonical_head = lifted.canonical_heads[0];
+        canonical_heads.insert(bookmark.clone(), canonical_head);
+        let mut states = Vec::with_capacity(lifted.new_mappings.len());
+        for mapping in &lifted.new_mappings {
+            let hidden_set_id = repository
+                .hidden_set_for_commit(mapping.canonical_id)
+                .await?
+                .identity()
+                .to_projection_id();
+            states.push(ProjectionGitState {
+                canonical_oid: mapping.canonical_id,
+                public_oid: mapping.public_id,
+                hidden_set_id,
+            });
+        }
+        states_by_bookmark.insert(bookmark.clone(), states);
+        mirrors.extend(lifted.mirrors);
+        disclosures.extend(lifted.disclosures);
     }
-    let disclosure_warnings = lifted
-        .disclosures
+    let disclosure_warnings = disclosures
         .iter()
         .map(|disclosure| disclosure.warning())
         .collect::<Vec<_>>();
@@ -409,30 +462,14 @@ pub async fn fetch_with_journal(
         .collect::<Vec<_>>();
     upload_closure(repository, transport, &closure_heads).await?;
 
-    let cursor_by_bookmark = snapshot
-        .cursors
-        .iter()
-        .filter(|cursor| cursor.remote == remote)
-        .map(|cursor| (cursor.bookmark.as_str(), cursor))
-        .collect::<BTreeMap<_, _>>();
-    let states = all_states;
     let refs = fetched
         .heads
         .iter()
         .map(|(bookmark, public_head)| {
-            if let Some(cursor) = cursor_by_bookmark.get(bookmark.as_str())
-                && !reaches(repository, *public_head, cursor.public_oid)
-            {
-                return Err(JournalFlowError::RefRewritten {
-                    remote: remote.to_owned(),
-                    bookmark: bookmark.clone(),
-                });
-            }
-            let own_states = states
-                .iter()
-                .filter(|state| reaches(repository, *public_head, state.public_oid))
+            let own_states = states_by_bookmark
+                .get(bookmark)
                 .cloned()
-                .collect::<Vec<_>>();
+                .expect("lift states were recorded per fetched bookmark");
             let proposed_state = own_states
                 .iter()
                 .position(|state| state.public_oid == *public_head);
@@ -455,7 +492,7 @@ pub async fn fetch_with_journal(
         receipt,
         public_heads: fetched.heads,
         canonical_heads,
-        mirrors: lifted.mirrors,
+        mirrors,
         disclosure_warnings,
     })
 }
@@ -525,20 +562,24 @@ fn lease_updates(
     updates
         .iter()
         .map(|update| {
-            let new_oid = update
-                .proposed_state
-                .map(|index| {
-                    update
-                        .states
-                        .get(index)
-                        .map(|state| state.public_oid)
-                        .ok_or_else(|| {
-                            JournalFlowError::Protocol(
-                                "proposed state is outside its state array".to_owned(),
-                            )
-                        })
-                })
-                .transpose()?;
+            let new_oid = if let Some(identity_oid) = update.identity_oid {
+                Some(identity_oid)
+            } else {
+                update
+                    .proposed_state
+                    .map(|index| {
+                        update
+                            .states
+                            .get(index)
+                            .map(|state| state.public_oid)
+                            .ok_or_else(|| {
+                                JournalFlowError::Protocol(
+                                    "proposed state is outside its state array".to_owned(),
+                                )
+                            })
+                    })
+                    .transpose()?
+            };
             Ok((
                 QualifiedRef::from_bookmark(&update.bookmark)?,
                 LeaseUpdate {

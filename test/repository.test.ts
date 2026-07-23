@@ -454,12 +454,13 @@ async function ensureRepository(name: string) {
 
 async function repositoryAuthority(name: string) {
   const repository = await ensureRepository(name);
-  return {
-    userId: env.DEVSPACE_DEVELOPMENT_USER_ID,
-    machineId: defaultMachine,
-    repositoryId: repository.repositoryId,
-    incarnation: repository.incarnation,
-  };
+  const authorized = await env.CONTROL_PLANE.getByName("directory").authorizeRepository(
+    { userId: env.DEVSPACE_DEVELOPMENT_USER_ID, machineId: defaultMachine },
+    repository.repositoryId,
+    repository.incarnation,
+  );
+  if (!authorized.ok) throw new Error(authorized.error);
+  return authorized.authority;
 }
 
 async function repositoryGitStub(name: string) {

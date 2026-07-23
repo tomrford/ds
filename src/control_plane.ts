@@ -8,8 +8,14 @@ const machineIdSchema = lowerHexStringSchema(16, "machine ID");
 const repositoryNameSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/);
 const repositoryIdSchema = lowerHexStringSchema(32, "repository ID");
 const incarnationSchema = lowerHexStringSchema(16, "incarnation");
+const creationNonceSchema = lowerHexStringSchema(16, "creation nonce");
 const idempotencyKeySchema = lowerHexStringSchema(16, "idempotencyKey");
 const identitySchema = z.strictObject({ userId: idSchema, machineId: machineIdSchema });
+const repositoryAuthoritySchema = identitySchema.extend({
+  repositoryId: repositoryIdSchema,
+  incarnation: incarnationSchema,
+  creationNonce: creationNonceSchema,
+});
 const createRepositorySchema = z.strictObject({
   name: repositoryNameSchema,
   idempotencyKey: idempotencyKeySchema,
@@ -44,6 +50,7 @@ export interface AuthenticatedPrincipal {
 export interface RepositoryAuthority extends AuthenticatedPrincipal {
   repositoryId: string;
   incarnation: string;
+  creationNonce: string;
 }
 
 interface RepositoryRow extends Record<string, SqlStorageValue> {
@@ -51,6 +58,7 @@ interface RepositoryRow extends Record<string, SqlStorageValue> {
   user_id: string;
   name: string;
   incarnation: string;
+  creation_nonce: string;
   status: string;
 }
 
@@ -109,8 +117,32 @@ export class ControlPlane extends DurableObject<Env> {
     }
     return {
       ok: true as const,
-      authority: { ...identity, repositoryId: repositoryId.data, incarnation },
+      authority: {
+        ...identity,
+        repositoryId: repositoryId.data,
+        incarnation,
+        creationNonce: repository.creation_nonce,
+      },
     };
+  }
+
+  validateRepositoryInitialization(authorityValue: unknown) {
+    let authority: RepositoryAuthority;
+    try {
+      authority = decodeRepositoryAuthority(authorityValue);
+    } catch (error) {
+      return failure(error, 400);
+    }
+    const repository = this.repositoryById(authority.userId, authority.repositoryId);
+    if (
+      repository === undefined ||
+      repository.status !== "active" ||
+      repository.incarnation !== authority.incarnation ||
+      repository.creation_nonce !== authority.creationNonce
+    ) {
+      return failure(new ControlPlaneError("repository not found", 404, REPOSITORY_NOT_FOUND), 404);
+    }
+    return { ok: true as const };
   }
 
   async createRepository(identityValue: unknown, value: unknown) {
@@ -133,7 +165,7 @@ export class ControlPlane extends DurableObject<Env> {
       );
       return this.ctx.storage.sql
         .exec<RepositoryRow>(
-          `SELECT repository_id, user_id, name, incarnation, status FROM repositories
+          `SELECT repository_id, user_id, name, incarnation, creation_nonce, status FROM repositories
            WHERE user_id = ? AND status = 'retiring'
            ORDER BY CASE WHEN name = ? THEN 0 ELSE 1 END, created_at_ms LIMIT ?`,
           identity.userId,
@@ -184,6 +216,7 @@ export class ControlPlane extends DurableObject<Env> {
               ...identity,
               repositoryId: receipt.repository_id,
               incarnation: receipt.incarnation,
+              creationNonce: repository.creation_nonce,
             },
             needsActivation: repository.status === "provisional",
           };
@@ -207,12 +240,16 @@ export class ControlPlane extends DurableObject<Env> {
 
         const repositoryId = this.env.REPOSITORIES.newUniqueId().toString();
         const incarnation = randomHex(16);
+        const creationNonce = randomHex(16);
         this.ctx.storage.sql.exec(
-          "INSERT INTO repositories VALUES (?, ?, ?, ?, 'provisional', ?, NULL)",
+          `INSERT INTO repositories
+           (repository_id, user_id, name, incarnation, creation_nonce, status, created_at_ms)
+           VALUES (?, ?, ?, ?, ?, 'provisional', ?)`,
           repositoryId,
           identity.userId,
           request.name,
           incarnation,
+          creationNonce,
           now,
         );
         this.ctx.storage.sql.exec(
@@ -224,7 +261,7 @@ export class ControlPlane extends DurableObject<Env> {
           incarnation,
         );
         return {
-          authority: { ...identity, repositoryId, incarnation },
+          authority: { ...identity, repositoryId, incarnation, creationNonce },
           needsActivation: true,
         };
       });
@@ -235,9 +272,6 @@ export class ControlPlane extends DurableObject<Env> {
     const authority = creation.authority;
     if (!creation.needsActivation) return creationSuccess(authority, request.name);
 
-    const stub = this.env.REPOSITORIES.getByName(authority.repositoryId);
-    const initialized = await stub.initializeRepository(authority);
-    if (!initialized.ok) return initialized;
     try {
       this.ctx.storage.transactionSync(() => {
         const changed = this.ctx.storage.sql
@@ -288,7 +322,7 @@ export class ControlPlane extends DurableObject<Env> {
     }
     const repository = this.ctx.storage.sql
       .exec<RepositoryRow>(
-        `SELECT repository_id, user_id, name, incarnation, status FROM repositories
+        `SELECT repository_id, user_id, name, incarnation, creation_nonce, status FROM repositories
          WHERE user_id = ? AND name = ? AND status = 'active'`,
         identity.userId,
         name,
@@ -314,7 +348,7 @@ export class ControlPlane extends DurableObject<Env> {
     }
     const repositories = this.ctx.storage.sql
       .exec<RepositoryRow>(
-        `SELECT repository_id, user_id, name, incarnation, status FROM repositories
+        `SELECT repository_id, user_id, name, incarnation, creation_nonce, status FROM repositories
          WHERE user_id = ? AND status = 'active' ORDER BY name`,
         identity.userId,
       )
@@ -342,7 +376,7 @@ export class ControlPlane extends DurableObject<Env> {
       return this.ctx.storage.transactionSync(() => {
         const repository = this.ctx.storage.sql
           .exec<RepositoryRow>(
-            `SELECT repository_id, user_id, name, incarnation, status FROM repositories
+            `SELECT repository_id, user_id, name, incarnation, creation_nonce, status FROM repositories
              WHERE user_id = ? AND name = ? AND status = 'active'`,
             identity.userId,
             oldName,
@@ -353,7 +387,12 @@ export class ControlPlane extends DurableObject<Env> {
         }
         if (oldName === request.newName) {
           return creationSuccess(
-            { ...identity, repositoryId: repository.repository_id, incarnation: repository.incarnation },
+            {
+              ...identity,
+              repositoryId: repository.repository_id,
+              incarnation: repository.incarnation,
+              creationNonce: repository.creation_nonce,
+            },
             oldName,
           );
         }
@@ -386,7 +425,12 @@ export class ControlPlane extends DurableObject<Env> {
           throw new Error("repository rename did not change exactly one active row");
         }
         return creationSuccess(
-          { ...identity, repositoryId: repository.repository_id, incarnation: repository.incarnation },
+          {
+            ...identity,
+            repositoryId: repository.repository_id,
+            incarnation: repository.incarnation,
+            creationNonce: repository.creation_nonce,
+          },
           request.newName,
         );
       });
@@ -476,7 +520,18 @@ export class ControlPlane extends DurableObject<Env> {
     }
     if (status === "deleted") return { ok: true as const, deleted: false };
 
-    const authority = { ...identity, repositoryId: request.repositoryId, incarnation: request.incarnation };
+    const repository = this.repositoryById(identity.userId, request.repositoryId);
+    if (repository === undefined) {
+      return expectedFailure(
+        new ControlPlaneError("repository not found", 404, REPOSITORY_NOT_FOUND),
+      );
+    }
+    const authority = {
+      ...identity,
+      repositoryId: request.repositoryId,
+      incarnation: request.incarnation,
+      creationNonce: repository.creation_nonce,
+    };
     const stub = this.env.REPOSITORIES.getByName(request.repositoryId);
     const retired = await stub.retireRepository(authority);
     if (!retired.ok) return retired;
@@ -491,6 +546,7 @@ export class ControlPlane extends DurableObject<Env> {
         machineId,
         repositoryId: repository.repository_id,
         incarnation: repository.incarnation,
+        creationNonce: repository.creation_nonce,
       };
       const stub = this.env.REPOSITORIES.getByName(repository.repository_id);
       const retired = await stub.retireRepository(authority);
@@ -527,7 +583,7 @@ export class ControlPlane extends DurableObject<Env> {
   private repositoryById(userId: string, repositoryId: string): RepositoryRow | undefined {
     return this.ctx.storage.sql
       .exec<RepositoryRow>(
-        `SELECT repository_id, user_id, name, incarnation, status FROM repositories
+        `SELECT repository_id, user_id, name, incarnation, creation_nonce, status FROM repositories
          WHERE user_id = ? AND repository_id = ?`,
         userId,
         repositoryId,
@@ -543,6 +599,7 @@ function initializeControlPlaneSchema(sql: SqlStorage) {
       user_id TEXT NOT NULL,
       name TEXT NOT NULL,
       incarnation TEXT NOT NULL,
+      creation_nonce TEXT NOT NULL,
       status TEXT NOT NULL CHECK (status IN ('provisional', 'active', 'retiring', 'deleted')),
       created_at_ms INTEGER NOT NULL,
       deleted_at_ms INTEGER
@@ -558,10 +615,21 @@ function initializeControlPlaneSchema(sql: SqlStorage) {
       PRIMARY KEY (user_id, idempotency_key)
     ) WITHOUT ROWID;
   `);
+  const repositoryColumns = sql.exec<{ name: string }>("PRAGMA table_info(repositories)").toArray();
+  if (!repositoryColumns.some((column) => column.name === "creation_nonce")) {
+    sql.exec("ALTER TABLE repositories ADD COLUMN creation_nonce TEXT");
+    sql.exec(
+      "UPDATE repositories SET creation_nonce = lower(hex(randomblob(16))) WHERE creation_nonce IS NULL",
+    );
+  }
 }
 
 function decodeIdentity(value: unknown): AuthenticatedPrincipal {
   return identitySchema.parse(value);
+}
+
+function decodeRepositoryAuthority(value: unknown): RepositoryAuthority {
+  return repositoryAuthoritySchema.parse(value);
 }
 
 function decodeCreateRepository(value: unknown) {
