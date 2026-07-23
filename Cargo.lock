@@ -702,6 +702,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "devspace-kernel-git"
+version = "0.1.0"
+dependencies = [
+ "sha1-checked",
+]
+
+[[package]]
 name = "devspace-kernel-wasm"
 version = "0.1.0"
 dependencies = [
