@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 devspace-kernel-git = { path = "../kernel-git" }
+devspace-machine-git = { path = "../machine-git" }
 futures.workspace = true
 jj-lib.workspace = true
 tempfile.workspace = true

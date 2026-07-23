@@ -1,5 +1,6 @@
 //! HTTP transport for the Worker's v2 Git-object pack store.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, HeaderValue};
@@ -7,7 +8,11 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::pack_manifest::MAX_MANIFEST_BYTES;
-use crate::{BuiltPack, Digest, MAX_CHUNK_BYTES, Oid, PackManifest, PackManifestError, hex};
+use crate::{
+    BuiltPack, CloudOpHeads, Digest, MAX_CHUNK_BYTES, Oid, OpId, OpObjectKey, OpObjectKind,
+    OpSyncTransport, OpTransportError, PackManifest, PackManifestError, PendingOpHeadTransaction,
+    hex,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -264,6 +269,19 @@ struct ErrorResponse {
     code: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpInventoryResponse {
+    keys: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpHeadsResponse {
+    cursor: u64,
+    heads: Vec<String>,
+}
+
 impl GitHttpTransport {
     pub fn new(
         base_url: &str,
@@ -421,6 +439,86 @@ impl GitHttpTransport {
         let url = format!("{}/packs/{}/install", self.repository_url, hex(&id));
         let response = self.send(self.client.post(url)).await?;
         self.read_json(response).await
+    }
+
+    async fn op_inventory(
+        &self,
+        candidates: &[OpObjectKey],
+    ) -> Result<BTreeSet<OpObjectKey>, GitHttpTransportError> {
+        let mut keys = candidates.iter().map(op_key).collect::<Vec<_>>();
+        keys.sort_unstable();
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/ops/inventory", self.repository_url))
+                    .json(&serde_json::json!({ "keys": keys })),
+            )
+            .await?;
+        let response: OpInventoryResponse = self.read_json(response).await?;
+        let present = response
+            .keys
+            .into_iter()
+            .map(|key| decode_op_key(&key))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if !present
+            .iter()
+            .all(|key| candidates.binary_search(key).is_ok())
+        {
+            return Err(GitHttpTransportError::Protocol(
+                "operation inventory returned an unrequested object".to_owned(),
+            ));
+        }
+        Ok(present)
+    }
+
+    async fn op_download(&self, key: OpObjectKey) -> Result<Vec<u8>, GitHttpTransportError> {
+        self.fetch_bytes(
+            format!("{}/ops/{}", self.repository_url, op_key_path(key)),
+            1024 * 1024,
+        )
+        .await
+    }
+
+    async fn op_upload(&self, key: OpObjectKey, bytes: &[u8]) -> Result<(), GitHttpTransportError> {
+        let response = self
+            .send(
+                self.client
+                    .put(format!("{}/ops/{}", self.repository_url, op_key_path(key)))
+                    .body(bytes.to_vec()),
+            )
+            .await?;
+        let _: serde_json::Value = self.read_json(response).await?;
+        Ok(())
+    }
+
+    async fn op_heads(&self) -> Result<CloudOpHeads, GitHttpTransportError> {
+        let response = self
+            .send(
+                self.client
+                    .get(format!("{}/ops/heads", self.repository_url)),
+            )
+            .await?;
+        decode_op_heads(self.read_json(response).await?)
+    }
+
+    async fn op_transact(
+        &self,
+        pending: &PendingOpHeadTransaction,
+    ) -> Result<CloudOpHeads, GitHttpTransportError> {
+        let body = serde_json::json!({
+            "incarnation": self.incarnation,
+            "idempotencyKey": hex(&pending.idempotency_key),
+            "newHead": hex(&pending.new_head),
+            "observedHeads": pending.observed_heads.iter().map(|head| hex(head)).collect::<Vec<_>>(),
+        });
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/ops/heads/transactions", self.repository_url))
+                    .json(&body),
+            )
+            .await?;
+        decode_op_heads(self.read_json(response).await?)
     }
 
     pub async fn projection_snapshot(
@@ -681,6 +779,48 @@ impl GitHttpTransport {
     }
 }
 
+impl OpSyncTransport for GitHttpTransport {
+    async fn inventory_op_objects(
+        &mut self,
+        candidates: &[OpObjectKey],
+    ) -> Result<BTreeSet<OpObjectKey>, OpTransportError> {
+        self.op_inventory(candidates)
+            .await
+            .map_err(|error| Box::new(error) as OpTransportError)
+    }
+
+    async fn download_op_object(&mut self, key: OpObjectKey) -> Result<Vec<u8>, OpTransportError> {
+        self.op_download(key)
+            .await
+            .map_err(|error| Box::new(error) as OpTransportError)
+    }
+
+    async fn upload_op_object(
+        &mut self,
+        key: OpObjectKey,
+        bytes: &[u8],
+    ) -> Result<(), OpTransportError> {
+        self.op_upload(key, bytes)
+            .await
+            .map_err(|error| Box::new(error) as OpTransportError)
+    }
+
+    async fn get_op_heads(&mut self) -> Result<CloudOpHeads, OpTransportError> {
+        self.op_heads()
+            .await
+            .map_err(|error| Box::new(error) as OpTransportError)
+    }
+
+    async fn transact_op_heads(
+        &mut self,
+        pending: &PendingOpHeadTransaction,
+    ) -> Result<CloudOpHeads, OpTransportError> {
+        self.op_transact(pending)
+            .await
+            .map_err(|error| Box::new(error) as OpTransportError)
+    }
+}
+
 fn request_timeout() -> Duration {
     if std::env::var_os(TEST_HOOKS_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
         && let Some(milliseconds) = std::env::var(TEST_REQUEST_TIMEOUT_MS_ENV)
@@ -715,6 +855,64 @@ fn decode_digest(value: &str) -> Result<Digest, GitHttpTransportError> {
         u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
             .expect("validated lowercase hexadecimal pair")
     }))
+}
+
+fn op_key(key: &OpObjectKey) -> String {
+    let prefix = match key.kind {
+        OpObjectKind::View => "v",
+        OpObjectKind::Operation => "o",
+    };
+    format!("{prefix}:{}", hex(&key.id))
+}
+
+fn op_key_path(key: OpObjectKey) -> String {
+    let directory = match key.kind {
+        OpObjectKind::View => "views",
+        OpObjectKind::Operation => "operations",
+    };
+    format!("{directory}/{}", hex(&key.id))
+}
+
+fn decode_op_key(value: &str) -> Result<OpObjectKey, GitHttpTransportError> {
+    let (prefix, id) = value.split_once(':').ok_or_else(|| {
+        GitHttpTransportError::Protocol("operation inventory key lacks a kind".to_owned())
+    })?;
+    let kind = match prefix {
+        "v" => OpObjectKind::View,
+        "o" => OpObjectKind::Operation,
+        _ => {
+            return Err(GitHttpTransportError::Protocol(
+                "operation inventory key has an unknown kind".to_owned(),
+            ));
+        }
+    };
+    Ok(OpObjectKey {
+        kind,
+        id: decode_op_id(id)?,
+    })
+}
+
+fn decode_op_id(value: &str) -> Result<OpId, GitHttpTransportError> {
+    validate_lower_hex(value, 128).map_err(|_| {
+        GitHttpTransportError::Protocol(
+            "operation ID must be 128 lowercase hex characters".to_owned(),
+        )
+    })?;
+    Ok(std::array::from_fn(|index| {
+        u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).expect("validated operation ID")
+    }))
+}
+
+fn decode_op_heads(response: OpHeadsResponse) -> Result<CloudOpHeads, GitHttpTransportError> {
+    let heads = response
+        .heads
+        .into_iter()
+        .map(|head| decode_op_id(&head))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(CloudOpHeads {
+        cursor: response.cursor,
+        heads,
+    })
 }
 
 fn state_json(state: &ProjectionGitState) -> serde_json::Value {

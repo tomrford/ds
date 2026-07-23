@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -5,6 +6,9 @@ use std::sync::Arc;
 use jj_lib::default_index::DefaultIndexStore;
 use jj_lib::default_submodule_store::DefaultSubmoduleStore;
 use jj_lib::git_backend::GitBackend;
+use jj_lib::object_id::ObjectId as _;
+use jj_lib::op_heads_store::OpHeadsStoreError;
+use jj_lib::op_store::OperationId;
 use jj_lib::repo::{
     ReadonlyRepo, Repo as _, RepoInitError, RepoLoader, RepoLoaderError, StoreFactories,
     StoreLoadError,
@@ -14,6 +18,8 @@ use jj_lib::signing::{SignInitError, Signer};
 use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
 use jj_lib::simple_op_store::SimpleOpStore;
 use thiserror::Error;
+
+use crate::OpId;
 
 /// A jj repository whose canonical commit/tree/blob storage is a bare Git ODB.
 pub struct MachineGitRepository {
@@ -113,6 +119,43 @@ impl MachineGitRepository {
             .expect("backend type checked at construction")
             .git_repo()
     }
+
+    pub async fn current_operation_heads(&self) -> Result<Vec<OpId>, OpReconcileError> {
+        let mut heads = self
+            .repo
+            .op_heads_store()
+            .get_op_heads()
+            .await?
+            .into_iter()
+            .map(|id| {
+                id.as_bytes()
+                    .try_into()
+                    .map_err(|_| OpReconcileError::InvalidIdLength(id.as_bytes().len()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        heads.sort_unstable();
+        heads.dedup();
+        Ok(heads)
+    }
+
+    pub async fn reconcile_operation_heads(
+        &mut self,
+        cloud_heads: &BTreeSet<OpId>,
+    ) -> Result<OperationId, OpReconcileError> {
+        let op_heads_store = self.repo.op_heads_store().clone();
+        {
+            let _lock = op_heads_store.lock().await?;
+            for head in cloud_heads {
+                op_heads_store
+                    .update_op_heads(&[], &OperationId::new(head.to_vec()))
+                    .await?;
+            }
+        }
+        let repo = self.repo.loader().load_at_head().await?;
+        let operation = repo.op_id().clone();
+        self.repo = repo;
+        Ok(operation)
+    }
 }
 
 fn require_store_type(
@@ -173,4 +216,14 @@ pub enum MachineGitRepositoryError {
     StoreLoad(#[from] StoreLoadError),
     #[error(transparent)]
     Sign(#[from] SignInitError),
+}
+
+#[derive(Debug, Error)]
+pub enum OpReconcileError {
+    #[error("native operation ID must be 64 bytes, got {0}")]
+    InvalidIdLength(usize),
+    #[error(transparent)]
+    Heads(#[from] OpHeadsStoreError),
+    #[error(transparent)]
+    Load(#[from] RepoLoaderError),
 }

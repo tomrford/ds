@@ -705,6 +705,8 @@ dependencies = [
 name = "devspace-kernel-git"
 version = "0.1.0"
 dependencies = [
+ "blake2",
+ "prost",
  "sha1-checked",
 ]
 
@@ -713,6 +715,7 @@ name = "devspace-kernel-git-oracle"
 version = "0.0.0"
 dependencies = [
  "devspace-kernel-git",
+ "devspace-machine-git",
  "futures 0.3.32",
  "jj-lib",
  "tempfile",

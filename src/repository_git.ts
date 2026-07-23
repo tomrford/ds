@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { RepositoryAuthority } from "./control_plane";
 import { KernelGit, equalGitBytes, exactGitBuffer } from "./kernel_git";
+import { OpGitStore } from "./op_git_store";
 import { GitPackStore } from "./pack_git_store";
 import { ProjectionGitStore } from "./projection_git_store";
 import { initializeGitSchema } from "./schema_git";
@@ -23,6 +24,7 @@ interface AuthorityRow extends Record<string, SqlStorageValue> {
 
 export class RepositoryGit extends DurableObject<Env> {
   private readonly packs: GitPackStore;
+  private readonly ops: OpGitStore;
   private readonly projection: ProjectionGitStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -33,6 +35,7 @@ export class RepositoryGit extends DurableObject<Env> {
     );
     const kernel = new KernelGit();
     this.packs = new GitPackStore(this.ctx, sql, kernel);
+    this.ops = new OpGitStore(this.ctx, sql, kernel);
     this.projection = new ProjectionGitStore(this.ctx, sql, kernel);
   }
 
@@ -87,6 +90,31 @@ export class RepositoryGit extends DurableObject<Env> {
     return this.withAuthority(authority, () =>
       this.packs.getInstalledPackChunk(packId, position),
     );
+  }
+
+  putOpObject(
+    authority: RepositoryAuthority,
+    kind: "view" | "operation",
+    id: string,
+    bytes: Uint8Array,
+  ) {
+    return this.withAuthority(authority, () => this.ops.put(kind, id, bytes));
+  }
+
+  getOpObject(authority: RepositoryAuthority, kind: "view" | "operation", id: string) {
+    return this.withAuthority(authority, () => this.ops.get(kind, id));
+  }
+
+  inventoryOpObjects(authority: RepositoryAuthority, value: unknown) {
+    return this.withAuthority(authority, () => this.ops.inventory(value));
+  }
+
+  getOpHeads(authority: RepositoryAuthority) {
+    return this.withAuthority(authority, () => this.ops.getHeads(authority.incarnation));
+  }
+
+  transactOpHeads(authority: RepositoryAuthority, value: unknown) {
+    return this.withAuthority(authority, () => this.ops.transactHeads(value));
   }
 
   getProjection(
@@ -154,6 +182,10 @@ export class RepositoryGit extends DurableObject<Env> {
 
   countQuarantinedPacks() {
     return this.packs.countQuarantinedPacks();
+  }
+
+  countOpObjects() {
+    return this.ops.countObjects();
   }
 
   private withAuthority<T>(authority: RepositoryAuthority, operation: () => T) {

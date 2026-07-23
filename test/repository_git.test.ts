@@ -315,6 +315,107 @@ describe("Git v2 repository object store", () => {
   });
 });
 
+describe("Git v2 operation store and heads", () => {
+  it("rejects noncanonical objects and converges concurrent heads idempotently", async () => {
+    const name = "git-ops-convergence";
+    const kernel = new KernelGit();
+    const view = canonicalGitView();
+    const viewId = gitToHex(kernel.validateView(view).id);
+    expect(await json(await putOp(name, "views", viewId, view))).toEqual({ inserted: true });
+    expect(await json(await putOp(name, "views", viewId, view))).toEqual({ inserted: false });
+
+    const noncanonical = Uint8Array.from([...view, 0x68, 0x01]);
+    const rejected = await putOp(name, "views", viewId, noncanonical);
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toMatchObject({
+      error: expect.stringContaining("does not exactly re-encode"),
+    });
+
+    const base = await installOperation(name, viewId, "base");
+    const left = await installOperation(name, viewId, "left", [base]);
+    const right = await installOperation(name, viewId, "right", [base]);
+    const merged = await installOperation(name, viewId, "merged", [left, right]);
+    const incarnation = (await ensureRepository(name)).incarnation;
+
+    expect(await postOpHeads(name, incarnation, "01".repeat(16), base, [])).toEqual({
+      cursor: 1,
+      heads: [base],
+    });
+    const leftRequest = opHeadRequest(incarnation, "02".repeat(16), left, [base]);
+    expect(await json(await routeRequest(name, "git/ops/heads/transactions", {
+      method: "POST",
+      body: JSON.stringify(leftRequest),
+    }))).toEqual({ cursor: 2, heads: [left] });
+    expect(await postOpHeads(name, incarnation, "03".repeat(16), right, [base])).toEqual({
+      cursor: 3,
+      heads: [left, right].sort(),
+    });
+    expect(await json(await routeRequest(name, "git/ops/heads/transactions", {
+      method: "POST",
+      body: JSON.stringify(leftRequest),
+    }))).toEqual({ cursor: 2, heads: [left] });
+    expect(await postOpHeads(name, incarnation, "04".repeat(16), merged, [right, left])).toEqual({
+      cursor: 4,
+      heads: [merged],
+    });
+  });
+
+  it("does not consume a head receipt until the complete op closure exists", async () => {
+    const name = "git-ops-incomplete";
+    const kernel = new KernelGit();
+    const view = canonicalGitView();
+    const viewId = gitToHex(kernel.validateView(view).id);
+    const operation = await installOperation(name, viewId, "needs view");
+    const incarnation = (await ensureRepository(name)).incarnation;
+    const request = opHeadRequest(incarnation, "0a".repeat(16), operation, []);
+
+    const incomplete = await routeRequest(name, "git/ops/heads/transactions", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+    expect(incomplete.status).toBe(409);
+    expect(await incomplete.json()).toMatchObject({ code: "head-closure-incomplete" });
+
+    expect(await json(await putOp(name, "views", viewId, view))).toEqual({ inserted: true });
+    expect(await json(await routeRequest(name, "git/ops/heads/transactions", {
+      method: "POST",
+      body: JSON.stringify(request),
+    }))).toEqual({ cursor: 1, heads: [operation] });
+  });
+
+  it("persists operation objects, exact bytes, heads and receipts across eviction", async () => {
+    const name = "git-ops-eviction";
+    const kernel = new KernelGit();
+    const view = canonicalGitView();
+    const viewId = gitToHex(kernel.validateView(view).id);
+    await putOp(name, "views", viewId, view);
+    const operation = await installOperation(name, viewId, "persistent");
+    const incarnation = (await ensureRepository(name)).incarnation;
+    expect(await postOpHeads(name, incarnation, "11".repeat(16), operation, [])).toEqual({
+      cursor: 1,
+      heads: [operation],
+    });
+
+    await evictDurableObject(await repositoryGitStub(name));
+    const downloaded = await routeRequest(name, `git/ops/operations/${operation}`, {
+      method: "GET",
+    });
+    expect(downloaded.status).toBe(200);
+    expect(new Uint8Array(await downloaded.arrayBuffer())).toEqual(
+      canonicalGitOperation(decodeHex(viewId), "persistent"),
+    );
+    expect(await json(await routeRequest(name, "git/ops/heads", { method: "GET" }))).toEqual({
+      cursor: 1,
+      heads: [operation],
+    });
+    expect(await postOpHeads(name, incarnation, "11".repeat(16), operation, [])).toEqual({
+      cursor: 1,
+      heads: [operation],
+    });
+    expect(await (await repositoryGitStub(name)).countOpObjects()).toBe(2);
+  });
+});
+
 interface EncodedFixture {
   id: string;
   manifest: string;
@@ -396,6 +497,92 @@ function putChunk(name: string, fixture: DecodedFixture, position: number) {
 
 function install(name: string, packId: string) {
   return routeRequest(name, `git/packs/${packId}/install`, { method: "POST" });
+}
+
+function putOp(
+  name: string,
+  kind: "views" | "operations",
+  id: string,
+  bytes: Uint8Array,
+) {
+  return routeRequest(name, `git/ops/${kind}/${id}`, { method: "PUT", body: bytes });
+}
+
+async function installOperation(
+  name: string,
+  viewId: string,
+  description: string,
+  parents = ["00".repeat(64)],
+): Promise<string> {
+  const bytes = canonicalGitOperation(decodeHex(viewId), description, parents.map(decodeHex));
+  const id = gitToHex(new KernelGit().validateOperation(bytes).id);
+  expect(await json(await putOp(name, "operations", id, bytes))).toMatchObject({
+    inserted: expect.any(Boolean),
+  });
+  return id;
+}
+
+async function postOpHeads(
+  name: string,
+  incarnation: string,
+  idempotencyKey: string,
+  newHead: string,
+  observedHeads: string[],
+) {
+  return json(await routeRequest(name, "git/ops/heads/transactions", {
+    method: "POST",
+    body: JSON.stringify(opHeadRequest(incarnation, idempotencyKey, newHead, observedHeads)),
+  }));
+}
+
+function opHeadRequest(
+  incarnation: string,
+  idempotencyKey: string,
+  newHead: string,
+  observedHeads: string[],
+) {
+  return { incarnation, idempotencyKey, newHead, observedHeads };
+}
+
+function canonicalGitView(): Uint8Array {
+  return new Uint8Array([
+    0x0a,
+    20,
+    ...new Uint8Array(20),
+    0x4a,
+    4,
+    0x1a,
+    2,
+    0x12,
+    0,
+    0x60,
+    1,
+  ]);
+}
+
+function canonicalGitOperation(
+  viewId: Uint8Array,
+  description: string,
+  parents: Uint8Array[] = [new Uint8Array(64)],
+): Uint8Array {
+  const metadata: number[] = [0x0a, 0, 0x12, 0];
+  pushProtoBytes(metadata, 3, new TextEncoder().encode(description));
+  const operation: number[] = [];
+  pushProtoBytes(operation, 1, viewId);
+  for (const parent of parents) pushProtoBytes(operation, 2, parent);
+  pushProtoBytes(operation, 3, Uint8Array.from(metadata));
+  return Uint8Array.from(operation);
+}
+
+function pushProtoBytes(output: number[], tag: number, bytes: Uint8Array) {
+  output.push((tag << 3) | 2);
+  let length = bytes.byteLength;
+  while (length >= 0x80) {
+    output.push((length & 0x7f) | 0x80);
+    length >>= 7;
+  }
+  output.push(length);
+  output.push(...bytes);
 }
 
 function listPacks(name: string, after: number, through?: number) {

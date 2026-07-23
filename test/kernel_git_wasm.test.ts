@@ -2,6 +2,8 @@ import { expect, it } from "vitest";
 import gitKernelModule from "../dist/kernel-git.wasm";
 import gitGolden from "../crates/kernel-git/tests/git_golden.txt?raw";
 import gitGoldenOracle from "../crates/kernel-git/tests/git_golden_oracle.txt?raw";
+import opsGolden from "../crates/kernel-git/tests/ops_golden.txt?raw";
+import { KernelGit, OP_REFERENCE_KIND } from "../src/kernel_git";
 
 interface GitKernelExports extends WebAssembly.Exports {
   memory: WebAssembly.Memory;
@@ -29,6 +31,45 @@ it("matches native Git IDs and acceptance for all 40 vectors through Wasm", () =
     );
     expect(encodeHex(result), `${kindName} ID`).toBe(expectedId);
   }
+});
+
+it("matches ported operation IDs and enforces 20-byte Git view references through Wasm", () => {
+  const kernel = new KernelGit();
+  const operations = opsGolden
+    .split("\n")
+    .filter((line) => line !== "" && !line.startsWith("#"));
+  expect(operations).toHaveLength(8);
+  for (const line of operations) {
+    const [kind, expectedId, payloadRle] = line.split("|");
+    const bytes = decodeRle(payloadRle);
+    const validated =
+      kind === "view"
+        ? kernel.validateView(bytes)
+        : kind === "operation"
+          ? kernel.validateOperation(bytes)
+          : undefined;
+    if (validated === undefined) throw new Error(`unknown operation-store kind ${kind}`);
+    expect(encodeHex(validated.id)).toBe(expectedId);
+  }
+
+  const view = new Uint8Array([
+    0x0a,
+    20,
+    ...new Uint8Array(20).fill(1),
+    0x4a,
+    4,
+    0x1a,
+    2,
+    0x12,
+    0,
+    0x60,
+    1,
+  ]);
+  const validated = kernel.validateView(view);
+  expect(validated.id).toHaveLength(64);
+  expect(validated.references).toEqual([
+    { kind: OP_REFERENCE_KIND.commit, id: new Uint8Array(20).fill(1) },
+  ]);
 });
 
 function validate(exports: GitKernelExports, kind: number, bytes: Uint8Array): Uint8Array {
@@ -75,4 +116,13 @@ function decodeHex(value: string): Uint8Array {
 
 function encodeHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function decodeRle(value: string): Uint8Array {
+  return Uint8Array.from(
+    value.split(",").flatMap((run) => {
+      const [byte, count] = run.split("*");
+      return Array(Number.parseInt(count, 10)).fill(Number.parseInt(byte, 16));
+    }),
+  );
 }

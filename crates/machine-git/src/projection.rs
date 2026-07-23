@@ -119,7 +119,7 @@ pub struct ProjectionResult {
 }
 
 #[derive(Default)]
-struct HiddenSetCache {
+pub(crate) struct HiddenSetCache {
     blobs: BTreeMap<FileId, Arc<Vec<u8>>>,
     trees: BTreeMap<TreeId, Arc<Vec<RepoPathBuf>>>,
 }
@@ -448,7 +448,7 @@ fn raw_tree_entries(id: Oid, bytes: &[u8]) -> Result<Vec<RawTreeEntry<'_>>, Proj
     Ok(output)
 }
 
-fn rewrite_commit(
+pub(crate) fn rewrite_commit(
     source: &[u8],
     tree: Oid,
     parents: &[Oid],
@@ -529,6 +529,15 @@ async fn resolve_hidden_set(
         commit.root_tree.clone(),
         ConflictLabels::from_merge(commit.conflict_labels.clone()),
     );
+    resolve_hidden_set_for_tree(store, commit_id, &merged_tree, cache).await
+}
+
+pub(crate) async fn resolve_hidden_set_for_tree(
+    store: &Arc<Store>,
+    context_id: &CommitId,
+    merged_tree: &MergedTree,
+    cache: &mut HiddenSetCache,
+) -> Result<HiddenSet, ProjectionError> {
     let mut candidate_paths = BTreeSet::new();
     for tree_id in merged_tree.tree_ids().iter() {
         for path in
@@ -539,7 +548,7 @@ async fn resolve_hidden_set(
     }
 
     let mut files = BTreeMap::new();
-    let canonical_id = oid_from_commit_id(commit_id)?;
+    let canonical_id = oid_from_commit_id(context_id)?;
     for path in &candidate_paths {
         let value = merged_tree
             .path_value(path)
@@ -560,7 +569,7 @@ async fn resolve_hidden_set(
 
     let mut matcher = GitIgnoreFile::empty();
     for (path, id) in &files {
-        let bytes = read_hidden_blob(store, path, id, &mut cache.blobs, commit_id).await?;
+        let bytes = read_hidden_blob(store, path, id, &mut cache.blobs, context_id).await?;
         matcher = matcher
             .chain(
                 path.parent().expect(".dsprivate has a parent directory"),

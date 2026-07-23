@@ -22,6 +22,7 @@ extern crate alloc;
 mod commit;
 mod error;
 mod hash;
+pub mod ops;
 mod tree;
 
 use alloc::vec::Vec;

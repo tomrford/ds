@@ -13,9 +13,9 @@ jj-lib.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
-tempfile.workspace = true
 tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread"] }

@@ -3,9 +3,9 @@ use std::process::Command;
 
 use devspace_kernel_git::{ObjectKind, Oid, parse_commit, validate};
 use devspace_machine_git::{
-    CommitMapping, GitHttpTransport, GitProcessEnvironment, GitProcessMode, JournalFlowError,
-    LeaseUpdate, MachineGitRepository, PushErrorKind, PushFailpoint, PushHead, QualifiedRef,
-    RemoteUrl, fetch_with_journal, graft_public_lineage, push, push_with_journal,
+    GitHttpTransport, GitProcessEnvironment, GitProcessMode, JournalFlowError, LeaseUpdate,
+    MachineGitRepository, PushErrorKind, PushFailpoint, PushHead, QualifiedRef, RemoteUrl,
+    fetch_with_journal, push, push_with_journal,
 };
 use gix::objs::{Kind as GitObjectKind, Write as _};
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
@@ -28,61 +28,6 @@ fn settings() -> UserSettings {
         .unwrap(),
     );
     UserSettings::from_config(config).unwrap()
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn fetched_foreign_commit_grafts_rewritten_public_parent_to_canonical_parent() {
-    let temp = tempfile::tempdir().unwrap();
-    let repository = MachineGitRepository::init(temp.path(), &settings())
-        .await
-        .unwrap();
-    let public_tree = write_tree(&repository, b"public");
-    let canonical_tree = write_tree(&repository, b"canonical-hidden-lineage");
-    let public_parent = write_commit(&repository, public_tree, &[], b"public parent\n", false);
-    let canonical_parent = write_commit(
-        &repository,
-        canonical_tree,
-        &[],
-        b"canonical parent\n",
-        false,
-    );
-    let foreign = write_commit(
-        &repository,
-        public_tree,
-        &[public_parent],
-        b"foreign child\n",
-        true,
-    );
-
-    let result = graft_public_lineage(
-        &repository,
-        foreign,
-        [CommitMapping {
-            canonical_id: canonical_parent,
-            public_id: public_parent,
-        }],
-    )
-    .await
-    .unwrap();
-
-    assert_ne!(result.canonical_head, foreign);
-    assert_eq!(result.grafts.len(), 1);
-    assert_eq!(result.grafts[0].public_commit, foreign);
-    assert_eq!(result.grafts[0].public_parents, vec![public_parent]);
-    assert_eq!(result.grafts[0].canonical_parents, vec![canonical_parent]);
-    let bytes = raw_object(&repository, result.canonical_head);
-    let parsed = parse_commit(&bytes).unwrap();
-    assert_eq!(parsed.parents, vec![canonical_parent]);
-    assert!(
-        !bytes
-            .windows(b"gpgsig".len())
-            .any(|window| window == b"gpgsig")
-    );
-    assert_eq!(result.states.last().unwrap().public_oid, foreign);
-    assert_eq!(
-        result.states.last().unwrap().canonical_oid,
-        result.canonical_head
-    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -359,7 +304,8 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
     );
     eprintln!("LIVE_PROOF c passed in {:?}", started.elapsed());
 
-    // (d) A foreign child of rewritten public P is fetched and grafted onto C.
+    // (d) A foreign child of rewritten public P is fetched, hidden state is
+    // replayed onto it, recordFetch stores L(F)->F, and the next push reuses it.
     let started = std::time::Instant::now();
     let public_tree = parse_commit(&raw_object(&a, public_main)).unwrap().tree;
     let foreign = write_commit(
@@ -398,12 +344,15 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
     .unwrap();
     assert_eq!(fetched.public_heads["main"], foreign);
     assert_ne!(fetched.canonical_heads["main"], foreign);
-    assert_eq!(fetched.grafts.len(), 1);
-    assert_eq!(fetched.grafts[0].public_parents, vec![public_main]);
-    assert_eq!(fetched.grafts[0].canonical_parents, vec![hidden_head]);
+    assert_eq!(fetched.mirrors.len(), 1);
+    assert_eq!(fetched.mirrors[0].public_parents, vec![public_main]);
+    assert_eq!(fetched.mirrors[0].canonical_parents, vec![hidden_head]);
+    assert!(fetched.disclosure_warnings.is_empty());
     let canonical_foreign_bytes = raw_object(&b, fetched.canonical_heads["main"]);
     let canonical_foreign = parse_commit(&canonical_foreign_bytes).unwrap();
     assert_eq!(canonical_foreign.parents, vec![hidden_head]);
+    assert!(tree_has_entry(&b, canonical_foreign.tree, b".dsprivate"));
+    assert!(tree_has_entry(&b, canonical_foreign.tree, b"secret.bin"));
     let final_snapshot = transport_b.projection_snapshot_all().await.unwrap();
     let main_cursor = final_snapshot
         .cursors
@@ -412,6 +361,37 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
         .unwrap();
     assert_eq!(main_cursor.public_oid, foreign);
     assert_eq!(main_cursor.canonical_oid, fetched.canonical_heads["main"]);
+    assert!(final_snapshot.mappings.iter().any(|mapping| {
+        mapping.canonical_oid == fetched.canonical_heads["main"] && mapping.public_oid == foreign
+    }));
+
+    let (local_after_fetch, _) = write_hidden_commit(
+        &b,
+        Some(fetched.canonical_heads["main"]),
+        b"local-after-lift\0\xfd",
+    );
+    let pushed_after_fetch = push_with_journal(
+        &b,
+        &transport_b,
+        "origin",
+        &[PushHead {
+            bookmark: "main".to_owned(),
+            canonical_oid: Some(local_after_fetch),
+        }],
+        [0x36; 16],
+        &environment,
+        PushFailpoint::None,
+    )
+    .await
+    .unwrap();
+    let public_after_fetch = pushed_after_fetch.public_heads["main"].unwrap();
+    assert_eq!(
+        parse_commit(&raw_object(&b, public_after_fetch))
+            .unwrap()
+            .parents,
+        vec![foreign]
+    );
+    assert_eq!(remote_ref(&remote, "main"), public_after_fetch);
     eprintln!("LIVE_PROOF d passed in {:?}", started.elapsed());
     eprintln!("LIVE_PROOF total {:?}", total.elapsed());
 }
@@ -498,6 +478,14 @@ fn raw_object(repository: &MachineGitRepository, id: Oid) -> Vec<u8> {
         .unwrap()
         .data
         .clone()
+}
+
+fn tree_has_entry(repository: &MachineGitRepository, tree: Oid, name: &[u8]) -> bool {
+    devspace_kernel_git::parse_tree(&raw_object(repository, tree))
+        .unwrap()
+        .entries
+        .iter()
+        .any(|entry| entry.name == name)
 }
 
 fn oid_hex(id: Oid) -> String {

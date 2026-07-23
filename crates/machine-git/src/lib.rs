@@ -9,7 +9,10 @@ mod git_subprocess;
 mod http_transport;
 mod install;
 mod journal_flow;
+mod lift;
 mod object_closure;
+mod op_sync;
+mod op_sync_state;
 mod pack;
 mod pack_manifest;
 mod projection;
@@ -30,11 +33,19 @@ pub use http_transport::{
 };
 pub use install::{InstalledPack, PackInstallError};
 pub use journal_flow::{
-    CanonicalGraftResult, CanonicalParentGraft, FetchFlowResult, JournalFlowError, PushFailpoint,
-    PushFlowResult, PushHead, fetch_with_journal, graft_public_lineage, push_with_journal,
+    FetchFlowResult, JournalFlowError, PushFailpoint, PushFlowResult, PushHead, fetch_with_journal,
+    push_with_journal,
 };
+pub use lift::{Disclosure, LiftError, LiftedCommit, OverlayLiftResult, overlay_lift};
 pub use object_closure::{
     MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectKey,
+};
+pub use op_sync::{
+    CloudOpHeads, OpObjectKey, OpObjectKind, OpSyncEngine, OpSyncEngineError, OpSyncTransport,
+    TransportError as OpTransportError,
+};
+pub use op_sync_state::{
+    OpSyncState, OpSyncStateError, OpSyncStore, PendingOpHeadBatch, PendingOpHeadTransaction,
 };
 pub use pack::{
     BuiltPack, BuiltPacks, Digest, MAX_CHUNK_BYTES, MAX_PACK_BYTES, MAX_PACK_OBJECTS,
@@ -45,9 +56,12 @@ pub use projection::{
     CommitMapping, HiddenSet, HiddenSetIdentity, ProjectionError, ProjectionMappings,
     ProjectionResult,
 };
+pub use store::OpReconcileError;
 pub use store::{MachineGitRepository, MachineGitRepositoryError};
 
 pub use devspace_kernel_git::{ObjectKind, Oid};
+
+pub type OpId = [u8; 64];
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";

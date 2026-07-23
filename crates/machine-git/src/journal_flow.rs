@@ -1,18 +1,17 @@
-//! Library-level push, recovery, fetch, and canonical-parent graft proofs.
+//! Library-level push, recovery, fetch, and overlay-lift proofs.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use devspace_kernel_git::{ObjectKind, Oid, parse_commit};
-use gix::objs::{Kind as GitObjectKind, Write as _};
+use devspace_kernel_git::{ObjectKind, Oid};
 use thiserror::Error;
 
 use crate::{
     CommitMapping, GitHttpTransport, GitHttpTransportError, GitProcessEnvironment, LeaseUpdate,
-    MachineGitRepository, ObjectClosureError, PackBuildError, PackInstallError, PackOptions,
-    ProjectionError, ProjectionGitBatchResult, ProjectionGitFetchRef, ProjectionGitFetchResult,
-    ProjectionGitObservation, ProjectionGitSnapshot, ProjectionGitState, ProjectionGitUpdate,
-    ProjectionMappings, PushError, PushErrorKind, QualifiedRef, RemoteUrl, build_packs, fetch, hex,
-    push,
+    LiftError, LiftedCommit, MachineGitRepository, ObjectClosureError, PackBuildError,
+    PackInstallError, PackOptions, ProjectionError, ProjectionGitBatchResult,
+    ProjectionGitFetchRef, ProjectionGitFetchResult, ProjectionGitObservation,
+    ProjectionGitSnapshot, ProjectionGitState, ProjectionGitUpdate, ProjectionMappings, PushError,
+    PushErrorKind, QualifiedRef, RemoteUrl, build_packs, fetch, overlay_lift, push,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,26 +36,12 @@ pub struct PushFlowResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CanonicalParentGraft {
-    pub public_commit: Oid,
-    pub canonical_commit: Oid,
-    pub public_parents: Vec<Oid>,
-    pub canonical_parents: Vec<Oid>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchFlowResult {
     pub receipt: ProjectionGitFetchResult,
     pub public_heads: BTreeMap<String, Oid>,
     pub canonical_heads: BTreeMap<String, Oid>,
-    pub grafts: Vec<CanonicalParentGraft>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CanonicalGraftResult {
-    pub canonical_head: Oid,
-    pub states: Vec<ProjectionGitState>,
-    pub grafts: Vec<CanonicalParentGraft>,
+    pub mirrors: Vec<LiftedCommit>,
+    pub disclosure_warnings: Vec<String>,
 }
 
 pub async fn push_with_journal(
@@ -356,28 +341,42 @@ pub async fn fetch_with_journal(
         &remote_url,
         environment,
     )?;
-    let mut public_to_canonical = BTreeMap::new();
-    for mapping in &snapshot.mappings {
-        if let Some(previous) =
-            public_to_canonical.insert(mapping.public_oid, mapping.canonical_oid)
-            && previous != mapping.canonical_oid
-        {
-            return Err(JournalFlowError::AmbiguousPublicLineage(mapping.public_oid));
-        }
+    let public_heads = fetched.heads.values().copied().collect::<Vec<_>>();
+    let lifted = overlay_lift(
+        repository,
+        &public_heads,
+        snapshot.mappings.iter().map(|mapping| CommitMapping {
+            canonical_id: mapping.canonical_oid,
+            public_id: mapping.public_oid,
+        }),
+    )
+    .await?;
+    let canonical_heads = fetched
+        .heads
+        .keys()
+        .cloned()
+        .zip(lifted.canonical_heads.iter().copied())
+        .collect::<BTreeMap<_, _>>();
+    let mut all_states = Vec::with_capacity(lifted.new_mappings.len());
+    for mapping in &lifted.new_mappings {
+        let hidden_set_id = repository
+            .hidden_set_for_commit(mapping.canonical_id)
+            .await?
+            .identity()
+            .to_projection_id();
+        all_states.push(ProjectionGitState {
+            canonical_oid: mapping.canonical_id,
+            public_oid: mapping.public_id,
+            hidden_set_id,
+        });
     }
-    let mut all_states = Vec::<ProjectionGitState>::new();
-    let mut seen_public_states = BTreeSet::new();
-    let mut grafts = Vec::new();
-    let mut canonical_heads = BTreeMap::new();
-    for (bookmark, public_head) in &fetched.heads {
-        let grafted = graft_public_head(repository, *public_head, &public_to_canonical).await?;
-        canonical_heads.insert(bookmark.clone(), grafted.canonical_head);
-        for state in grafted.states {
-            if seen_public_states.insert(state.public_oid) {
-                all_states.push(state);
-            }
-        }
-        grafts.extend(grafted.grafts);
+    let disclosure_warnings = lifted
+        .disclosures
+        .iter()
+        .map(|disclosure| disclosure.warning())
+        .collect::<Vec<_>>();
+    for warning in &disclosure_warnings {
+        eprintln!("{warning}");
     }
     let closure_heads = fetched
         .heads
@@ -430,146 +429,9 @@ pub async fn fetch_with_journal(
         receipt,
         public_heads: fetched.heads,
         canonical_heads,
-        grafts,
+        mirrors: lifted.mirrors,
+        disclosure_warnings,
     })
-}
-
-pub async fn graft_public_lineage(
-    repository: &MachineGitRepository,
-    head: Oid,
-    mappings: impl IntoIterator<Item = CommitMapping>,
-) -> Result<CanonicalGraftResult, JournalFlowError> {
-    let mut public_to_canonical = BTreeMap::new();
-    for mapping in mappings {
-        if let Some(previous) = public_to_canonical.insert(mapping.public_id, mapping.canonical_id)
-            && previous != mapping.canonical_id
-        {
-            return Err(JournalFlowError::AmbiguousPublicLineage(mapping.public_id));
-        }
-    }
-    graft_public_head(repository, head, &public_to_canonical).await
-}
-
-async fn graft_public_head(
-    repository: &MachineGitRepository,
-    head: Oid,
-    public_to_canonical: &BTreeMap<Oid, Oid>,
-) -> Result<CanonicalGraftResult, JournalFlowError> {
-    enum Visit {
-        Enter(Oid),
-        Exit(Oid),
-    }
-    let git = gix::open(repository.git_repo_path())
-        .map_err(|error| JournalFlowError::GitObject(error.to_string()))?;
-    let mut stack = vec![Visit::Enter(head)];
-    let mut staged = BTreeMap::<Oid, Vec<u8>>::new();
-    let mut canonical = public_to_canonical.clone();
-    let mut states = Vec::new();
-    let mut grafts = Vec::new();
-    while let Some(visit) = stack.pop() {
-        match visit {
-            Visit::Enter(id) => {
-                if canonical.contains_key(&id) || staged.contains_key(&id) {
-                    continue;
-                }
-                let object = git
-                    .find_object(gix::ObjectId::from_bytes_or_panic(&id.0))
-                    .map_err(|error| JournalFlowError::GitObject(error.to_string()))?;
-                if object.kind != GitObjectKind::Commit {
-                    return Err(JournalFlowError::GitObject(
-                        "fetched head is not a commit".to_owned(),
-                    ));
-                }
-                let parsed = parse_commit(&object.data)
-                    .map_err(|error| JournalFlowError::GitObject(error.to_string()))?;
-                let parents = parsed.parents.clone();
-                staged.insert(id, object.data.clone());
-                stack.push(Visit::Exit(id));
-                for parent in parents.into_iter().rev() {
-                    stack.push(Visit::Enter(parent));
-                }
-            }
-            Visit::Exit(id) => {
-                let bytes = staged.remove(&id).expect("entered commit is staged");
-                let parsed = parse_commit(&bytes)
-                    .map_err(|error| JournalFlowError::GitObject(error.to_string()))?;
-                let public_parents = parsed.parents.clone();
-                let canonical_parents = public_parents
-                    .iter()
-                    .map(|parent| canonical.get(parent).copied().unwrap_or(*parent))
-                    .collect::<Vec<_>>();
-                let canonical_id = if public_parents == canonical_parents {
-                    id
-                } else {
-                    let rewritten = rewrite_parent_headers(&bytes, &canonical_parents, id)?;
-                    let written = git
-                        .objects
-                        .write_buf(GitObjectKind::Commit, &rewritten)
-                        .map_err(|error| JournalFlowError::GitObject(error.to_string()))?;
-                    let oid = Oid(written.as_bytes().try_into().map_err(|_| {
-                        JournalFlowError::GitObject("Git wrote a non-SHA-1 object ID".to_owned())
-                    })?);
-                    grafts.push(CanonicalParentGraft {
-                        public_commit: id,
-                        canonical_commit: oid,
-                        public_parents,
-                        canonical_parents,
-                    });
-                    oid
-                };
-                canonical.insert(id, canonical_id);
-                let hidden_set_id = repository
-                    .hidden_set_for_commit(canonical_id)
-                    .await?
-                    .identity()
-                    .to_projection_id();
-                states.push(ProjectionGitState {
-                    canonical_oid: canonical_id,
-                    public_oid: id,
-                    hidden_set_id,
-                });
-            }
-        }
-    }
-    Ok(CanonicalGraftResult {
-        canonical_head: canonical.get(&head).copied().unwrap_or(head),
-        states,
-        grafts,
-    })
-}
-
-fn rewrite_parent_headers(
-    source: &[u8],
-    parents: &[Oid],
-    id: Oid,
-) -> Result<Vec<u8>, JournalFlowError> {
-    let commit =
-        parse_commit(source).map_err(|error| JournalFlowError::GitObject(error.to_string()))?;
-    let message_start = source.len() - commit.message.len();
-    let headers_end = message_start.checked_sub(1).ok_or_else(|| {
-        JournalFlowError::GitObject(format!("commit {} has no header separator", hex(&id.0)))
-    })?;
-    let mut output = Vec::with_capacity(source.len());
-    let mut parent_index = 0;
-    for (index, header) in commit.headers.iter().enumerate() {
-        let end = commit
-            .headers
-            .get(index + 1)
-            .map_or(headers_end, |next| next.offset);
-        match header.name {
-            b"parent" => {
-                output.extend_from_slice(b"parent ");
-                output.extend_from_slice(hex(&parents[parent_index].0).as_bytes());
-                output.push(b'\n');
-                parent_index += 1;
-            }
-            b"gpgsig" | b"gpgsig-sha256" | b"mergetag" => {}
-            _ => output.extend_from_slice(&source[header.offset..end]),
-        }
-    }
-    output.push(b'\n');
-    output.extend_from_slice(commit.message);
-    Ok(output)
 }
 
 async fn recover_overlapping(
@@ -784,6 +646,8 @@ pub enum JournalFlowError {
     Http(#[from] GitHttpTransportError),
     #[error(transparent)]
     Projection(#[from] ProjectionError),
+    #[error(transparent)]
+    Lift(#[from] LiftError),
     #[error(transparent)]
     Closure(#[from] ObjectClosureError),
     #[error(transparent)]

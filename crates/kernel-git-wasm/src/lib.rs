@@ -9,6 +9,10 @@ use alloc::vec::Vec;
 
 use blake2::digest::Update;
 use blake2::{Blake2b512, Digest};
+use devspace_kernel_git::ops::{
+    OpObjectKind, OpReferenceKind, OpValidatedObject, ValidationError as OpValidationError,
+    validate_op,
+};
 use devspace_kernel_git::{ObjectKind, ReferenceKind, validate};
 
 #[unsafe(no_mangle)]
@@ -55,6 +59,41 @@ pub unsafe extern "C" fn kernel_validate(kind: u32, pointer: u32, length: u32) -
         Ok(Some(kind)) => encode(validate(kind, input)),
         Ok(None) | Err(_) => encode_error("unknown object kind"),
     };
+    let length = response.len() as u32;
+    let pointer = leak(response);
+    (u64::from(length) << 32) | u64::from(pointer)
+}
+
+/// Validates a stock jj simple operation-store view.
+///
+/// # Safety
+///
+/// `pointer` and `length` must identify a live, initialized input allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kernel_validate_view(pointer: u32, length: u32) -> u64 {
+    // SAFETY: Forwarding the caller contract unchanged.
+    unsafe { validate_op_input(OpObjectKind::View, pointer, length) }
+}
+
+/// Validates a stock jj simple operation-store operation.
+///
+/// # Safety
+///
+/// `pointer` and `length` must identify a live, initialized input allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kernel_validate_operation(pointer: u32, length: u32) -> u64 {
+    // SAFETY: Forwarding the caller contract unchanged.
+    unsafe { validate_op_input(OpObjectKind::Operation, pointer, length) }
+}
+
+unsafe fn validate_op_input(kind: OpObjectKind, pointer: u32, length: u32) -> u64 {
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: The caller contract requires a live, initialized input allocation.
+        unsafe { core::slice::from_raw_parts(pointer as *const u8, length as usize) }
+    };
+    let response = encode_op(validate_op(kind, input));
     let length = response.len() as u32;
     let pointer = leak(response);
     (u64::from(length) << 32) | u64::from(pointer)
@@ -127,6 +166,28 @@ fn encode(
     }
 }
 
+fn encode_op(result: Result<OpValidatedObject, OpValidationError>) -> Vec<u8> {
+    match result {
+        Ok(object) => {
+            let reference_bytes = object
+                .references
+                .iter()
+                .map(|reference| 1 + reference.id.len())
+                .sum::<usize>();
+            let mut output = Vec::with_capacity(69 + reference_bytes);
+            output.push(0);
+            output.extend_from_slice(&object.id);
+            output.extend_from_slice(&(object.references.len() as u32).to_le_bytes());
+            for reference in object.references {
+                output.push(op_reference_kind(reference.kind));
+                output.extend_from_slice(&reference.id);
+            }
+            output
+        }
+        Err(error) => encode_error(&error.to_string()),
+    }
+}
+
 const fn reference_kind(kind: ReferenceKind) -> u8 {
     match kind {
         ReferenceKind::Blob => 0,
@@ -135,6 +196,14 @@ const fn reference_kind(kind: ReferenceKind) -> u8 {
         ReferenceKind::Tree => 3,
         ReferenceKind::Commit => 4,
         ReferenceKind::Gitlink => 5,
+    }
+}
+
+const fn op_reference_kind(kind: OpReferenceKind) -> u8 {
+    match kind {
+        OpReferenceKind::Commit => 0,
+        OpReferenceKind::View => 1,
+        OpReferenceKind::Operation => 2,
     }
 }
 
@@ -186,5 +255,18 @@ mod tests {
         hasher.update(b"lo");
         let expected: [u8; 64] = Blake2b512::digest(b"hello").into();
         assert_eq!(hasher.finalize(), expected);
+    }
+
+    #[test]
+    fn operation_store_response_carries_blake2_id_and_mixed_width_references() {
+        let mut view = Vec::new();
+        view.extend_from_slice(&[0x0a, 20]);
+        view.extend_from_slice(&[1; 20]);
+        view.extend_from_slice(&[0x4a, 4, 0x1a, 2, 0x12, 0]);
+        view.extend_from_slice(&[0x60, 1]);
+        let response = encode_op(validate_op(OpObjectKind::View, &view));
+        assert_eq!(response[0], 0);
+        assert_eq!(&response[65..69], &[1, 0, 0, 0]);
+        assert_eq!(response.len(), 90);
     }
 }

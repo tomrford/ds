@@ -6,6 +6,11 @@ import {
 } from "./pack_git_protocol";
 import { MAX_GIT_PROJECTION_REQUEST_BYTES } from "./projection_git_protocol";
 import { MAX_REMOTE_REQUEST_BYTES } from "./remote_protocol";
+import {
+  MAX_OP_INVENTORY_REQUEST_BYTES,
+  MAX_OP_OBJECT_BYTES,
+} from "./op_git_store";
+import { MAX_HEAD_REQUEST_BYTES } from "./head_protocol";
 import type { RepositoryGit } from "./repository_git";
 import { cursorStringSchema, lowerHexStringSchema } from "./validation";
 
@@ -38,6 +43,14 @@ export async function routeGitRepository(
     /^\/repositories\/([^/]+)\/git\/projection\/pushes\/([^/]+)\/(claim|recover|replay)$/.exec(
       url.pathname,
     );
+  const opObjectMatch =
+    /^\/repositories\/([^/]+)\/git\/ops\/(views|operations)\/([^/]+)$/.exec(url.pathname);
+  const opInventoryMatch =
+    /^\/repositories\/([^/]+)\/git\/ops\/inventory$/.exec(url.pathname);
+  const opHeadsMatch =
+    /^\/repositories\/([^/]+)\/git\/ops\/heads$/.exec(url.pathname);
+  const opHeadTransactionsMatch =
+    /^\/repositories\/([^/]+)\/git\/ops\/heads\/transactions$/.exec(url.pathname);
   const repositoryId =
     chunkMatch?.[1] ??
     packMatch?.[1] ??
@@ -47,7 +60,11 @@ export async function routeGitRepository(
     remoteMatch?.[1] ??
     projectionPushMatch?.[1] ??
     projectionFetchMatch?.[1] ??
-    projectionPushActionMatch?.[1];
+    projectionPushActionMatch?.[1] ??
+    opObjectMatch?.[1] ??
+    opInventoryMatch?.[1] ??
+    opHeadsMatch?.[1] ??
+    opHeadTransactionsMatch?.[1];
   const packId = chunkMatch?.[2] ?? packMatch?.[2];
   if (repositoryId === undefined) return undefined;
 
@@ -67,6 +84,46 @@ export async function routeGitRepository(
   if (!initialized.ok) return gitRpcResponse(initialized);
 
   try {
+    if (opObjectMatch !== null && (request.method === "PUT" || request.method === "GET")) {
+      const kind = opObjectMatch[2] === "views" ? "view" : "operation";
+      const id = opObjectMatch[3];
+      if (request.method === "GET") {
+        return gitBinaryRpcResponse(await stub.getOpObject(authority, kind, id));
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = await readBoundedGitBody(request, MAX_OP_OBJECT_BYTES, "operation-store object");
+      } catch (error) {
+        return gitErrorResponse(
+          400,
+          error instanceof Error ? error.message : "invalid operation-store object body",
+        );
+      }
+      return gitRpcResponse(await stub.putOpObject(authority, kind, id, bytes));
+    }
+    if (opInventoryMatch !== null && request.method === "POST") {
+      const body = await readGitJsonBody(
+        request,
+        MAX_OP_INVENTORY_REQUEST_BYTES,
+        "operation-store inventory request",
+        "invalid-op-inventory",
+      );
+      if (body instanceof Response) return body;
+      return gitRpcResponse(await stub.inventoryOpObjects(authority, body));
+    }
+    if (opHeadsMatch !== null && request.method === "GET") {
+      return gitRpcResponse(await stub.getOpHeads(authority));
+    }
+    if (opHeadTransactionsMatch !== null && request.method === "POST") {
+      const body = await readGitJsonBody(
+        request,
+        MAX_HEAD_REQUEST_BYTES,
+        "operation head request",
+        "invalid-head-request",
+      );
+      if (body instanceof Response) return body;
+      return gitRpcResponse(await stub.transactOpHeads(authority, body));
+    }
     if (packCatalogMatch !== null && request.method === "GET") {
       const after = cursorStringSchema.safeParse(url.searchParams.get("after") ?? "0");
       if (!after.success) return gitErrorResponse(400, "invalid pack cursor");

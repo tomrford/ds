@@ -106,8 +106,44 @@ export function initializeGitSchema(sql: SqlStorage) {
       incarnation BLOB NOT NULL,
       user_id TEXT NOT NULL,
       repository_id TEXT NOT NULL,
-      retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1))
+      retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
+      op_cursor INTEGER NOT NULL DEFAULT 0 CHECK (op_cursor >= 0),
+      op_receipt_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_count >= 0),
+      op_receipt_head_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_head_count >= 0)
     );
+    CREATE TABLE IF NOT EXISTS op_objects (
+      kind INTEGER NOT NULL CHECK (kind IN (0, 1)),
+      id BLOB NOT NULL,
+      bytes BLOB NOT NULL,
+      PRIMARY KEY (kind, id)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS op_object_references (
+      object_kind INTEGER NOT NULL CHECK (object_kind IN (0, 1)),
+      object_id BLOB NOT NULL,
+      reference_kind INTEGER NOT NULL CHECK (reference_kind IN (0, 1, 2)),
+      referenced_id BLOB NOT NULL,
+      PRIMARY KEY (object_kind, object_id, reference_kind, referenced_id)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS op_heads (
+      id BLOB PRIMARY KEY
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS op_head_transactions (
+      incarnation BLOB NOT NULL,
+      idempotency_key BLOB NOT NULL,
+      request_hash BLOB NOT NULL,
+      cursor INTEGER NOT NULL,
+      created_at_ms INTEGER NOT NULL,
+      PRIMARY KEY (incarnation, idempotency_key)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS op_head_transactions_created_at
+      ON op_head_transactions (created_at_ms);
+    CREATE TABLE IF NOT EXISTS op_head_transaction_heads (
+      incarnation BLOB NOT NULL,
+      idempotency_key BLOB NOT NULL,
+      position INTEGER NOT NULL,
+      id BLOB NOT NULL,
+      PRIMARY KEY (incarnation, idempotency_key, position)
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS projection_git_meta (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
       next_fence INTEGER NOT NULL CHECK (next_fence >= 0),
@@ -186,4 +222,22 @@ export function initializeGitSchema(sql: SqlStorage) {
       url TEXT NOT NULL
     ) WITHOUT ROWID;
   `);
+  const repositoryColumns = sql
+    .exec<{ name: string }>("PRAGMA table_info(repository_state)")
+    .toArray();
+  if (!repositoryColumns.some((column) => column.name === "op_cursor")) {
+    sql.exec(
+      "ALTER TABLE repository_state ADD COLUMN op_cursor INTEGER NOT NULL DEFAULT 0 CHECK (op_cursor >= 0)",
+    );
+  }
+  if (!repositoryColumns.some((column) => column.name === "op_receipt_count")) {
+    sql.exec(
+      "ALTER TABLE repository_state ADD COLUMN op_receipt_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_count >= 0)",
+    );
+  }
+  if (!repositoryColumns.some((column) => column.name === "op_receipt_head_count")) {
+    sql.exec(
+      "ALTER TABLE repository_state ADD COLUMN op_receipt_head_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_head_count >= 0)",
+    );
+  }
 }
