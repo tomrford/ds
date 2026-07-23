@@ -5,19 +5,34 @@
 //! `op_store/` and `op_heads/`; they are intentionally not part of this pack
 //! format.
 
+mod git_subprocess;
 mod http_transport;
 mod install;
+mod journal_flow;
 mod object_closure;
 mod pack;
 mod pack_manifest;
 mod projection;
 mod store;
 
+pub use git_subprocess::{
+    FetchError, FetchReport, GitProcessEnvironment, GitProcessMode, LeaseUpdate, PushError,
+    PushErrorKind, PushRefReport, PushRefStatus, PushReport, QualifiedRef, QualifiedRefError,
+    RemoteUrl, fetch, push,
+};
 pub use http_transport::{
     DownloadedGitPack, GitHttpTransport, GitHttpTransportError, GitInstallReceipt,
-    GitPackCatalogEntry, GitPackCatalogPage, GitUploadReceipt,
+    GitPackCatalogEntry, GitPackCatalogPage, GitUploadReceipt, PendingProjectionGitBatch,
+    PendingProjectionGitRef, ProjectionGitBatchResult, ProjectionGitClaimResult,
+    ProjectionGitCursor, ProjectionGitFetchRef, ProjectionGitFetchResult, ProjectionGitMapping,
+    ProjectionGitObservation, ProjectionGitReplay, ProjectionGitSnapshot, ProjectionGitState,
+    ProjectionGitUpdate, RegisteredGitRemote,
 };
 pub use install::{InstalledPack, PackInstallError};
+pub use journal_flow::{
+    CanonicalGraftResult, CanonicalParentGraft, FetchFlowResult, JournalFlowError, PushFailpoint,
+    PushFlowResult, PushHead, fetch_with_journal, graft_public_lineage, push_with_journal,
+};
 pub use object_closure::{
     MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectKey,
 };

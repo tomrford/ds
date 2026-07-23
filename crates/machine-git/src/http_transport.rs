@@ -7,7 +7,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::pack_manifest::MAX_MANIFEST_BYTES;
-use crate::{BuiltPack, Digest, MAX_CHUNK_BYTES, PackManifest, PackManifestError, hex};
+use crate::{BuiltPack, Digest, MAX_CHUNK_BYTES, Oid, PackManifest, PackManifestError, hex};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -51,6 +51,152 @@ pub struct GitInstallReceipt {
     pub inserted_objects: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionGitState {
+    pub canonical_oid: Oid,
+    pub public_oid: Oid,
+    pub hidden_set_id: Option<[u8; 64]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionGitUpdate {
+    pub bookmark: String,
+    pub expected_old_oid: Option<Oid>,
+    pub states: Vec<ProjectionGitState>,
+    pub proposed_state: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionGitFetchRef {
+    pub bookmark: String,
+    pub observed_public_oid: Oid,
+    pub expected_cursor_oid: Option<Oid>,
+    pub states: Vec<ProjectionGitState>,
+    pub proposed_state: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionGitFetchResult {
+    #[serde(deserialize_with = "deserialize_short_id")]
+    pub fetch_id: [u8; 16],
+    pub activation_cursor: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionGitObservation {
+    pub bookmark: String,
+    pub live_oid: Option<Oid>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct RegisteredGitRemote {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionGitBatchResult {
+    pub pending: bool,
+    pub fence: u64,
+    pub outcome: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionGitClaimResult {
+    #[serde(default)]
+    pub pending: bool,
+    pub fence: u64,
+    pub previous_fence: Option<u64>,
+    pub outcome: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionGitReplay {
+    #[serde(deserialize_with = "deserialize_short_id")]
+    pub batch_id: [u8; 16],
+    pub remote: String,
+    #[serde(deserialize_with = "deserialize_short_id")]
+    pub owner_machine: [u8; 16],
+    pub fence: u64,
+    #[serde(deserialize_with = "deserialize_updates")]
+    pub updates: Vec<ProjectionGitUpdate>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionGitMapping {
+    pub remote: String,
+    pub bookmark: String,
+    #[serde(deserialize_with = "deserialize_oid")]
+    pub canonical_oid: Oid,
+    #[serde(deserialize_with = "deserialize_oid")]
+    pub public_oid: Oid,
+    #[serde(deserialize_with = "deserialize_optional_hidden_set")]
+    pub hidden_set_id: Option<[u8; 64]>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionGitCursor {
+    pub remote: String,
+    pub bookmark: String,
+    #[serde(deserialize_with = "deserialize_oid")]
+    pub canonical_oid: Oid,
+    #[serde(deserialize_with = "deserialize_oid")]
+    pub public_oid: Oid,
+    #[serde(deserialize_with = "deserialize_optional_hidden_set")]
+    pub hidden_set_id: Option<[u8; 64]>,
+    pub activation_sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingProjectionGitRef {
+    pub bookmark: String,
+    #[serde(default, deserialize_with = "deserialize_optional_oid")]
+    pub expected_old_oid: Option<Oid>,
+    #[serde(default, deserialize_with = "deserialize_optional_oid")]
+    pub proposed_public_oid: Option<Oid>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingProjectionGitBatch {
+    #[serde(deserialize_with = "deserialize_short_id")]
+    pub batch_id: [u8; 16],
+    pub remote: String,
+    #[serde(deserialize_with = "deserialize_short_id")]
+    pub owner_machine: [u8; 16],
+    pub fence: u64,
+    pub refs: Vec<PendingProjectionGitRef>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionGitSnapshot {
+    pub activation_cursor: u64,
+    pub cursors: Vec<ProjectionGitCursor>,
+    pub mappings: Vec<ProjectionGitMapping>,
+    pub next_after: u64,
+    pub through: u64,
+    pub has_more: bool,
+    pub pending: Vec<PendingProjectionGitBatch>,
+}
+
+#[derive(Deserialize)]
+struct RemoteList {
+    remotes: Vec<RegisteredGitRemote>,
+}
+
+#[derive(Deserialize)]
+struct RemoteUpsert {
+    remote: RegisteredGitRemote,
+}
+
 #[derive(Debug)]
 pub struct GitHttpTransport {
     client: reqwest::Client,
@@ -81,6 +227,7 @@ pub enum GitHttpTransportError {
     #[error("Worker request failed with status {status}: {message}")]
     Status {
         status: reqwest::StatusCode,
+        code: Option<String>,
         message: String,
     },
     #[error("Worker response declares {length} bytes, exceeding the {limit}-byte limit")]
@@ -276,6 +423,187 @@ impl GitHttpTransport {
         self.read_json(response).await
     }
 
+    pub async fn projection_snapshot(
+        &self,
+        after: u64,
+        through: Option<u64>,
+    ) -> Result<ProjectionGitSnapshot, GitHttpTransportError> {
+        let high_water = through.map_or_else(String::new, |value| format!("&through={value}"));
+        let url = format!(
+            "{}/projection?incarnation={}&after={after}{high_water}",
+            self.repository_url, self.incarnation
+        );
+        let response = self.send(self.client.get(url)).await?;
+        self.read_json(response).await
+    }
+
+    pub async fn projection_snapshot_all(
+        &self,
+    ) -> Result<ProjectionGitSnapshot, GitHttpTransportError> {
+        let mut page = self.projection_snapshot(0, None).await?;
+        let through = page.through;
+        let mut mappings = std::mem::take(&mut page.mappings);
+        let mut after = page.next_after;
+        while page.has_more {
+            page = self.projection_snapshot(after, Some(through)).await?;
+            after = page.next_after;
+            mappings.append(&mut page.mappings);
+        }
+        page.mappings = mappings;
+        Ok(page)
+    }
+
+    pub async fn set_remote(
+        &self,
+        name: &str,
+        url: &str,
+    ) -> Result<RegisteredGitRemote, GitHttpTransportError> {
+        let body = serde_json::json!({ "incarnation": self.incarnation, "url": url });
+        let response = self
+            .send(self.client.put(self.remote_url(name)?).json(&body))
+            .await?;
+        Ok(self.read_json::<RemoteUpsert>(response).await?.remote)
+    }
+
+    pub async fn list_remotes(&self) -> Result<Vec<RegisteredGitRemote>, GitHttpTransportError> {
+        let url = format!(
+            "{}/remotes?incarnation={}",
+            self.repository_url, self.incarnation
+        );
+        let response = self.send(self.client.get(url)).await?;
+        Ok(self.read_json::<RemoteList>(response).await?.remotes)
+    }
+
+    pub async fn begin_push(
+        &self,
+        batch_id: [u8; 16],
+        remote: &str,
+        updates: &[ProjectionGitUpdate],
+    ) -> Result<ProjectionGitBatchResult, GitHttpTransportError> {
+        let body = serde_json::json!({
+            "incarnation": self.incarnation,
+            "batchId": hex(&batch_id),
+            "machineId": self.machine_id,
+            "remote": remote,
+            "updates": updates.iter().map(update_json).collect::<Vec<_>>(),
+        });
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/projection/pushes", self.repository_url))
+                    .json(&body),
+            )
+            .await?;
+        self.read_json(response).await
+    }
+
+    pub async fn claim_push(
+        &self,
+        batch_id: [u8; 16],
+    ) -> Result<ProjectionGitClaimResult, GitHttpTransportError> {
+        let body = serde_json::json!({
+            "incarnation": self.incarnation,
+            "machineId": self.machine_id,
+        });
+        let response = self
+            .send(
+                self.client
+                    .post(format!(
+                        "{}/projection/pushes/{}/claim",
+                        self.repository_url,
+                        hex(&batch_id)
+                    ))
+                    .json(&body),
+            )
+            .await?;
+        self.read_json(response).await
+    }
+
+    pub async fn push_replay(
+        &self,
+        batch_id: [u8; 16],
+    ) -> Result<ProjectionGitReplay, GitHttpTransportError> {
+        let url = format!(
+            "{}/projection/pushes/{}/replay?incarnation={}",
+            self.repository_url,
+            hex(&batch_id),
+            self.incarnation
+        );
+        let response = self.send(self.client.get(url)).await?;
+        self.read_json(response).await
+    }
+
+    pub async fn recover_push(
+        &self,
+        batch_id: [u8; 16],
+        fence: u64,
+        observations: &[ProjectionGitObservation],
+    ) -> Result<ProjectionGitBatchResult, GitHttpTransportError> {
+        let body = serde_json::json!({
+            "incarnation": self.incarnation,
+            "machineId": self.machine_id,
+            "fence": fence,
+            "observations": observations.iter().map(|observation| serde_json::json!({
+                "bookmark": observation.bookmark,
+                "liveOid": observation.live_oid.map(|oid| hex(&oid.0)),
+            })).collect::<Vec<_>>(),
+        });
+        let response = self
+            .send(
+                self.client
+                    .post(format!(
+                        "{}/projection/pushes/{}/recover",
+                        self.repository_url,
+                        hex(&batch_id)
+                    ))
+                    .json(&body),
+            )
+            .await?;
+        self.read_json(response).await
+    }
+
+    pub async fn record_fetch(
+        &self,
+        fetch_id: [u8; 16],
+        remote: &str,
+        refs: &[ProjectionGitFetchRef],
+    ) -> Result<ProjectionGitFetchResult, GitHttpTransportError> {
+        let body = serde_json::json!({
+            "incarnation": self.incarnation,
+            "fetchId": hex(&fetch_id),
+            "machineId": self.machine_id,
+            "remote": remote,
+            "refs": refs.iter().map(|fetch_ref| serde_json::json!({
+                "bookmark": fetch_ref.bookmark,
+                "observedPublicOid": hex(&fetch_ref.observed_public_oid.0),
+                "expectedCursorOid": fetch_ref.expected_cursor_oid.map(|oid| hex(&oid.0)),
+                "states": fetch_ref.states.iter().map(state_json).collect::<Vec<_>>(),
+                "proposedState": fetch_ref.proposed_state,
+            })).collect::<Vec<_>>(),
+        });
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/projection/fetches", self.repository_url))
+                    .json(&body),
+            )
+            .await?;
+        self.read_json(response).await
+    }
+
+    fn remote_url(&self, name: &str) -> Result<reqwest::Url, GitHttpTransportError> {
+        let mut url = reqwest::Url::parse(&self.repository_url)
+            .map_err(|error| GitHttpTransportError::InvalidBaseUrl(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|()| {
+                GitHttpTransportError::Protocol(
+                    "repository URL cannot contain path segments".to_owned(),
+                )
+            })?
+            .extend(["remotes", name]);
+        Ok(url)
+    }
+
     async fn send(
         &self,
         request: reqwest::RequestBuilder,
@@ -291,19 +619,24 @@ impl GitHttpTransport {
         if status.is_success() {
             return Ok(response);
         }
-        let message = self
+        let error = self
             .read_bounded(response, MAX_ERROR_RESPONSE_BYTES)
             .await
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<ErrorResponse>(&bytes).ok())
-            .map_or_else(
-                || "cloud request failed without an error body".to_owned(),
-                |body| match body.code {
-                    Some(code) => format!("{code}: {}", body.error),
-                    None => body.error,
-                },
-            );
-        Err(GitHttpTransportError::Status { status, message })
+            .and_then(|bytes| serde_json::from_slice::<ErrorResponse>(&bytes).ok());
+        let code = error.as_ref().and_then(|body| body.code.clone());
+        let message = error.map_or_else(
+            || "cloud request failed without an error body".to_owned(),
+            |body| match &body.code {
+                Some(code) => format!("{code}: {}", body.error),
+                None => body.error,
+            },
+        );
+        Err(GitHttpTransportError::Status {
+            status,
+            code,
+            message,
+        })
     }
 
     async fn fetch_bytes(
@@ -382,4 +715,107 @@ fn decode_digest(value: &str) -> Result<Digest, GitHttpTransportError> {
         u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
             .expect("validated lowercase hexadecimal pair")
     }))
+}
+
+fn state_json(state: &ProjectionGitState) -> serde_json::Value {
+    serde_json::json!({
+        "canonicalOid": hex(&state.canonical_oid.0),
+        "publicOid": hex(&state.public_oid.0),
+        "hiddenSetId": state.hidden_set_id.as_ref().map(|id| hex(id)),
+    })
+}
+
+fn update_json(update: &ProjectionGitUpdate) -> serde_json::Value {
+    serde_json::json!({
+        "bookmark": update.bookmark,
+        "expectedOldOid": update.expected_old_oid.map(|oid| hex(&oid.0)),
+        "states": update.states.iter().map(state_json).collect::<Vec<_>>(),
+        "proposedState": update.proposed_state,
+    })
+}
+
+fn deserialize_hex<'de, const N: usize, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<[u8; N], D::Error> {
+    let value = String::deserialize(deserializer)?;
+    validate_lower_hex(&value, N * 2).map_err(|()| {
+        serde::de::Error::custom(format!("expected {} lowercase hex characters", N * 2))
+    })?;
+    Ok(std::array::from_fn(|index| {
+        u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).expect("validated hex")
+    }))
+}
+
+fn deserialize_short_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<[u8; 16], D::Error> {
+    deserialize_hex(deserializer)
+}
+
+fn deserialize_oid<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Oid, D::Error> {
+    deserialize_hex(deserializer).map(Oid)
+}
+
+fn deserialize_optional_oid<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Oid>, D::Error> {
+    Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
+        validate_lower_hex(&value, 40)
+            .map_err(|()| serde::de::Error::custom("expected 40 lowercase hex characters"))?;
+        Oid::from_hex(value.as_bytes())
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("invalid Git object ID"))
+    })
+}
+
+fn deserialize_optional_hidden_set<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u8; 64]>, D::Error> {
+    Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
+        let deserializer = serde::de::value::StringDeserializer::<D::Error>::new(value);
+        deserialize_hex(deserializer).map(Some)
+    })
+}
+
+fn deserialize_updates<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ProjectionGitUpdate>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WireUpdate {
+        bookmark: String,
+        #[serde(default, deserialize_with = "deserialize_optional_oid")]
+        expected_old_oid: Option<Oid>,
+        states: Vec<WireState>,
+        proposed_state: Option<usize>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WireState {
+        #[serde(deserialize_with = "deserialize_oid")]
+        canonical_oid: Oid,
+        #[serde(deserialize_with = "deserialize_oid")]
+        public_oid: Oid,
+        #[serde(deserialize_with = "deserialize_optional_hidden_set")]
+        hidden_set_id: Option<[u8; 64]>,
+    }
+    Vec::<WireUpdate>::deserialize(deserializer).map(|updates| {
+        updates
+            .into_iter()
+            .map(|update| ProjectionGitUpdate {
+                bookmark: update.bookmark,
+                expected_old_oid: update.expected_old_oid,
+                states: update
+                    .states
+                    .into_iter()
+                    .map(|state| ProjectionGitState {
+                        canonical_oid: state.canonical_oid,
+                        public_oid: state.public_oid,
+                        hidden_set_id: state.hidden_set_id,
+                    })
+                    .collect(),
+                proposed_state: update.proposed_state,
+            })
+            .collect()
+    })
 }
