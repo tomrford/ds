@@ -10,6 +10,7 @@ mod install;
 mod object_closure;
 mod pack;
 mod pack_manifest;
+mod projection;
 mod store;
 
 pub use http_transport::{
@@ -25,6 +26,10 @@ pub use pack::{
     MIN_CHUNK_BYTES, MIN_PACK_BYTES, PackBuildError, PackMetrics, PackOptions, build_packs,
 };
 pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
+pub use projection::{
+    CommitMapping, HiddenSet, HiddenSetIdentity, ProjectionError, ProjectionMappings,
+    ProjectionResult,
+};
 pub use store::{MachineGitRepository, MachineGitRepositoryError};
 
 pub use devspace_kernel_git::{ObjectKind, Oid};
