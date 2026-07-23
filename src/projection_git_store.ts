@@ -218,7 +218,11 @@ export class ProjectionGitStore {
                   states.public_oid, states.hidden_set_id, states.activation_seq
            FROM projection_git_cursors AS cursors
            JOIN projection_git_states AS states ON states.state_id = cursors.state_id
-           ORDER BY cursors.remote, cursors.bookmark`,
+           UNION ALL
+           SELECT remote, bookmark, oid AS canonical_oid, oid AS public_oid,
+                  NULL AS hidden_set_id, activation_seq
+           FROM projection_git_identity_cursors
+           ORDER BY remote, bookmark`,
         )
         .toArray()
         .map((row) => ({
@@ -507,6 +511,9 @@ export class ProjectionGitStore {
         }
         for (const ref of request.refs) {
           for (const state of ref.states) this.requireDurableState(state, "fetch-commit-not-durable");
+          if (ref.identityOid !== null) {
+            this.requireDurableCommit("identity", ref.identityOid, "fetch-commit-not-durable");
+          }
         }
         this.requireFetchReceiptConsistency(request);
         this.requireUnambiguousFetchLineage(request);
@@ -514,7 +521,7 @@ export class ProjectionGitStore {
 
         const existingStateIds = new Map<string, number>();
         for (const ref of request.refs) {
-          if (ref.proposedState !== null) continue;
+          if (ref.proposedState !== null || ref.identityOid !== null) continue;
           const existing = this.activeStateForObserved(
             request.remote,
             ref.bookmark,
@@ -535,6 +542,27 @@ export class ProjectionGitStore {
         }
         let activation = this.meta().activation_cursor;
         for (const ref of request.refs) {
+          if (ref.identityOid !== null) {
+            if (activation >= Number.MAX_SAFE_INTEGER) {
+              throw new Error("projection activation cursor exceeds the safe integer range");
+            }
+            activation += 1;
+            this.sql.exec(
+              "DELETE FROM projection_git_cursors WHERE remote = ? AND bookmark = ?",
+              request.remote,
+              ref.bookmark,
+            );
+            this.sql.exec(
+              `INSERT INTO projection_git_identity_cursors VALUES (?, ?, ?, ?)
+               ON CONFLICT (remote, bookmark) DO UPDATE SET
+                 oid = excluded.oid, activation_seq = excluded.activation_seq`,
+              request.remote,
+              ref.bookmark,
+              exactGitBuffer(ref.identityOid),
+              activation,
+            );
+            continue;
+          }
           const stateIds: number[] = [];
           for (const state of ref.states) {
             if (activation >= Number.MAX_SAFE_INTEGER) {
@@ -561,6 +589,11 @@ export class ProjectionGitStore {
               ? existingStateIds.get(ref.bookmark)
               : stateIds[ref.proposedState];
           if (proposedStateId === undefined) throw new Error("fetch cursor state is missing");
+          this.sql.exec(
+            "DELETE FROM projection_git_identity_cursors WHERE remote = ? AND bookmark = ?",
+            request.remote,
+            ref.bookmark,
+          );
           this.sql.exec(
             `INSERT INTO projection_git_cursors VALUES (?, ?, ?)
              ON CONFLICT (remote, bookmark) DO UPDATE SET state_id = excluded.state_id`,
@@ -724,9 +757,15 @@ export class ProjectionGitStore {
         "projection-pending-state-limit",
       );
     }
-    const activeCursors = this.sql
-      .exec<{ count: number }>("SELECT count(*) AS count FROM projection_git_cursors")
-      .one().count;
+    const activeCursors =
+      this.sql
+        .exec<{ count: number }>("SELECT count(*) AS count FROM projection_git_cursors")
+        .one().count +
+      this.sql
+        .exec<{ count: number }>(
+          "SELECT count(*) AS count FROM projection_git_identity_cursors",
+        )
+        .one().count;
     const pendingAdds = this.sql
       .exec<{ count: number }>(
         `SELECT count(*) AS count FROM projection_git_batch_refs
@@ -816,6 +855,11 @@ export class ProjectionGitStore {
         );
       }
       for (const ref of this.batchRefs(batchId)) {
+        this.sql.exec(
+          "DELETE FROM projection_git_identity_cursors WHERE remote = ? AND bookmark = ?",
+          batch.remote,
+          ref.bookmark,
+        );
         if (ref.proposed_state_id === null) {
           this.sql.exec(
             "DELETE FROM projection_git_cursors WHERE remote = ? AND bookmark = ?",
@@ -864,6 +908,7 @@ export class ProjectionGitStore {
     );
     this.sql.exec("DELETE FROM projection_git_batch_refs WHERE remote = ?", remote);
     this.sql.exec("DELETE FROM projection_git_cursors WHERE remote = ?", remote);
+    this.sql.exec("DELETE FROM projection_git_identity_cursors WHERE remote = ?", remote);
     this.sql.exec("DELETE FROM projection_git_states WHERE remote = ?", remote);
     this.sql.exec("DELETE FROM projection_git_batches WHERE remote = ?", remote);
     this.sql.exec("DELETE FROM projection_git_batch_results WHERE remote = ?", remote);
@@ -978,6 +1023,17 @@ export class ProjectionGitStore {
         ...expectedCursors.map((cursor) => cursor.bookmark),
       )
       .toArray();
+    rows.push(
+      ...this.sql
+        .exec<{ bookmark: string; public_oid: ArrayBuffer }>(
+          `SELECT bookmark, oid AS public_oid
+           FROM projection_git_identity_cursors
+           WHERE remote = ? AND bookmark IN (${placeholders})`,
+          remote,
+          ...expectedCursors.map((cursor) => cursor.bookmark),
+        )
+        .toArray(),
+    );
     const actualByBookmark = new Map(
       rows.map((row) => [row.bookmark, new Uint8Array(row.public_oid)]),
     );
@@ -1082,9 +1138,15 @@ export class ProjectionGitStore {
   }
 
   private requireFetchCursorCapacity(request: RecordGitFetchRequest) {
-    const cursorCount = this.sql
-      .exec<{ count: number }>("SELECT count(*) AS count FROM projection_git_cursors")
-      .one().count;
+    const cursorCount =
+      this.sql
+        .exec<{ count: number }>("SELECT count(*) AS count FROM projection_git_cursors")
+        .one().count +
+      this.sql
+        .exec<{ count: number }>(
+          "SELECT count(*) AS count FROM projection_git_identity_cursors",
+        )
+        .one().count;
     const additions = request.refs.filter((ref) => ref.expectedCursorOid === null).length;
     if (cursorCount + additions > MAX_REPOSITORY_GIT_PROJECTION_REFS) {
       throw new ProjectionGitStoreError(

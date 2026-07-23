@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 blake2.workspace = true
 devspace-kernel = { path = "../kernel" }
+devspace-machine-git = { path = "../machine-git" }
 futures.workspace = true
 jj-lib.workspace = true
 reqwest.workspace = true

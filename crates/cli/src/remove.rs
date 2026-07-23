@@ -2,7 +2,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 
-use devspace_machine::{CatalogEntry, MachineConfig, MachineRepository, MachineStore};
+use devspace_machine::{CatalogEntry, MachineConfig, MachineStore};
+use devspace_machine_git::MachineGitRepository;
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
@@ -89,7 +90,7 @@ pub(crate) async fn remove_checkout(
 
     let workspace_name = WorkspaceNameBuf::from(target.owner.workspace_name().to_owned());
     let settings = command.settings().clone();
-    let repository = MachineRepository::open(&target.entry.native_repository_path, &settings)
+    let repository = MachineGitRepository::open(&target.entry.native_repository_path, &settings)
         .await
         .map_err(|error| user_error(error.to_string()))?;
     let registered = repository
@@ -111,6 +112,17 @@ pub(crate) async fn remove_checkout(
     if target.path_exists {
         failpoint("before_checkout_deletion_validation");
         validate_checkout_at_path(command, &target.entry, &target.owner, &path)?;
+    }
+    let repository_for_forget = if registered {
+        Some(
+            MachineGitRepository::open(&target.entry.native_repository_path, &settings)
+                .await
+                .map_err(|error| user_error(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    if target.path_exists {
         let _git_shim_removal_guard = crate::git_shim::remove_guard(&path);
         fs::remove_dir_all(&path).map_err(|error| {
             user_error(format!(
@@ -121,7 +133,13 @@ pub(crate) async fn remove_checkout(
     }
 
     let abandoned = if registered {
-        forget_workspace(&target.entry, &workspace_name, &settings).await?
+        forget_workspace(
+            repository_for_forget
+                .as_ref()
+                .expect("registered workspace has a repository"),
+            &workspace_name,
+        )
+        .await?
     } else {
         forget_workspace_record(&target.entry.native_repository_path, &workspace_name)?;
         false
@@ -207,7 +225,7 @@ async fn explain_mismatched_checkout(
         .ok_or_else(|| stale_checkout(path))?;
     let registered_path =
         resolve_stored_workspace_path(&entry.native_repository_path, &registered_path);
-    let repository = MachineRepository::open(&entry.native_repository_path, command.settings())
+    let repository = MachineGitRepository::open(&entry.native_repository_path, command.settings())
         .await
         .map_err(|error| user_error(error.to_string()))?;
     if repository
@@ -501,13 +519,9 @@ fn validate_checkout_at_path(
 }
 
 async fn forget_workspace(
-    entry: &CatalogEntry,
+    repository: &MachineGitRepository,
     workspace_name: &WorkspaceName,
-    settings: &jj_lib::settings::UserSettings,
 ) -> Result<bool, CommandError> {
-    let repository = MachineRepository::open(&entry.native_repository_path, settings)
-        .await
-        .map_err(|error| user_error(error.to_string()))?;
     let mut abandoned = false;
     if let Some(working_copy_commit_id) = repository
         .repo()
@@ -562,7 +576,7 @@ async fn forget_workspace(
         })?;
         failpoint("after_repository_view_forget");
     }
-    forget_workspace_record(&entry.native_repository_path, workspace_name)?;
+    forget_workspace_record(repository.path(), workspace_name)?;
     Ok(abandoned)
 }
 
@@ -571,7 +585,7 @@ async fn registered_change_id(
     workspace_name: &WorkspaceName,
     settings: &jj_lib::settings::UserSettings,
 ) -> Result<Option<String>, CommandError> {
-    let repository = MachineRepository::open(&entry.native_repository_path, settings)
+    let repository = MachineGitRepository::open(&entry.native_repository_path, settings)
         .await
         .map_err(|error| user_error(error.to_string()))?;
     let Some(commit_id) = repository.repo().view().get_wc_commit_id(workspace_name) else {

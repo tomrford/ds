@@ -3,9 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::thread;
 
-use devspace_machine::{
-    MachineRepository, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
-};
+use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
+use devspace_machine_git::MachineGitRepository as MachineRepository;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};

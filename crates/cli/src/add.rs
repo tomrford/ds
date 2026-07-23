@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use devspace_machine::{
     CatalogEntry, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
-    MachineConfig, MachineRepository, MachineStore, RepositoryName, sync_directory,
+    MachineConfig, MachineStore, RepositoryName, sync_directory,
 };
+use devspace_machine_git::MachineGitRepository;
 use jj_cli::cli_util::{CommandHelper, RevisionArg};
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
@@ -170,7 +171,7 @@ pub(crate) async fn add_checkout(
         command.settings_for_new_workspace(ui, &requested_path)?.0
     };
     let target = resolve_add_target(ui, command, &entry, revision, mode).await?;
-    let repository = MachineRepository::open(&entry.native_repository_path, &settings)
+    let repository = MachineGitRepository::open(&entry.native_repository_path, &settings)
         .await
         .map_err(|error| user_error(error.to_string()))?;
     let current_workspace_commit = repository
@@ -391,13 +392,11 @@ async fn clone_repository(
         )));
     };
     let sync_path = staging.sync_path().to_owned();
-    let packs_path = staging.packs_path().to_owned();
     crate::sync::run_sync_engine(
         config,
         &entry.identity,
         staging.repository_mut(),
         &sync_path,
-        &packs_path,
     )
     .map_err(|error| {
         user_error(format!(
@@ -448,7 +447,7 @@ async fn resolve_add_target(
         });
     }
 
-    let repository = MachineRepository::open(&entry.native_repository_path, command.settings())
+    let repository = MachineGitRepository::open(&entry.native_repository_path, command.settings())
         .await
         .map_err(|error| user_error(error.to_string()))?;
     let repo = repository.repo().clone();

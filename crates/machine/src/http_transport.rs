@@ -72,7 +72,7 @@ impl HttpTransport {
     ) -> Result<Self, TransportError> {
         let mut authorization = reqwest::header::HeaderValue::from_str(&format!(
             "Bearer {}",
-            config.shared_secret().expose()
+            config.shared_secret().as_str()
         ))?;
         authorization.set_sensitive(true);
         Ok(Self {

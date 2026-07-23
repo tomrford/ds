@@ -351,6 +351,48 @@ describe("Git projection journal v2", () => {
     );
   });
 
+  it("records an identity cursor without creating a projection state row", async () => {
+    const repository = "git-journal-identity-cursor";
+    const [identityOid] = await installJournalFixture(repository);
+    const repositoryIncarnation = await incarnation(repository);
+    await putRemote(repository, "origin", "/tmp/origin.git");
+    const fetchId = "1c".repeat(16);
+    const request = {
+      incarnation: repositoryIncarnation,
+      fetchId,
+      machineId: defaultMachine,
+      remote: "origin",
+      refs: [
+        {
+          ...fetchRef("main", identityOid, null, [], null),
+          identityOid,
+        },
+      ],
+    };
+
+    expect(await projectionRequest(repository, "fetches", request)).toEqual({
+      status: 200,
+      body: { fetchId, activationCursor: 1 },
+    });
+    expect(await projectionSnapshot(repository)).toMatchObject({
+      status: 200,
+      body: {
+        activationCursor: 1,
+        cursors: [
+          {
+            remote: "origin",
+            bookmark: "main",
+            canonicalOid: identityOid,
+            publicOid: identityOid,
+            hiddenSetId: null,
+            activationSequence: 1,
+          },
+        ],
+        mappings: [],
+      },
+    });
+  });
+
   it("keeps canonical mapping receipts immutable after an aborted batch", async () => {
     const repository = "git-journal-receipt-immutability";
     const [canonicalOid, publicOne, publicTwo] = await installJournalFixture(repository);
@@ -750,7 +792,14 @@ function fetchRef(
   states: ReturnType<typeof projectionState>[],
   proposedState: number | null,
 ) {
-  return { bookmark, observedPublicOid, expectedCursorOid, states, proposedState };
+  return {
+    bookmark,
+    observedPublicOid,
+    expectedCursorOid,
+    states,
+    proposedState,
+    identityOid: null,
+  };
 }
 
 function authorizationFor(machineId: string): Record<string, string> {

@@ -1,15 +1,12 @@
 pub(crate) mod fetch;
-mod projection_sidecar;
 mod push;
 
 use std::io::Write as _;
 use std::path::Path;
 
 use clap::parser::ValueSource;
-use devspace_machine::{
-    CatalogEntry, GitOid, GitProjection, HttpTransport, LowerHexError, MachineRepository,
-    MachineStore, RegisteredRemote, RepositorySyncGuard, decode_lower_hex,
-};
+use devspace_machine::{CatalogEntry, MachineStore, RepositorySyncGuard};
+use devspace_machine_git::{GitHttpTransport, MachineGitRepository, Oid, RegisteredGitRemote};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
@@ -17,8 +14,6 @@ use jj_lib::settings::UserSettings;
 
 use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
 use crate::sync::{LockedSyncRun, run_sync_entry_foreground_locked};
-
-use self::projection_sidecar::open_or_create_projection;
 
 const DEFAULT_REMOTE: &str = "origin";
 const FAILPOINT_ENV: &str = "DEVSPACE_FAILPOINT";
@@ -139,10 +134,8 @@ pub(super) struct LockedCheckoutEntry {
 }
 
 pub(super) struct CloudSession {
-    repository: MachineRepository,
-    projection: GitProjection,
-    transport: HttpTransport,
-    machine_id: [u8; 16],
+    repository: MachineGitRepository,
+    transport: GitHttpTransport,
 }
 
 pub(crate) async fn run_git(ui: &mut Ui, command: &CommandHelper) -> Result<(), CommandError> {
@@ -282,15 +275,7 @@ pub(crate) fn register_remote(
     name: &str,
     url: &str,
 ) -> Result<(), CommandError> {
-    let transport = HttpTransport::new(
-        config,
-        entry.identity.repository_id.as_str(),
-        parse_hex(
-            entry.identity.incarnation.as_str(),
-            "repository incarnation",
-        )?,
-    )
-    .map_err(display_error)?;
+    let transport = git_transport(config, entry)?;
     cloud_runtime()?
         .block_on(transport.set_remote(name, url))
         .map_err(display_error)?;
@@ -331,16 +316,8 @@ async fn remote_list(ui: &mut Ui, command: &CommandHelper, json: bool) -> Result
 pub(crate) fn list_registered_remotes(
     config: &devspace_machine::MachineConfig,
     entry: &CatalogEntry,
-) -> Result<Vec<RegisteredRemote>, CommandError> {
-    let transport = HttpTransport::new(
-        config,
-        entry.identity.repository_id.as_str(),
-        parse_hex(
-            entry.identity.incarnation.as_str(),
-            "repository incarnation",
-        )?,
-    )
-    .map_err(display_error)?;
+) -> Result<Vec<RegisteredGitRemote>, CommandError> {
+    let transport = git_transport(config, entry)?;
     let remotes = cloud_runtime()?
         .block_on(transport.list_remotes())
         .map_err(display_error)?;
@@ -400,44 +377,34 @@ pub(super) async fn locked_checkout_entry(
 }
 
 pub(super) async fn open_cloud_session(
-    ui: &mut Ui,
+    _ui: &mut Ui,
     settings: &UserSettings,
     store: &MachineStore,
     entry: &CatalogEntry,
 ) -> Result<CloudSession, CommandError> {
-    let repository = MachineRepository::open(&entry.native_repository_path, settings)
+    let repository = MachineGitRepository::open(&entry.native_repository_path, settings)
         .await
         .map_err(display_error)?;
     let config = store.load_config().map_err(display_error)?;
-    let incarnation = parse_hex(
-        entry.identity.incarnation.as_str(),
-        "repository incarnation",
-    )?;
-    let machine_id = parse_hex(config.machine_id().as_str(), "machine ID")?;
-    let transport = HttpTransport::new(&config, entry.identity.repository_id.as_str(), incarnation)
-        .map_err(display_error)?;
-    let (projection, rebuilt_projection) =
-        open_or_create_projection(&store.repository_projection_path(&entry.identity), settings)
-            .map_err(user_error)?;
-    if rebuilt_projection {
-        writeln!(
-            ui.warning_default(),
-            "Rebuilt the local Git projection sidecar after it failed validation."
-        )?;
-    }
+    let transport = git_transport(&config, entry)?;
     Ok(CloudSession {
         repository,
-        projection,
         transport,
-        machine_id,
     })
 }
 
-fn parse_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], CommandError> {
-    decode_lower_hex(value).map_err(|error| match error {
-        LowerHexError::InvalidLength { .. } => user_error(format!("{label} has an invalid length")),
-        LowerHexError::InvalidDigit => user_error(format!("{label} is not lowercase hexadecimal")),
-    })
+pub(super) fn git_transport(
+    config: &devspace_machine::MachineConfig,
+    entry: &CatalogEntry,
+) -> Result<GitHttpTransport, CommandError> {
+    GitHttpTransport::new(
+        config.base_url(),
+        config.shared_secret().as_str(),
+        config.machine_id().as_str(),
+        entry.identity.repository_id.as_str(),
+        entry.identity.incarnation.as_str(),
+    )
+    .map_err(display_error)
 }
 
 pub(crate) fn cloud_runtime() -> Result<tokio::runtime::Runtime, CommandError> {
@@ -451,8 +418,11 @@ pub(crate) fn display_error(error: impl std::fmt::Display) -> CommandError {
     user_error(error.to_string())
 }
 
-pub(super) fn short_oid(oid: GitOid) -> String {
-    oid.to_string()[..12].to_owned()
+pub(super) fn short_oid(oid: Oid) -> String {
+    oid.0[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(crate) fn failpoint_enabled(name: &str) -> bool {

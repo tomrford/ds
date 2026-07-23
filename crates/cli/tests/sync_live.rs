@@ -7,7 +7,8 @@ use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use devspace_machine::{MachineRepository, MachineStore, MachineSyncStore, RepositoryName};
+use devspace_machine::{MachineStore, MachineSyncStore, RepositoryName};
+use devspace_machine_git::MachineGitRepository as MachineRepository;
 #[cfg(unix)]
 use support::daemon_socket_path;
 use support::{

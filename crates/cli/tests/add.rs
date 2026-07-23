@@ -1,13 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::thread;
 
-use devspace_machine::{
-    MachineRepository, PackOptions, RepositoryId, RepositoryIdentity, RepositoryIncarnation,
-    RepositoryName, build_packs,
+use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
+use devspace_machine_git::{
+    BuiltPack, MachineGitRepository as MachineRepository, Oid, PackOptions, build_packs,
 };
+use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{StoreFactories, StoreLoadError};
 use jj_lib::workspace::{Workspace, WorkspaceLoadError, default_working_copy_factories};
@@ -46,10 +47,9 @@ fn request_body(request: &str) -> serde_json::Value {
 }
 
 struct CloudFixture {
-    pack_id: String,
-    manifest: Vec<u8>,
-    chunks: Vec<Vec<u8>>,
     operation_head: String,
+    op_objects: BTreeMap<String, Vec<u8>>,
+    pack: BuiltPack,
 }
 
 async fn cloud_fixture(root: &Path) -> CloudFixture {
@@ -63,24 +63,40 @@ async fn cloud_fixture(root: &Path) -> CloudFixture {
     let repository = MachineRepository::open(&repository_path, &settings())
         .await
         .unwrap();
-    let closure = repository.object_closure(&BTreeSet::new()).await.unwrap();
-    let operation_head = hex_bytes(*closure.operation_heads.first().unwrap());
-    let built = build_packs(
+    let operation_head = hex_bytes(repository.current_operation_heads().await.unwrap()[0]);
+    let mut op_objects = BTreeMap::new();
+    for kind in ["operations", "views"] {
+        for entry in fs::read_dir(repository.operation_store_path().join(kind)).unwrap() {
+            let entry = entry.unwrap();
+            op_objects.insert(
+                format!("{kind}/{}", entry.file_name().to_string_lossy()),
+                fs::read(entry.path()).unwrap(),
+            );
+        }
+    }
+    let commit_heads = repository
+        .repo()
+        .view()
+        .wc_commit_ids()
+        .values()
+        .map(|id| Oid(id.as_bytes().try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let closure = repository.object_closure(commit_heads).unwrap();
+    let pack = build_packs(
+        &repository,
         &closure,
         &BTreeSet::new(),
-        fixture_root.join("packs"),
         PackOptions::default(),
     )
+    .unwrap()
+    .packs
+    .into_iter()
+    .next()
     .unwrap();
-    let pack = built.packs.into_iter().next().unwrap();
-    let chunks = (0..pack.manifest.chunks().len())
-        .map(|position| fs::read(pack.directory.join(format!("{position:08}.chunk"))).unwrap())
-        .collect();
     CloudFixture {
-        pack_id: hex_bytes(pack.id),
-        manifest: pack.manifest.encode(),
-        chunks,
         operation_head,
+        op_objects,
+        pack,
     }
 }
 
@@ -94,28 +110,37 @@ fn hex_bytes<const N: usize>(bytes: [u8; N]) -> String {
 fn create_cloud_sync_server(fixture: CloudFixture) -> (String, thread::JoinHandle<Vec<String>>) {
     create_server(move |_, request, stream| {
         let request_line = request.lines().next().unwrap();
-        if request_line.starts_with("GET ") && request_line.contains("/packs?") {
+        if request_line.starts_with("GET ") && request_line.contains("/git/packs?") {
             respond(
                 stream,
                 "200 OK",
-                &format!(
-                    r#"{{"packs":[{{"sequence":1,"id":"{}"}}],"nextAfter":1,"through":1,"hasMore":false}}"#,
-                    fixture.pack_id
-                ),
+                &serde_json::json!({
+                    "packs": [{"sequence": 1, "id": hex_bytes(fixture.pack.id)}],
+                    "nextAfter": 1,
+                    "through": 1,
+                    "hasMore": false,
+                })
+                .to_string(),
             );
-        } else if request_line.starts_with("GET ") && request_line.contains("/manifest?") {
+        } else if request_line.starts_with("GET ")
+            && request_line.contains("/git/packs/")
+            && request_line.contains("/manifest ")
+        {
             respond_bytes(
                 stream,
                 "200 OK",
                 "application/octet-stream",
-                &fixture.manifest,
+                &fixture.pack.manifest_bytes,
             );
-        } else if request_line.starts_with("GET ") && request_line.contains("/chunks/") {
+        } else if request_line.starts_with("GET ")
+            && request_line.contains("/git/packs/")
+            && request_line.contains("/chunks/")
+        {
             let position = request_line
                 .split("/chunks/")
                 .nth(1)
                 .unwrap()
-                .split(['?', ' '])
+                .split_whitespace()
                 .next()
                 .unwrap()
                 .parse::<usize>()
@@ -124,21 +149,35 @@ fn create_cloud_sync_server(fixture: CloudFixture) -> (String, thread::JoinHandl
                 stream,
                 "200 OK",
                 "application/octet-stream",
-                &fixture.chunks[position],
+                &fixture.pack.chunks[position],
             );
-        } else if request_line.starts_with("GET ") && request_line.contains("/heads?") {
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads") {
             respond(
                 stream,
                 "200 OK",
                 &format!(r#"{{"cursor":1,"heads":["{}"]}}"#, fixture.operation_head),
             );
-        } else if request_line.starts_with("POST ") && request_line.contains("/objects/inventory ")
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/") {
+            let key = request_line
+                .split("/git/ops/")
+                .nth(1)
+                .unwrap()
+                .split(['?', ' '])
+                .next()
+                .unwrap();
+            respond_bytes(
+                stream,
+                "200 OK",
+                "application/octet-stream",
+                &fixture.op_objects[key],
+            );
+        } else if request_line.starts_with("POST ") && request_line.contains("/git/ops/inventory ")
         {
-            let objects = request_body(request)["objects"].clone();
+            let keys = request_body(request)["keys"].clone();
             respond(
                 stream,
                 "200 OK",
-                &serde_json::json!({ "objects": objects }).to_string(),
+                &serde_json::json!({ "keys": keys }).to_string(),
             );
         } else {
             respond(stream, "200 OK", "{}");

@@ -4,14 +4,13 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use devspace_machine::{
-    MachineRepository, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
-};
+use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
+use devspace_machine_git::MachineGitRepository as MachineRepository;
 use jj_lib::default_index::DefaultIndexStore;
 use jj_lib::default_submodule_store::DefaultSubmoduleStore;
+use jj_lib::git_backend::GitBackend;
 use jj_lib::op_store::RefTarget;
 use jj_lib::repo::Repo as _;
-use jj_lib::simple_backend::SimpleBackend;
 use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
 use jj_lib::simple_op_store::SimpleOpStore;
 
@@ -243,7 +242,7 @@ fn set_repository_read_only(path: &Path, read_only: bool) {
 
 fn add_bare_marker_collision(path: &Path) {
     for (directory, store_type) in [
-        ("store", SimpleBackend::name()),
+        ("store", GitBackend::name()),
         ("op_store", SimpleOpStore::name()),
         ("op_heads", SimpleOpHeadsStore::name()),
         ("index", DefaultIndexStore::name()),

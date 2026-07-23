@@ -21,7 +21,7 @@ mod store;
 pub use git_subprocess::{
     FetchError, FetchReport, GitProcessEnvironment, GitProcessMode, LeaseUpdate, PushError,
     PushErrorKind, PushRefReport, PushRefStatus, PushReport, QualifiedRef, QualifiedRefError,
-    RemoteUrl, fetch, push,
+    RemoteHead, RemoteHeadsError, RemoteUrl, fetch, ls_remote_head, ls_remote_heads, push,
 };
 pub use http_transport::{
     DownloadedGitPack, GitHttpTransport, GitHttpTransportError, GitInstallReceipt,

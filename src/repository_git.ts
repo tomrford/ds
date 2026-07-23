@@ -62,6 +62,17 @@ export class RepositoryGit extends DurableObject<Env> {
     }
   }
 
+  async retireRepository(authority: RepositoryAuthority) {
+    try {
+      const state = this.authorityState();
+      if (state !== undefined) this.requireAuthority(authority);
+      await this.ctx.storage.deleteAll();
+      return { ok: true as const, retired: true };
+    } catch (error) {
+      return authorityFailure(error);
+    }
+  }
+
   putPackManifest(authority: RepositoryAuthority, packId: string, bytes: Uint8Array) {
     return this.withAuthority(authority, () => this.packs.putPackManifest(packId, bytes));
   }

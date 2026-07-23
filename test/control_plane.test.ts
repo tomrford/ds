@@ -386,6 +386,22 @@ describe("cloud identity and repository directory", () => {
     const machineId = "51".repeat(16);
     const first = await createRepository(machineId, "replaceable", "51".repeat(16));
     const firstStub = env.REPOSITORIES.get(env.REPOSITORIES.idFromString(first.repositoryId));
+    const firstGitStub = env.REPOSITORIES_GIT.getByName(first.repositoryId);
+    const firstAuthority = {
+      userId: env.DEVSPACE_DEVELOPMENT_USER_ID,
+      machineId,
+      repositoryId: first.repositoryId,
+      incarnation: first.incarnation,
+    };
+    expect(await firstGitStub.initializeRepository(firstAuthority)).toMatchObject({ ok: true });
+    await runInDurableObject(firstGitStub, (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO objects (kind, id, bytes) VALUES (?, ?, ?)",
+        1,
+        new Uint8Array(20).fill(1),
+        new Uint8Array([2]),
+      );
+    });
     await runInDurableObject(firstStub, (_instance, state) => {
       state.storage.sql.exec(
         "INSERT INTO objects (kind, id, bytes) VALUES (?, ?, ?)",
@@ -409,6 +425,15 @@ describe("cloud identity and repository directory", () => {
     });
     expect(deleted.status).toBe(200);
     expect(await deleted.json()).toEqual({ deleted: true });
+    await evictDurableObject(firstGitStub);
+    expect(await firstGitStub.countObjects()).toBe(0);
+    await runInDurableObject(firstGitStub, (_instance, state) => {
+      expect(
+        state.storage.sql
+          .exec<{ count: number }>("SELECT count(*) AS count FROM repository_state")
+          .one().count,
+      ).toBe(0);
+    });
     await runInDurableObject(firstStub, (_instance, state) => {
       const tombstone = state.storage.sql
         .exec<{ retired: number; repository_id: string }>(

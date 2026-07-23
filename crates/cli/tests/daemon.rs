@@ -15,9 +15,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use devspace_machine::{
-    CatalogEntry, MACHINE_STORE_OVERRIDE, MachineRepository, RepositoryId, RepositoryIdentity,
-    RepositoryIncarnation, RepositoryName,
+    CatalogEntry, MACHINE_STORE_OVERRIDE, RepositoryId, RepositoryIdentity, RepositoryIncarnation,
+    RepositoryName,
 };
+use devspace_machine_git::MachineGitRepository as MachineRepository;
 use stalling_server::StallingServer;
 use support::{
     configure_machine, daemon_socket_path, machine_store, poll_until, settings, stderr,

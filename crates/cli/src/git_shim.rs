@@ -71,8 +71,8 @@ fn ensure_inner(checkout_root: &Path, settings: &UserSettings) -> Result<(), Str
     // Resolve everything that does not need a writable .git first. In
     // particular, an unrelated invalid filesystem path must not leave the
     // guard relaxed or partially rewrite the index.
-    let base_ignores =
-        crate::working_copy::base_ignores(checkout_root).map_err(|error| error.to_string())?;
+    let base_ignores = crate::working_copy::base_ignores(checkout_root, settings)?;
+    let backend_objects = backend_objects_dir(checkout_root, settings)?;
     let discovered = crate::working_copy::discover_shim_paths(checkout_root, &base_ignores)
         .map_err(|error| error.to_string())?;
     let canonical = canonical_paths(checkout_root, settings)?;
@@ -136,6 +136,11 @@ fn ensure_inner(checkout_root: &Path, settings: &UserSettings) -> Result<(), Str
         if !git_dir.exists() {
             require_success(git(checkout_root).args(["init", "-q"]), "git init")?;
         }
+        fs::write(
+            git_dir.join("objects/info/alternates"),
+            format!("{}\n", backend_objects.display()),
+        )
+        .map_err(|error| format!("configure real Git object database: {error}"))?;
         remove_stale_index_lock(&git_dir)?;
         ensure_info_exclude(&git_dir, excluded_paths.iter().map(|path| path.as_ref()))?;
 
@@ -157,6 +162,22 @@ fn ensure_inner(checkout_root: &Path, settings: &UserSettings) -> Result<(), Str
         }
     })();
     finish_guard(refresh, guard)
+}
+
+fn backend_objects_dir(
+    checkout_root: &Path,
+    settings: &UserSettings,
+) -> Result<std::path::PathBuf, String> {
+    let workspace = Workspace::load(
+        settings,
+        checkout_root,
+        &StoreFactories::default(),
+        &crate::working_copy::devspace_working_copy_factories(),
+    )
+    .map_err(|error| error.to_string())?;
+    let backend = jj_lib::git::get_git_backend(workspace.repo_loader().store())
+        .map_err(|error| error.to_string())?;
+    Ok(backend.git_repo_path().join("objects"))
 }
 
 fn finish_guard(result: Result<(), String>, guard: GitDirGuard<'_>) -> Result<(), String> {

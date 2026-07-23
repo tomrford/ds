@@ -484,6 +484,9 @@ export class ControlPlane extends DurableObject<Env> {
     );
     const retired = await stub.retireRepository(authority);
     if (!retired.ok) return retired;
+    const gitStub = this.env.REPOSITORIES_GIT.getByName(request.repositoryId);
+    const gitRetired = await gitStub.retireRepository(authority);
+    if (!gitRetired.ok) return gitRetired;
     this.finalizeRepositoryRetirement(identity.userId, request.repositoryId);
     return { ok: true as const, deleted: true };
   }
@@ -502,6 +505,11 @@ export class ControlPlane extends DurableObject<Env> {
       const retired = await stub.retireRepository(authority);
       if (!retired.ok) {
         throw new Error(`repository retirement recovery failed: ${retired.error}`);
+      }
+      const gitStub = this.env.REPOSITORIES_GIT.getByName(repository.repository_id);
+      const gitRetired = await gitStub.retireRepository(authority);
+      if (!gitRetired.ok) {
+        throw new Error(`Git repository retirement recovery failed: ${gitRetired.error}`);
       }
       this.finalizeRepositoryRetirement(repository.user_id, repository.repository_id);
     }

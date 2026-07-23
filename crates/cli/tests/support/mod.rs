@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use blake2::{Blake2b512, Digest as _};
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineRepository, MachineStore, SharedSecret,
+    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineStore, SharedSecret,
 };
+use devspace_machine_git::MachineGitRepository as MachineRepository;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::settings::UserSettings;

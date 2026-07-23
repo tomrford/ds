@@ -9,9 +9,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use devspace_machine::{
-    GitProjection, HttpTransport, MachineRepository, MachineStoreError, ProjectionSnapshot,
-    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, encode_lower_hex,
+    HttpTransport, MachineStoreError, ProjectionSnapshot, RepositoryId, RepositoryIdentity,
+    RepositoryIncarnation, RepositoryName, encode_lower_hex,
 };
+use devspace_machine_git::MachineGitRepository as MachineRepository;
 use jj_lib::op_store::RemoteRef;
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 
@@ -192,8 +193,6 @@ async fn git_push_holds_the_repository_sync_lock_after_sync_completes() {
         .resolve(&RepositoryName::parse("lock-lifetime").unwrap())
         .unwrap()
         .unwrap();
-    let projection_path = store.repository_projection_path(&entry.identity);
-    fs::create_dir_all(projection_path.join("store")).unwrap();
     let child = ds_command(&checkout, &home, &config)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -215,8 +214,6 @@ async fn git_push_holds_the_repository_sync_lock_after_sync_completes() {
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("no such Git remote `origin`"));
     assert!(stderr(&output).contains("remote-not-found"));
-    assert!(stderr(&output).contains("Rebuilt the local Git projection sidecar"));
-    GitProjection::open(&projection_path, &settings()).unwrap();
     drop(store.try_lock_repository_sync(&entry.identity).unwrap());
 }
 
@@ -471,20 +468,22 @@ async fn deleted_selects_only_absent_local_tracked_bookmarks_on_the_remote() {
 }
 
 #[tokio::test]
-async fn push_surfaces_missing_mapped_sidecar_object_repair() {
+async fn push_surfaces_missing_mapped_object_repair() {
     let fixture = FakePushFixture::new("missing-mapped-object").await;
+    fs::write(fixture.checkout.join(".dsprivate"), b"/secret.txt\n").unwrap();
+    fs::write(fixture.checkout.join("secret.txt"), b"private\n").unwrap();
     fixture.commit("main", "first\n");
     let created = fixture.push(&["-b", "main"]);
     assert!(created.status.success(), "{}", stderr(&created));
     let oid = remote_ref(&fixture.remote, "main").unwrap();
     let hex = encode_lower_hex(&oid);
-    let projection = GitProjection::open(fixture.projection_path(), &settings()).unwrap();
-    let object_path = projection
+    let repository = fixture.repository().await;
+    let object_path = repository
         .git_repo_path()
         .join("objects")
         .join(&hex[..2])
         .join(&hex[2..]);
-    drop(projection);
+    drop(repository);
     fs::remove_file(&object_path).unwrap();
     fixture.commit("main", "second\n");
 
@@ -492,7 +491,7 @@ async fn push_surfaces_missing_mapped_sidecar_object_repair() {
     assert_eq!(pushed.status.code(), Some(1));
     let diagnostic = stderr(&pushed);
     assert!(
-        diagnostic.contains("Git projection sidecar is missing mapped Git object"),
+        diagnostic.contains("failed to read Git object"),
         "{diagnostic}"
     );
     assert!(
@@ -646,10 +645,6 @@ impl FakePushFixture {
     fn add_remote(&self, name: &str) {
         let added = self.ds(&["git", "remote", "add", name, self.remote.to_str().unwrap()]);
         assert!(added.status.success(), "{}", stderr(&added));
-    }
-
-    fn projection_path(&self) -> PathBuf {
-        machine_store(&self.home).repository_projection_path(&self.entry().identity)
     }
 
     fn fetch(&self, args: &[&str]) -> Output {
@@ -1105,6 +1100,7 @@ impl LiveFixture {
 fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
     let mut head = None::<String>;
     let mut head_cursor = 0_u64;
+    let mut op_objects = BTreeMap::<String, String>::new();
     let mut activation_cursor = 0_u64;
     let mut cursors = Vec::<serde_json::Value>::new();
     let mut mappings = Vec::<serde_json::Value>::new();
@@ -1128,7 +1124,18 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                 "200 OK",
                 r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
             );
-        } else if request_line.starts_with("GET ") && request_line.contains("/heads?") {
+        } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
+            respond(stream, "200 OK", r#"{"inserted":true,"installed":false}"#);
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/packs/")
+            && request_line.contains("/install ")
+        {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"installed":true,"insertedObjects":1}"#,
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads ") {
             respond(
                 stream,
                 "200 OK",
@@ -1138,14 +1145,51 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                 })
                 .to_string(),
             );
-        } else if request_line.starts_with("POST ") && request_line.contains("/objects/inventory ")
+        } else if request_line.starts_with("POST ") && request_line.contains("/git/ops/inventory ")
         {
+            let requested = request_json(request)["keys"].as_array().unwrap().clone();
             respond(
                 stream,
                 "200 OK",
-                &serde_json::json!({"objects": request_json(request)["objects"]}).to_string(),
+                &serde_json::json!({
+                    "keys": requested.into_iter().filter(|key| {
+                        op_objects.contains_key(key.as_str().unwrap())
+                    }).collect::<Vec<_>>()
+                })
+                .to_string(),
             );
-        } else if request_line.starts_with("POST ") && request_line.contains("/heads ") {
+        } else if request_line.starts_with("PUT ")
+            && (request_line.contains("/git/ops/views/")
+                || request_line.contains("/git/ops/operations/"))
+        {
+            let path = request_line.split_whitespace().nth(1).unwrap();
+            let (kind, id) = if let Some(id) = path.split("/git/ops/views/").nth(1) {
+                ("v", id)
+            } else {
+                ("o", path.split("/git/ops/operations/").nth(1).unwrap())
+            };
+            op_objects.insert(format!("{kind}:{id}"), request_body(request).to_owned());
+            respond(stream, "200 OK", r#"{}"#);
+        } else if request_line.starts_with("GET ")
+            && (request_line.contains("/git/ops/views/")
+                || request_line.contains("/git/ops/operations/"))
+        {
+            let path = request_line.split_whitespace().nth(1).unwrap();
+            let (kind, id) = if let Some(id) = path.split("/git/ops/views/").nth(1) {
+                ("v", id)
+            } else {
+                ("o", path.split("/git/ops/operations/").nth(1).unwrap())
+            };
+            respond(
+                stream,
+                "200 OK",
+                op_objects
+                    .get(&format!("{kind}:{id}"))
+                    .expect("requested operation object exists"),
+            );
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/ops/heads/transactions ")
+        {
             let body = request_json(request);
             head = Some(body["newHead"].as_str().unwrap().to_owned());
             head_cursor += 1;
@@ -1170,7 +1214,7 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                 })
                 .to_string(),
             );
-        } else if request_line.starts_with("GET ") && request_line.contains("/projection?") {
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/projection?") {
             let pending_batches = pending
                 .iter()
                 .map(|batch| {
@@ -1182,12 +1226,12 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                         "refs": batch["updates"].as_array().unwrap().iter().map(|update| {
                             let proposed = update["proposedState"]
                                 .as_u64()
-                                .map(|index| update["states"][index as usize]["gitOid"].clone())
+                                .map(|index| update["states"][index as usize]["publicOid"].clone())
                                 .unwrap_or(serde_json::Value::Null);
                             serde_json::json!({
                                 "bookmark": update["bookmark"],
                                 "expectedOldOid": update["expectedOldOid"],
-                                "proposedGitOid": proposed,
+                                "proposedPublicOid": proposed,
                             })
                         }).collect::<Vec<_>>(),
                     })
@@ -1207,7 +1251,9 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                 })
                 .to_string(),
             );
-        } else if request_line.starts_with("POST ") && request_line.contains("/git/fetches ") {
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/projection/fetches ")
+        {
             let body = request_json(request);
             let remote = body["remote"].as_str().unwrap();
             for fetch_ref in body["refs"].as_array().unwrap() {
@@ -1215,7 +1261,7 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                 let current = cursors
                     .iter()
                     .find(|cursor| cursor["remote"] == remote && cursor["bookmark"] == bookmark)
-                    .map(|cursor| cursor["gitOid"].clone())
+                    .map(|cursor| cursor["publicOid"].clone())
                     .unwrap_or(serde_json::Value::Null);
                 assert_eq!(fetch_ref["expectedCursorOid"], current);
                 cursors
@@ -1225,23 +1271,32 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                     let mapping = serde_json::json!({
                         "remote": remote,
                         "bookmark": bookmark,
-                        "gitOid": state["gitOid"],
-                        "canonicalCommitId": state["canonicalCommitId"],
-                        "publicCommitId": state["publicCommitId"],
+                        "canonicalOid": state["canonicalOid"],
+                        "publicOid": state["publicOid"],
                         "hiddenSetId": state["hiddenSetId"],
                     });
                     if !mappings.iter().any(|existing| existing == &mapping) {
                         mappings.push(mapping);
                     }
                 }
-                let proposed = fetch_ref["proposedState"].as_u64().unwrap() as usize;
-                let state = &fetch_ref["states"][proposed];
+                let state = fetch_ref["proposedState"]
+                    .as_u64()
+                    .map(|index| fetch_ref["states"][index as usize].clone())
+                    .or_else(|| {
+                        fetch_ref["identityOid"].as_str().map(|oid| {
+                            serde_json::json!({
+                                "canonicalOid": oid,
+                                "publicOid": oid,
+                                "hiddenSetId": null,
+                            })
+                        })
+                    })
+                    .expect("fetch records a state or identity cursor");
                 cursors.push(serde_json::json!({
                     "remote": remote,
                     "bookmark": bookmark,
-                    "gitOid": state["gitOid"],
-                    "canonicalCommitId": state["canonicalCommitId"],
-                    "publicCommitId": state["publicCommitId"],
+                    "canonicalOid": state["canonicalOid"],
+                    "publicOid": state["publicOid"],
                     "hiddenSetId": state["hiddenSetId"],
                     "activationSequence": activation_cursor,
                 }));
@@ -1256,7 +1311,7 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                 .to_string(),
             );
         } else if request_line.starts_with("POST ")
-            && request_line.contains("/git/pushes/")
+            && request_line.contains("/git/projection/pushes/")
             && request_line.contains("/claim ")
         {
             let previous_fence = pending_fence;
@@ -1271,7 +1326,7 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                 .to_string(),
             );
         } else if request_line.starts_with("GET ")
-            && request_line.contains("/git/pushes/")
+            && request_line.contains("/git/projection/pushes/")
             && request_line.contains("/replay?")
         {
             let batch = pending.as_ref().expect("replay follows a pending batch");
@@ -1288,7 +1343,7 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                 .to_string(),
             );
         } else if request_line.starts_with("POST ")
-            && request_line.contains("/git/pushes/")
+            && request_line.contains("/git/projection/pushes/")
             && request_line.contains("/recover ")
         {
             let body = request_json(request);
@@ -1307,13 +1362,12 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                     .retain(|cursor| cursor["remote"] != remote || cursor["bookmark"] != bookmark);
                 if let Some(index) = update["proposedState"].as_u64() {
                     let state = &update["states"][index as usize];
-                    assert_eq!(observation["liveOid"], state["gitOid"]);
+                    assert_eq!(observation["liveOid"], state["publicOid"]);
                     cursors.push(serde_json::json!({
                         "remote": remote,
                         "bookmark": bookmark,
-                        "gitOid": state["gitOid"],
-                        "canonicalCommitId": state["canonicalCommitId"],
-                        "publicCommitId": state["publicCommitId"],
+                        "canonicalOid": state["canonicalOid"],
+                        "publicOid": state["publicOid"],
                         "hiddenSetId": state["hiddenSetId"],
                         "activationSequence": activation_cursor,
                     }));
@@ -1321,9 +1375,8 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                         let mapping = serde_json::json!({
                             "remote": remote,
                             "bookmark": bookmark,
-                            "gitOid": state["gitOid"],
-                            "canonicalCommitId": state["canonicalCommitId"],
-                            "publicCommitId": state["publicCommitId"],
+                            "canonicalOid": state["canonicalOid"],
+                            "publicOid": state["publicOid"],
                             "hiddenSetId": state["hiddenSetId"],
                         });
                         if !mappings.iter().any(|existing| existing == &mapping) {
@@ -1344,7 +1397,9 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                 })
                 .to_string(),
             );
-        } else if request_line.starts_with("POST ") && request_line.contains("/git/pushes ") {
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/projection/pushes ")
+        {
             let body = request_json(request);
             for update in body["updates"].as_array().unwrap() {
                 let bookmark = &update["bookmark"];
@@ -1353,7 +1408,7 @@ fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) {
                     .find(|cursor| {
                         cursor["remote"] == body["remote"] && cursor["bookmark"] == *bookmark
                     })
-                    .map(|cursor| cursor["gitOid"].clone())
+                    .map(|cursor| cursor["publicOid"].clone())
                     .unwrap_or(serde_json::Value::Null);
                 assert_eq!(update["expectedOldOid"], current);
             }
@@ -1404,9 +1459,17 @@ fn cloud_paused_at_remote_list() -> (String, Receiver<()>, SyncSender<()>, JoinH
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_http_request(&mut stream);
             let request_line = request.lines().next().unwrap();
-            if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
+            if request_line.starts_with("GET ") && request_line.contains("/git/projection?") {
                 push_reached_tx.send(()).unwrap();
                 release_push_rx.recv().unwrap();
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"activationCursor":0,"cursors":[],"mappings":[],"nextAfter":0,"through":0,"hasMore":false,"pending":[]}"#,
+                );
+                continue;
+            }
+            if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
                 respond(&mut stream, "200 OK", r#"{"remotes":[]}"#);
                 return;
             }
@@ -1416,24 +1479,46 @@ fn cloud_paused_at_remote_list() -> (String, Receiver<()>, SyncSender<()>, JoinH
                     "200 OK",
                     r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
                 );
-            } else if request_line.starts_with("GET ") && request_line.contains("/heads?") {
+            } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"inserted":true,"installed":false}"#,
+                );
+            } else if request_line.starts_with("POST ")
+                && request_line.contains("/packs/")
+                && request_line.contains("/install ")
+            {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"installed":true,"insertedObjects":1}"#,
+                );
+            } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads ") {
                 respond(&mut stream, "200 OK", r#"{"cursor":0,"heads":[]}"#);
             } else if request_line.starts_with("POST ")
-                && request_line.contains("/objects/inventory ")
+                && request_line.contains("/git/ops/inventory ")
             {
                 let body: serde_json::Value = serde_json::from_str(request_body(&request)).unwrap();
                 respond(
                     &mut stream,
                     "200 OK",
-                    &serde_json::json!({ "objects": body["objects"] }).to_string(),
+                    &serde_json::json!({ "keys": body["keys"] }).to_string(),
                 );
-            } else if request_line.starts_with("POST ") && request_line.contains("/heads ") {
+            } else if request_line.starts_with("POST ")
+                && request_line.contains("/git/ops/heads/transactions ")
+            {
                 let body: serde_json::Value = serde_json::from_str(request_body(&request)).unwrap();
                 respond(
                     &mut stream,
                     "200 OK",
                     &serde_json::json!({ "cursor": 1, "heads": [body["newHead"]] }).to_string(),
                 );
+            } else if request_line.starts_with("PUT ")
+                && (request_line.contains("/git/ops/views/")
+                    || request_line.contains("/git/ops/operations/"))
+            {
+                respond(&mut stream, "200 OK", r#"{}"#);
             } else {
                 panic!("unexpected fake cloud request: {request_line}");
             }

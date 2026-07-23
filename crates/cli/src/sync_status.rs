@@ -1,7 +1,8 @@
 use std::io::Write as _;
 use std::path::Path;
 
-use devspace_machine::{CatalogEntry, MachineRepository, MachineStore, MachineSyncStore};
+use devspace_machine::{CatalogEntry, MachineStore};
+use devspace_machine_git::{MachineGitRepository, OpSyncStore};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
@@ -101,7 +102,7 @@ pub(crate) async fn write_catalog_status(
         let complete = entry.native_repository_path.is_dir();
         let current_heads = if complete {
             let repository =
-                MachineRepository::open(&entry.native_repository_path, command.settings())
+                MachineGitRepository::open(&entry.native_repository_path, command.settings())
                     .await
                     .map_err(|error| user_error(error.to_string()))?;
             repository
@@ -165,7 +166,7 @@ fn local_sync_status(
         });
     }
 
-    let sync_store = MachineSyncStore::open(sync_path).map_err(|error| error.to_string())?;
+    let sync_store = OpSyncStore::open(sync_path).map_err(|error| error.to_string())?;
     let outbox = sync_store
         .load_outbox()
         .map_err(|error| error.to_string())?;

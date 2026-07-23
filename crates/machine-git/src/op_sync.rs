@@ -12,7 +12,7 @@ use jj_lib::repo::Repo as _;
 use thiserror::Error;
 
 use crate::{
-    MachineGitRepository, OpId, OpReconcileError, OpSyncState, OpSyncStateError, OpSyncStore,
+    MachineGitRepository, Oid, OpId, OpReconcileError, OpSyncState, OpSyncStateError, OpSyncStore,
     PendingOpHeadBatch, PendingOpHeadTransaction,
 };
 
@@ -41,6 +41,20 @@ pub struct CloudOpHeads {
 
 #[allow(async_fn_in_trait)]
 pub trait OpSyncTransport {
+    async fn download_git_objects(
+        &mut self,
+        _repository: &MachineGitRepository,
+        after: u64,
+    ) -> Result<u64, TransportError> {
+        Ok(after)
+    }
+    async fn upload_git_objects(
+        &mut self,
+        _repository: &MachineGitRepository,
+        _heads: &BTreeSet<Oid>,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
     async fn inventory_op_objects(
         &mut self,
         candidates: &[OpObjectKey],
@@ -87,12 +101,19 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
                 .map(|entry| entry.new_head)
                 .collect::<Vec<_>>();
             let closure = self.local_closure(heads, &BTreeSet::new())?;
+            self.transport
+                .upload_git_objects(self.repository, &closure.commit_heads)
+                .await?;
             self.upload_closure(&closure).await?;
             self.drain_outbox(&mut state, pending).await?;
             return Ok(state);
         }
 
         let cloud = self.transport.get_op_heads().await?;
+        state.catalog_sequence = self
+            .transport
+            .download_git_objects(self.repository, state.catalog_sequence)
+            .await?;
         self.download_closures(&cloud.heads).await?;
         if !cloud.heads.is_empty() {
             self.repository
@@ -104,6 +125,9 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
 
         let current_heads = self.repository.current_operation_heads().await?;
         let closure = self.local_closure(current_heads, &state.accepted_heads)?;
+        self.transport
+            .upload_git_objects(self.repository, &closure.commit_heads)
+            .await?;
         self.upload_closure(&closure).await?;
         let new_heads = closure
             .heads
@@ -174,7 +198,7 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
             };
             let references = validate_bytes(key, &bytes)?;
             install_object(&path, &bytes)?;
-            for (kind, id) in references {
+            for (kind, id) in references.op_objects {
                 if kind == OpObjectKind::Operation && id == [0; 64] {
                     continue;
                 }
@@ -201,6 +225,7 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
             })
             .collect::<BTreeSet<_>>();
         let mut objects = BTreeSet::new();
+        let mut commit_heads = BTreeSet::new();
         while let Some(key) = pending.pop_first() {
             if objects.contains(&key)
                 || (key.kind == OpObjectKind::Operation && accepted_heads.contains(&key.id))
@@ -210,7 +235,8 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
             let bytes = read_required(&object_path(self.repository, key))?;
             let references = validate_bytes(key, &bytes)?;
             objects.insert(key);
-            for (kind, id) in references {
+            commit_heads.extend(references.commits);
+            for (kind, id) in references.op_objects {
                 if kind == OpObjectKind::Operation && id == [0; 64] {
                     continue;
                 }
@@ -220,6 +246,7 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
         Ok(LocalOpClosure {
             heads,
             objects: objects.into_iter().collect(),
+            commit_heads,
         })
     }
 
@@ -272,12 +299,18 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
 struct LocalOpClosure {
     heads: Vec<OpId>,
     objects: Vec<OpObjectKey>,
+    commit_heads: BTreeSet<Oid>,
+}
+
+struct ValidatedReferences {
+    op_objects: Vec<(OpObjectKind, OpId)>,
+    commits: BTreeSet<Oid>,
 }
 
 fn validate_bytes(
     key: OpObjectKey,
     bytes: &[u8],
-) -> Result<Vec<(OpObjectKind, OpId)>, OpSyncEngineError> {
+) -> Result<ValidatedReferences, OpSyncEngineError> {
     let kind = match key.kind {
         OpObjectKind::View => KernelOpObjectKind::View,
         OpObjectKind::Operation => KernelOpObjectKind::Operation,
@@ -287,22 +320,37 @@ fn validate_bytes(
     if validated.id != key.id {
         return Err(OpSyncEngineError::ObjectIdMismatch { key });
     }
-    validated
-        .references
-        .into_iter()
-        .filter_map(|reference| match reference.kind {
-            OpReferenceKind::Commit => None,
-            OpReferenceKind::View => Some((OpObjectKind::View, reference.id)),
-            OpReferenceKind::Operation => Some((OpObjectKind::Operation, reference.id)),
-        })
-        .map(|(kind, bytes)| {
-            let length = bytes.len();
-            bytes
-                .try_into()
-                .map(|id| (kind, id))
-                .map_err(|_| OpSyncEngineError::InvalidReferenceId { length })
-        })
-        .collect()
+    let mut op_objects = Vec::new();
+    let mut commits = BTreeSet::new();
+    for reference in validated.references {
+        match reference.kind {
+            OpReferenceKind::Commit => {
+                let length = reference.id.len();
+                let id = reference
+                    .id
+                    .try_into()
+                    .map_err(|_| OpSyncEngineError::InvalidReferenceId { length })?;
+                commits.insert(Oid(id));
+            }
+            OpReferenceKind::View | OpReferenceKind::Operation => {
+                let kind = if reference.kind == OpReferenceKind::View {
+                    OpObjectKind::View
+                } else {
+                    OpObjectKind::Operation
+                };
+                let length = reference.id.len();
+                let id = reference
+                    .id
+                    .try_into()
+                    .map_err(|_| OpSyncEngineError::InvalidReferenceId { length })?;
+                op_objects.push((kind, id));
+            }
+        }
+    }
+    Ok(ValidatedReferences {
+        op_objects,
+        commits,
+    })
 }
 
 fn object_path(repository: &MachineGitRepository, key: OpObjectKey) -> PathBuf {

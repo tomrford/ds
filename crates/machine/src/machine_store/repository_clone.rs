@@ -2,13 +2,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use devspace_machine_git::MachineGitRepository;
 use jj_lib::settings::UserSettings;
 
 use super::{
     MATERIALIZATION_LOCK_FILE, MachineStore, MachineStoreError, RepositoryIdentity, RepositoryName,
     RepositorySyncGuard,
 };
-use crate::MachineRepository;
 use crate::sync_directory;
 
 const CLONE_STAGING_DIRECTORY: &str = ".clone-staging";
@@ -17,7 +17,7 @@ pub struct StagedRepositoryClone {
     store: MachineStore,
     name: RepositoryName,
     identity: RepositoryIdentity,
-    repository: Option<MachineRepository>,
+    repository: Option<MachineGitRepository>,
     staging_directory: PathBuf,
     native_path: PathBuf,
     sync_path: PathBuf,
@@ -28,7 +28,7 @@ pub struct StagedRepositoryClone {
 }
 
 impl StagedRepositoryClone {
-    pub fn repository_mut(&mut self) -> &mut MachineRepository {
+    pub fn repository_mut(&mut self) -> &mut MachineGitRepository {
         self.repository
             .as_mut()
             .expect("staged repository is available before publication")
@@ -45,7 +45,7 @@ impl StagedRepositoryClone {
     pub async fn publish(
         mut self,
         settings: &UserSettings,
-    ) -> Result<MachineRepository, MachineStoreError> {
+    ) -> Result<MachineGitRepository, MachineStoreError> {
         drop(self.repository.take());
         self.store.require_binding(&self.name, &self.identity)?;
         for (from, to, component) in [
@@ -90,7 +90,7 @@ impl StagedRepositoryClone {
                 source,
             }
         })?;
-        MachineRepository::open(self.repository_directory.join("native"), settings)
+        MachineGitRepository::open(self.repository_directory.join("native"), settings)
             .await
             .map_err(MachineStoreError::Repository)
     }
@@ -189,7 +189,7 @@ impl MachineStore {
                 source,
             }
         })?;
-        let repository = MachineRepository::init(&native_path, settings)
+        let repository = MachineGitRepository::init(&native_path, settings)
             .await
             .map_err(MachineStoreError::Repository)?;
         sync_directory(&repository_directory).map_err(|source| {

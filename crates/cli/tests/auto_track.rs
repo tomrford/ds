@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineRepository, RepositoryId, RepositoryIdentity,
-    RepositoryIncarnation, RepositoryName,
+    MACHINE_STORE_OVERRIDE, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
 };
+use devspace_machine_git::MachineGitRepository as MachineRepository;
 
 mod support;
 

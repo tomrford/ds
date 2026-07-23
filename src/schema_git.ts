@@ -195,6 +195,13 @@ export function initializeGitSchema(sql: SqlStorage) {
       state_id INTEGER NOT NULL,
       PRIMARY KEY (remote, bookmark)
     ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS projection_git_identity_cursors (
+      remote TEXT NOT NULL,
+      bookmark TEXT NOT NULL,
+      oid BLOB NOT NULL,
+      activation_seq INTEGER NOT NULL CHECK (activation_seq >= 0),
+      PRIMARY KEY (remote, bookmark)
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS projection_git_batch_results (
       batch_id BLOB PRIMARY KEY,
       remote TEXT NOT NULL,

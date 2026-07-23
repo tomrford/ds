@@ -269,14 +269,12 @@ pub(crate) fn discover_shim_paths(
     })
 }
 
-/// Mirrors jj-cli 0.42's `WorkspaceCommandHelper::base_ignores` for
-/// non-Git-backend workspaces: the global Git excludes file (or the XDG
-/// `git/ignore` fallback), never a repository-level `.git/info/exclude`.
-/// Devspace checkouts use the simple backend, so jj snapshotting resolves
-/// exactly this chain into `SnapshotOptions::base_ignores`.
+/// Mirrors jj-cli 0.42's Git-backend `WorkspaceCommandHelper::base_ignores`:
+/// the backend repository config's global excludes plus `.git/info/exclude`.
 pub(crate) fn base_ignores(
     workspace_root: &Path,
-) -> Result<Arc<GitIgnoreFile>, jj_lib::gitignore::GitIgnoreError> {
+    settings: &UserSettings,
+) -> Result<Arc<GitIgnoreFile>, String> {
     fn xdg_config_home() -> Option<PathBuf> {
         if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME")
             && !config_home.is_empty()
@@ -286,21 +284,38 @@ pub(crate) fn base_ignores(
         etcetera::home_dir().ok().map(|home| home.join(".config"))
     }
 
-    let excludes_file_path = gix::config::File::from_globals()
-        .ok()
-        .and_then(|config| match config.string("core.excludesFile") {
-            // A relative configured path is resolved at the work-tree
-            // directory, matching jj-cli and `git status`.
-            Some(value) => str::from_utf8(&value)
-                .ok()
-                .map(jj_lib::file_util::expand_home_path)
-                .map(|path| workspace_root.join(path)),
-            None => xdg_config_home().map(|dir| dir.join("git").join("ignore")),
-        });
-    match excludes_file_path {
-        Some(path) => GitIgnoreFile::empty().chain_with_file(RepoPath::root(), path),
-        None => Ok(GitIgnoreFile::empty()),
+    let workspace = Workspace::load(
+        settings,
+        workspace_root,
+        &StoreFactories::default(),
+        &devspace_working_copy_factories(),
+    )
+    .map_err(|error| error.to_string())?;
+    let backend = jj_lib::git::get_git_backend(workspace.repo_loader().store())
+        .map_err(|error| error.to_string())?;
+    let git_repo = backend.git_repo();
+    let config = git_repo.config_snapshot();
+    let excludes_file_path = match config.string("core.excludesFile") {
+        // A relative configured path is resolved at the work-tree
+        // directory, matching jj-cli and `git status`.
+        Some(value) => str::from_utf8(&value)
+            .ok()
+            .map(jj_lib::file_util::expand_home_path)
+            .map(|path| workspace_root.join(path)),
+        None => xdg_config_home().map(|dir| dir.join("git").join("ignore")),
+    };
+    let mut ignores = GitIgnoreFile::empty();
+    if let Some(path) = excludes_file_path {
+        ignores = ignores
+            .chain_with_file(RepoPath::root(), path)
+            .map_err(|error| error.to_string())?;
     }
+    ignores
+        .chain_with_file(
+            RepoPath::root(),
+            backend.git_repo_path().join("info").join("exclude"),
+        )
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Default)]

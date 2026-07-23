@@ -2,9 +2,9 @@ use std::io::Write as _;
 use std::process::Command;
 
 use devspace_machine::{
-    CatalogEntry, ControlPlaneClient, HttpTransport, MachineConfig, MachineStore,
-    PendingProjectionBatch, decode_lower_hex, encode_lower_hex,
+    CatalogEntry, ControlPlaneClient, MachineConfig, MachineStore, encode_lower_hex,
 };
+use devspace_machine_git::{GitHttpTransport, PendingProjectionGitBatch};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
@@ -150,9 +150,7 @@ fn check_projection(
                         .map(|pending_ref| pending_ref.bookmark.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let owner_machine = owner_machine
-                        .map(short_machine_id)
-                        .unwrap_or_else(|| "unknown".to_owned());
+                    let owner_machine = short_machine_id(owner_machine);
                     writeln!(
                         ui.stdout(),
                         "WARN projection: {}: pending push batch on {} (bookmarks: {bookmarks}; \
@@ -174,33 +172,36 @@ fn check_projection(
 }
 
 struct PendingBatchReport {
-    batch: PendingProjectionBatch,
-    owner_machine: Option<[u8; 16]>,
+    batch: PendingProjectionGitBatch,
+    owner_machine: [u8; 16],
 }
 
 fn pending_push_batches(
     config: &MachineConfig,
     entry: &CatalogEntry,
 ) -> Result<Vec<PendingBatchReport>, String> {
-    let incarnation = decode_lower_hex(entry.identity.incarnation.as_str())
-        .map_err(|_| "repository incarnation is invalid".to_owned())?;
-    let transport = HttpTransport::new(config, entry.identity.repository_id.as_str(), incarnation)
-        .map_err(|error| error.to_string())?;
+    let transport = GitHttpTransport::new(
+        config.base_url(),
+        config.shared_secret().as_str(),
+        config.machine_id().as_str(),
+        entry.identity.repository_id.as_str(),
+        entry.identity.incarnation.as_str(),
+    )
+    .map_err(|error| error.to_string())?;
     let runtime = cloud_runtime().map_err(|_| CLOUD_RUNTIME_ERROR.to_owned())?;
     runtime.block_on(async {
         let snapshot = transport
-            .get(0, None)
+            .projection_snapshot_all()
             .await
             .map_err(|error| error.to_string())?;
-        let mut pending = Vec::with_capacity(snapshot.pending.len());
-        for batch in snapshot.pending {
-            let replay = transport.get_push_replay(batch.batch_id).await.ok();
-            pending.push(PendingBatchReport {
+        Ok(snapshot
+            .pending
+            .into_iter()
+            .map(|batch| PendingBatchReport {
+                owner_machine: batch.owner_machine,
                 batch,
-                owner_machine: replay.map(|replay| replay.owner_machine),
-            });
-        }
-        Ok(pending)
+            })
+            .collect())
     })
 }
 

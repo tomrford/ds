@@ -75,6 +75,7 @@ const fetchGitRefSchema = z.strictObject({
   expectedCursorOid: nullableOidSchema("expectedCursorOid"),
   states: z.array(projectionGitStateSchema),
   proposedState: nonNegativeSafeIntegerSchema.nullable(),
+  identityOid: nullableOidSchema("identityOid"),
 });
 
 const recordGitFetchSchema = z.strictObject({
@@ -145,6 +146,14 @@ export function decodeRecordGitFetch(value: unknown): RecordGitFetchRequest {
     ) {
       throw new Error(`refs[${index}].proposedState must map the observed public OID`);
     }
+    if (ref.identityOid !== null) {
+      if (ref.proposedState !== null || ref.states.length !== 0) {
+        throw new Error(`refs[${index}].identityOid requires no states or proposedState`);
+      }
+      if (compareGitBytes(ref.identityOid, ref.observedPublicOid) !== 0) {
+        throw new Error(`refs[${index}].identityOid must equal the observed public OID`);
+      }
+    }
   }
   requireStateLimit(request.refs, "refs");
   request.refs.sort((left, right) => compareNames(left.bookmark, right.bookmark));
@@ -201,6 +210,7 @@ export function canonicalGitFetchBytes(request: RecordGitFetchRequest): Uint8Arr
           ref.expectedCursorOid === null ? null : gitToHex(ref.expectedCursorOid),
         states: ref.states.map(encodeProjectionGitState),
         proposedState: ref.proposedState,
+        identityOid: ref.identityOid === null ? null : gitToHex(ref.identityOid),
       })),
     }),
   );

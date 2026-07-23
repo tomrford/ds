@@ -10,8 +10,8 @@ use thiserror::Error;
 use crate::pack_manifest::MAX_MANIFEST_BYTES;
 use crate::{
     BuiltPack, CloudOpHeads, Digest, MAX_CHUNK_BYTES, Oid, OpId, OpObjectKey, OpObjectKind,
-    OpSyncTransport, OpTransportError, PackManifest, PackManifestError, PendingOpHeadTransaction,
-    hex,
+    OpSyncTransport, OpTransportError, PackManifest, PackManifestError, PackOptions,
+    PendingOpHeadTransaction, build_packs, hex,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,6 +78,7 @@ pub struct ProjectionGitFetchRef {
     pub expected_cursor_oid: Option<Oid>,
     pub states: Vec<ProjectionGitState>,
     pub proposed_state: Option<usize>,
+    pub identity_oid: Option<Oid>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -677,6 +678,7 @@ impl GitHttpTransport {
                 "expectedCursorOid": fetch_ref.expected_cursor_oid.map(|oid| hex(&oid.0)),
                 "states": fetch_ref.states.iter().map(state_json).collect::<Vec<_>>(),
                 "proposedState": fetch_ref.proposed_state,
+                "identityOid": fetch_ref.identity_oid.map(|oid| hex(&oid.0)),
             })).collect::<Vec<_>>(),
         });
         let response = self
@@ -780,6 +782,61 @@ impl GitHttpTransport {
 }
 
 impl OpSyncTransport for GitHttpTransport {
+    async fn download_git_objects(
+        &mut self,
+        repository: &crate::MachineGitRepository,
+        mut after: u64,
+    ) -> Result<u64, OpTransportError> {
+        let mut through = None;
+        loop {
+            let page = self
+                .list_packs(after, through)
+                .await
+                .map_err(|error| Box::new(error) as OpTransportError)?;
+            through = Some(page.through);
+            for pack in page.packs {
+                let downloaded = self
+                    .download_pack(pack.id)
+                    .await
+                    .map_err(|error| Box::new(error) as OpTransportError)?;
+                repository
+                    .install_pack(downloaded.id, &downloaded.manifest, &downloaded.chunks)
+                    .map_err(|error| Box::new(error) as OpTransportError)?;
+            }
+            if !page.has_more {
+                return Ok(page.through);
+            }
+            after = page.next_after;
+        }
+    }
+
+    async fn upload_git_objects(
+        &mut self,
+        repository: &crate::MachineGitRepository,
+        heads: &BTreeSet<Oid>,
+    ) -> Result<(), OpTransportError> {
+        let heads = heads.iter().copied().filter(|oid| oid.0 != [0; 20]);
+        let closure = repository
+            .object_closure(heads)
+            .map_err(|error| Box::new(error) as OpTransportError)?;
+        if closure.objects.is_empty() {
+            return Ok(());
+        }
+        let packs = build_packs(
+            repository,
+            &closure,
+            &BTreeSet::new(),
+            PackOptions::default(),
+        )
+        .map_err(|error| Box::new(error) as OpTransportError)?;
+        for pack in &packs.packs {
+            self.upload_pack(pack)
+                .await
+                .map_err(|error| Box::new(error) as OpTransportError)?;
+        }
+        Ok(())
+    }
+
     async fn inventory_op_objects(
         &mut self,
         candidates: &[OpObjectKey],

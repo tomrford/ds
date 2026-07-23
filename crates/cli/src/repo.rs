@@ -6,6 +6,7 @@ use devspace_machine::{
     MachineConfig, MachineStore, RepositoryCreationIntent, RepositoryCreationIntentError,
     RepositoryCreationKey, RepositoryCreationTarget, RepositoryIdentity, RepositoryName,
 };
+use devspace_machine_git::MachineGitRepository;
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::formatter::FormatterExt as _;
@@ -634,12 +635,9 @@ async fn workspace_inventory(
             remote_names: Vec::new(),
         });
     }
-    let repository = devspace_machine::MachineRepository::open(
-        &entry.native_repository_path,
-        command.settings(),
-    )
-    .await
-    .map_err(display_error)?;
+    let repository = MachineGitRepository::open(&entry.native_repository_path, command.settings())
+        .await
+        .map_err(display_error)?;
     let workspace_store = SimpleWorkspaceStore::load(&entry.native_repository_path)
         .map_err(|error| user_error(error.to_string()))?;
     let mut checkout_paths = Vec::new();

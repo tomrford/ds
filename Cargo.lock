@@ -677,6 +677,7 @@ dependencies = [
  "blake2",
  "clap",
  "devspace-machine",
+ "devspace-machine-git",
  "dunce",
  "etcetera",
  "futures 0.3.32",
@@ -742,6 +743,7 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "devspace-kernel",
+ "devspace-machine-git",
  "futures 0.3.32",
  "jj-lib",
  "reqwest",

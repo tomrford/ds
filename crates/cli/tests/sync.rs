@@ -11,9 +11,10 @@ use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use devspace_machine::{
-    CatalogEntry, MachineRepository, MachineSyncStore, PendingHeadBatch, PendingHeadTransaction,
-    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName, SyncState,
+    CatalogEntry, MachineSyncStore, PendingHeadBatch, PendingHeadTransaction, RepositoryId,
+    RepositoryIdentity, RepositoryIncarnation, RepositoryName, SyncState,
 };
+use devspace_machine_git::MachineGitRepository as MachineRepository;
 use jj_lib::object_id::ObjectId as _;
 #[cfg(unix)]
 use stalling_server::StallingServer;
@@ -27,6 +28,10 @@ use support::{
 
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
 const FIRST_MACHINE_ID: &str = "12121212121212121212121212121212";
+
+fn request_body(request: &str) -> serde_json::Value {
+    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+}
 
 #[test]
 fn sync_help_lists_status_but_hides_run() {
@@ -108,8 +113,46 @@ async fn sync_run_silences_colliding_alias_warning() {
                 r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
             );
             false
-        } else if request_line.starts_with("GET ") && request_line.contains("/heads?") {
+        } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
+            support::fake_worker::respond(
+                stream,
+                "200 OK",
+                r#"{"inserted":true,"installed":false}"#,
+            );
+            false
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/packs/")
+            && request_line.contains("/install ")
+        {
+            support::fake_worker::respond(
+                stream,
+                "200 OK",
+                r#"{"installed":true,"insertedObjects":1}"#,
+            );
+            false
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads ") {
             support::fake_worker::respond(stream, "200 OK", r#"{"cursor":0,"heads":[]}"#);
+            false
+        } else if request_line.starts_with("POST ") && request_line.contains("/git/ops/inventory ")
+        {
+            support::fake_worker::respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({"keys": request_body(request)["keys"]}).to_string(),
+            );
+            false
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/ops/heads/transactions ")
+        {
+            support::fake_worker::respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({
+                    "cursor": 1,
+                    "heads": [request_body(request)["newHead"]],
+                })
+                .to_string(),
+            );
             true
         } else {
             panic!("unexpected fake cloud request: {request_line}");
@@ -132,7 +175,13 @@ async fn sync_run_silences_colliding_alias_warning() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).is_empty(), "{}", stdout(&output));
     assert!(stderr(&output).is_empty(), "{}", stderr(&output));
-    assert_eq!(server.join().unwrap().len(), 2);
+    assert!(
+        server
+            .join()
+            .unwrap()
+            .iter()
+            .any(|request| request.contains("/git/ops/heads "))
+    );
 }
 
 #[cfg(unix)]

@@ -76,7 +76,18 @@ fn create_import_server(
                 "200 OK",
                 r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
             );
-        } else if request_line.starts_with("GET ") && request_line.contains("/heads?") {
+        } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
+            respond(stream, "200 OK", r#"{"inserted":true,"installed":false}"#);
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/packs/")
+            && request_line.contains("/install ")
+        {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"installed":true,"insertedObjects":1}"#,
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads") {
             respond(
                 stream,
                 "200 OK",
@@ -86,14 +97,16 @@ fn create_import_server(
                 })
                 .to_string(),
             );
-        } else if request_line.starts_with("POST ") && request_line.contains("/objects/inventory ")
+        } else if request_line.starts_with("POST ") && request_line.contains("/git/ops/inventory ")
         {
             respond(
                 stream,
                 "200 OK",
-                &serde_json::json!({"objects": request_body(request)["objects"]}).to_string(),
+                &serde_json::json!({"keys": request_body(request)["keys"]}).to_string(),
             );
-        } else if request_line.starts_with("POST ") && request_line.contains("/heads ") {
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/ops/heads/transactions ")
+        {
             let body = request_body(request);
             head = Some(body["newHead"].as_str().unwrap().to_owned());
             head_cursor += 1;
@@ -106,36 +119,45 @@ fn create_import_server(
                 })
                 .to_string(),
             );
-        } else if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/remotes?") {
             respond(
                 stream,
                 "200 OK",
                 &serde_json::json!({"remotes": [{"name": "origin", "url": git_url}]}).to_string(),
             );
-        } else if request_line.starts_with("GET ") && request_line.contains("/projection?") {
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/projection?") {
             respond(stream, "200 OK", &projection.to_string());
-        } else if request_line.starts_with("POST ") && request_line.contains("/git/fetches ") {
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/projection/fetches ")
+        {
             let body = request_body(request);
             let cursors = body["refs"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|fetch_ref| {
-                    let index = fetch_ref["proposedState"].as_u64().unwrap() as usize;
-                    let state = &fetch_ref["states"][index];
+                    let state = fetch_ref["proposedState"]
+                        .as_u64()
+                        .map(|index| &fetch_ref["states"][index as usize]);
+                    let canonical = state
+                        .map(|state| state["canonicalOid"].clone())
+                        .unwrap_or_else(|| fetch_ref["identityOid"].clone());
+                    let public = state
+                        .map(|state| state["publicOid"].clone())
+                        .unwrap_or_else(|| fetch_ref["identityOid"].clone());
                     serde_json::json!({
                         "remote": body["remote"],
                         "bookmark": fetch_ref["bookmark"],
-                        "gitOid": state["gitOid"],
-                        "canonicalCommitId": state["canonicalCommitId"],
-                        "publicCommitId": state["publicCommitId"],
-                        "hiddenSetId": state["hiddenSetId"],
+                        "canonicalOid": canonical,
+                        "publicOid": public,
+                        "hiddenSetId": state.map(|state| state["hiddenSetId"].clone()).unwrap_or(serde_json::Value::Null),
                         "activationSequence": 1,
                     })
                 })
                 .collect::<Vec<_>>();
             let mappings = cursors
                 .iter()
+                .filter(|cursor| cursor["canonicalOid"] != cursor["publicOid"])
                 .map(|cursor| {
                     let mut mapping = cursor.clone();
                     mapping
@@ -347,7 +369,7 @@ fn repo_add_derives_or_overrides_the_name_without_creating_a_checkout() {
         assert!(
             requests
                 .iter()
-                .any(|request| request.contains("/git/fetches "))
+                .any(|request| request.contains("/git/projection/fetches "))
         );
     }
 }
@@ -630,7 +652,7 @@ fn doctor_reports_pending_push_batches_per_repository() {
     );
     assert!(
         report.contains(
-            "WARN projection: stuck: pending push batch on backup (bookmarks: release; owner machine unknown)"
+            "WARN projection: stuck: pending push batch on backup (bookmarks: release; owner machine bcbcbcbcbcbc)"
         ),
         "{report}"
     );

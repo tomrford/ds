@@ -5,9 +5,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use devspace_machine::{
-    CatalogEntry, HttpTransport, MachineConfig, MachineRepository, MachineStore, MachineStoreError,
-    MachineSyncStore, RepositoryIdentity, RepositoryName, RepositorySyncGuard, SyncEngine,
-    SyncEngineError, decode_lower_hex,
+    CatalogEntry, MachineConfig, MachineStore, MachineStoreError, RepositoryIdentity,
+    RepositoryName, RepositorySyncGuard,
+};
+use devspace_machine_git::{
+    GitHttpTransport, MachineGitRepository, OpSyncEngine, OpSyncEngineError, OpSyncStore,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -198,7 +200,7 @@ async fn run_sync_entry_after_lock(
     guard: RepositorySyncGuard,
 ) -> Result<LockedSyncRun, String> {
     let config = store.load_config().map_err(|error| error.to_string())?;
-    let mut repository = MachineRepository::open(&entry.native_repository_path, settings)
+    let mut repository = MachineGitRepository::open(&entry.native_repository_path, settings)
         .await
         .map_err(|error| error.to_string())?;
     run_sync_engine(
@@ -206,7 +208,6 @@ async fn run_sync_entry_after_lock(
         &entry.identity,
         &mut repository,
         &store.repository_sync_path(&entry.identity),
-        &store.repository_packs_path(&entry.identity),
     )?;
     Ok(LockedSyncRun::Completed(guard))
 }
@@ -214,26 +215,26 @@ async fn run_sync_entry_after_lock(
 pub(crate) fn run_sync_engine(
     config: &MachineConfig,
     identity: &RepositoryIdentity,
-    repository: &mut MachineRepository,
+    repository: &mut MachineGitRepository,
     sync_path: &Path,
-    packs_path: &Path,
 ) -> Result<(), String> {
-    let state = MachineSyncStore::open(sync_path).map_err(|error| error.to_string())?;
-    let incarnation = parse_incarnation(identity.incarnation.as_str());
-    let mut transport = HttpTransport::new(config, identity.repository_id.as_str(), incarnation)
-        .map_err(|error| error.to_string())?;
+    let state = OpSyncStore::open(sync_path).map_err(|error| error.to_string())?;
+    let mut transport = GitHttpTransport::new(
+        config.base_url(),
+        config.shared_secret().as_str(),
+        config.machine_id().as_str(),
+        identity.repository_id.as_str(),
+        identity.incarnation.as_str(),
+    )
+    .map_err(|error| error.to_string())?;
     let runtime = cloud_runtime().map_err(|_| CLOUD_RUNTIME_ERROR.to_owned())?;
     runtime
-        .block_on(SyncEngine::new(repository, &state, packs_path, &mut transport).run())
+        .block_on(OpSyncEngine::new(repository, &state, &mut transport).run())
         .map(|_| ())
         .map_err(|error| sync_error_message(&error))
 }
 
-fn parse_incarnation(value: &str) -> [u8; 16] {
-    decode_lower_hex(value).expect("catalog incarnations are validated lowercase hex")
-}
-
-fn sync_error_message(error: &SyncEngineError) -> String {
+fn sync_error_message(error: &OpSyncEngineError) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
     while let Some(error) = source {

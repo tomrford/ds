@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use devspace_machine::{HttpTransport, MachineRepository, ProjectionSnapshot, RepositoryName};
+use devspace_machine::{HttpTransport, ProjectionSnapshot, RepositoryName};
+use devspace_machine_git::MachineGitRepository as MachineRepository;
 
 mod support;
 

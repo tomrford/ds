@@ -80,7 +80,7 @@ pub enum ControlPlaneRemoteErrorKind {
 impl ControlPlaneClient {
     pub fn new(config: &MachineConfig) -> Result<Self, ControlPlaneClientError> {
         let mut authorization =
-            HeaderValue::from_str(&format!("Bearer {}", config.shared_secret().expose()))
+            HeaderValue::from_str(&format!("Bearer {}", config.shared_secret().as_str()))
                 .map_err(|_| ControlPlaneClientError::InvalidCredential)?;
         authorization.set_sensitive(true);
         let machine_id = HeaderValue::from_str(config.machine_id().as_str())

@@ -81,6 +81,16 @@ pub async fn push_with_journal(
         environment,
     )
     .await?;
+    let recovered_deletions = snapshot
+        .pending
+        .iter()
+        .filter(|batch| batch.remote == remote && recovered_batches.contains(&batch.batch_id))
+        .flat_map(|batch| &batch.refs)
+        .filter(|pending_ref| {
+            requested.contains(&pending_ref.bookmark) && pending_ref.proposed_public_oid.is_none()
+        })
+        .map(|pending_ref| pending_ref.bookmark.clone())
+        .collect::<BTreeSet<_>>();
     if !recovered_batches.is_empty() {
         snapshot = transport.projection_snapshot_all().await?;
     }
@@ -92,7 +102,9 @@ pub async fn push_with_journal(
         .map(|cursor| (cursor.bookmark.as_str(), cursor))
         .collect::<BTreeMap<_, _>>();
     for head in heads {
-        if head.canonical_oid.is_none() && !cursor_by_bookmark.contains_key(head.bookmark.as_str())
+        if head.canonical_oid.is_none()
+            && !cursor_by_bookmark.contains_key(head.bookmark.as_str())
+            && !recovered_deletions.contains(&head.bookmark)
         {
             return Err(JournalFlowError::InvalidInput(format!(
                 "bookmark `{}` has no projection cursor to delete",
@@ -100,8 +112,16 @@ pub async fn push_with_journal(
             )));
         }
     }
+    let journal_heads = heads
+        .iter()
+        .filter(|head| {
+            !(head.canonical_oid.is_none()
+                && recovered_deletions.contains(&head.bookmark)
+                && !cursor_by_bookmark.contains_key(head.bookmark.as_str()))
+        })
+        .collect::<Vec<_>>();
     let mut active_heads = Vec::new();
-    for head in heads {
+    for head in &journal_heads {
         if let Some(canonical_oid) = head.canonical_oid
             && cursor_by_bookmark
                 .get(head.bookmark.as_str())
@@ -111,7 +131,7 @@ pub async fn push_with_journal(
         }
     }
     if active_heads.is_empty()
-        && heads.iter().all(|head| {
+        && journal_heads.iter().all(|head| {
             head.canonical_oid.is_some_and(|oid| {
                 cursor_by_bookmark
                     .get(head.bookmark.as_str())
@@ -144,8 +164,11 @@ pub async fn push_with_journal(
         .zip(projected.public_heads.iter().copied())
         .collect::<BTreeMap<_, _>>();
 
-    let mut public_heads = BTreeMap::new();
-    for head in heads {
+    let mut public_heads = recovered_deletions
+        .iter()
+        .map(|bookmark| (bookmark.clone(), None))
+        .collect::<BTreeMap<_, _>>();
+    for head in &journal_heads {
         public_heads.insert(
             head.bookmark.clone(),
             head.canonical_oid.map(|canonical| {
@@ -160,7 +183,7 @@ pub async fn push_with_journal(
             }),
         );
     }
-    for head in heads {
+    for head in &journal_heads {
         if let (Some(canonical), Some(public)) = (head.canonical_oid, public_heads[&head.bookmark])
         {
             let hidden_set = repository.hidden_set_for_commit(canonical).await?;
@@ -168,7 +191,7 @@ pub async fn push_with_journal(
         }
     }
 
-    let closure_heads = heads
+    let closure_heads = journal_heads
         .iter()
         .flat_map(|head| {
             [head.canonical_oid, public_heads[&head.bookmark]]
@@ -202,7 +225,7 @@ pub async fn push_with_journal(
             hidden_set_id,
         });
     }
-    for head in heads {
+    for head in &journal_heads {
         if let (Some(canonical), Some(public)) = (head.canonical_oid, public_heads[&head.bookmark])
             && !states.iter().any(|state| state.canonical_oid == canonical)
         {
@@ -218,7 +241,7 @@ pub async fn push_with_journal(
             });
         }
     }
-    let updates = heads
+    let updates = journal_heads
         .iter()
         .map(|head| {
             let cursor = cursor_by_bookmark.get(head.bookmark.as_str());
@@ -413,6 +436,7 @@ pub async fn fetch_with_journal(
             let proposed_state = own_states
                 .iter()
                 .position(|state| state.public_oid == *public_head);
+            let canonical_head = canonical_heads[bookmark];
             Ok(ProjectionGitFetchRef {
                 bookmark: bookmark.clone(),
                 observed_public_oid: *public_head,
@@ -421,6 +445,8 @@ pub async fn fetch_with_journal(
                     .map(|cursor| cursor.public_oid),
                 states: own_states,
                 proposed_state,
+                identity_oid: (proposed_state.is_none() && canonical_head == *public_head)
+                    .then_some(*public_head),
             })
         })
         .collect::<Result<Vec<_>, JournalFlowError>>()?;

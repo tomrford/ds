@@ -4,12 +4,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use devspace_machine_git::{MachineGitRepository, MachineGitRepositoryError};
 use jj_lib::settings::UserSettings;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::locked_json::{LockedJsonError, LockedJsonFile};
-use crate::{MachineRepository, MachineRepositoryError, decode_lower_hex, sync_directory};
+use crate::{decode_lower_hex, sync_directory};
 
 mod repository_clone;
 pub use repository_clone::StagedRepositoryClone;
@@ -440,7 +441,7 @@ impl MachineStore {
         name: &RepositoryName,
         expected: &RepositoryIdentity,
         settings: &UserSettings,
-    ) -> Result<MachineRepository, MachineStoreError> {
+    ) -> Result<MachineGitRepository, MachineStoreError> {
         let entry = self.require_binding(name, expected)?;
         let parent = entry
             .native_repository_path
@@ -471,7 +472,7 @@ impl MachineStore {
         // The catalog can change while this caller waits for another initializer.
         let entry = self.require_binding(name, expected)?;
         if entry.native_repository_path.exists() {
-            return MachineRepository::open(&entry.native_repository_path, settings)
+            return MachineGitRepository::open(&entry.native_repository_path, settings)
                 .await
                 .map_err(MachineStoreError::Repository);
         }
@@ -483,7 +484,7 @@ impl MachineStore {
                 path: parent.to_owned(),
                 source,
             })?;
-        let repository = MachineRepository::init(staging.path(), settings)
+        let repository = MachineGitRepository::init(staging.path(), settings)
             .await
             .map_err(MachineStoreError::Repository)?;
         drop(repository);
@@ -502,7 +503,7 @@ impl MachineStore {
             source,
         })?;
 
-        MachineRepository::open(&entry.native_repository_path, settings)
+        MachineGitRepository::open(&entry.native_repository_path, settings)
             .await
             .map_err(MachineStoreError::Repository)
     }
@@ -511,11 +512,11 @@ impl MachineStore {
         &self,
         name: &RepositoryName,
         settings: &UserSettings,
-    ) -> Result<MachineRepository, MachineStoreError> {
+    ) -> Result<MachineGitRepository, MachineStoreError> {
         let entry = self
             .resolve(name)?
             .ok_or_else(|| MachineStoreError::RepositoryNotRegistered(name.clone()))?;
-        MachineRepository::open(entry.native_repository_path, settings)
+        MachineGitRepository::open(entry.native_repository_path, settings)
             .await
             .map_err(MachineStoreError::Repository)
     }
@@ -898,7 +899,7 @@ pub enum MachineStoreError {
         source: io::Error,
     },
     #[error(transparent)]
-    Repository(#[from] MachineRepositoryError),
+    Repository(#[from] MachineGitRepositoryError),
 }
 
 impl From<LockedJsonError> for MachineStoreError {

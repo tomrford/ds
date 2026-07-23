@@ -8,6 +8,7 @@ use jj_lib::commit::Commit;
 use jj_lib::dag_walk_async;
 use jj_lib::default_index::DefaultIndexStore;
 use jj_lib::default_submodule_store::DefaultSubmoduleStore;
+use jj_lib::git_backend::GitBackend;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::op_heads_store::{OpHeadsStore, OpHeadsStoreError, OpHeadsStoreLock};
 use jj_lib::op_store::{OpStore, OperationId};
@@ -16,7 +17,6 @@ use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{ReadonlyRepo, Repo as _, RepoLoader, StoreFactories};
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
-use jj_lib::simple_backend::SimpleBackend;
 use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
 use jj_lib::simple_op_store::SimpleOpStore;
 use jj_lib::working_copy::{
@@ -193,7 +193,7 @@ pub(crate) fn is_stock_bare_repository(path: &Path) -> bool {
         return false;
     }
     let stock_store_types = [
-        ("store", SimpleBackend::name()),
+        ("store", GitBackend::name()),
         ("op_store", SimpleOpStore::name()),
         ("op_heads", SimpleOpHeadsStore::name()),
         ("index", DefaultIndexStore::name()),

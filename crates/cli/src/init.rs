@@ -2,8 +2,9 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use devspace_machine::{
-    CatalogEntry, GitProcessEnvironment, MachineRepository, MachineStore, RemoteUrl, RepositoryName,
+use devspace_machine::{CatalogEntry, MachineStore, RepositoryName};
+use devspace_machine_git::{
+    GitProcessEnvironment, MachineGitRepository, RemoteUrl, ls_remote_head,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -146,7 +147,7 @@ pub(crate) async fn import_git_repository(
         .map_err(display_error)?
         .is_some_and(|entry| entry.native_repository_path.is_dir());
     let observe_head = || {
-        devspace_machine::ls_remote_head(&remote_url, &GitProcessEnvironment::default())
+        ls_remote_head(&remote_url, &GitProcessEnvironment::default())
             .map_err(display_error)?
             .ok_or_else(|| {
                 user_error(
@@ -281,7 +282,7 @@ async fn sync_repository(
     entry: &CatalogEntry,
     settings: &jj_lib::settings::UserSettings,
 ) -> Result<(), String> {
-    let mut repository = MachineRepository::open(&entry.native_repository_path, settings)
+    let mut repository = MachineGitRepository::open(&entry.native_repository_path, settings)
         .await
         .map_err(|error| error.to_string())?;
     crate::sync::run_sync_engine(
@@ -289,7 +290,6 @@ async fn sync_repository(
         &entry.identity,
         &mut repository,
         &store.repository_sync_path(&entry.identity),
-        &store.repository_packs_path(&entry.identity),
     )
 }
 
@@ -439,7 +439,7 @@ async fn position_checkout(
 ) -> Result<(), String> {
     let config = store.load_config().map_err(|error| error.to_string())?;
     let workspace_name = workspace_name(&config, checkout_path);
-    let repository = MachineRepository::open(&entry.native_repository_path, command.settings())
+    let repository = MachineGitRepository::open(&entry.native_repository_path, command.settings())
         .await
         .map_err(|error| error.to_string())?;
     let name = RefName::new(head_branch);
