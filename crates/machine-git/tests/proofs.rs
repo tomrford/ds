@@ -5,7 +5,8 @@ use std::process::Command;
 use blake2::{Blake2b512, Digest as _};
 use devspace_kernel_git::{ObjectKind, Oid, validate};
 use devspace_machine_git::{
-    MachineGitRepository, ObjectKey, PackInstallError, PackOptions, build_packs,
+    GitHttpTransport, GitInstallReceipt, GitUploadReceipt, MachineGitRepository, ObjectKey,
+    PackInstallError, PackOptions, build_packs,
 };
 use futures::executor::block_on;
 use gix::objs::{Kind as GitObjectKind, Write as _};
@@ -139,46 +140,163 @@ fn deterministic_pack_rebuilds_exact_objects_and_semantics_without_extras() {
     assert_eq!(installed.inserted_objects, closure.objects.len());
     assert_eq!(installed.existing_objects, 0);
 
-    for object in &closure.objects {
-        assert_eq!(
-            read_raw(&source, object.key),
-            read_raw(&destination, object.key),
-            "raw bytes differ for {:?}",
-            object.key
-        );
-    }
     let retried = destination
         .install_pack(pack.id, &pack.manifest_bytes, &pack.chunks)
         .unwrap();
     assert_eq!(retried.inserted_objects, 0);
     assert_eq!(retried.existing_objects, closure.objects.len());
+    block_on(assert_exact_rebuild(
+        &source,
+        &destination_path,
+        destination,
+        &closure,
+        foreign_commit,
+    ));
+}
 
-    drop(destination);
-    fs::remove_dir_all(destination_path.join("store/extra")).unwrap();
-    assert!(!destination_path.join("store/extra").exists());
-    let rebuilt = block_on(MachineGitRepository::open(&destination_path, &settings())).unwrap();
-    let commit_ids = closure
-        .objects
-        .iter()
-        .filter(|object| object.key.kind == ObjectKind::Commit)
-        .map(|object| CommitId::from_bytes(&object.key.id.0))
-        .collect::<Vec<_>>();
-    for commit_id in &commit_ids {
-        let source_commit =
-            block_on(source.repo().store().backend().read_commit(commit_id)).unwrap();
-        let rebuilt_commit =
-            block_on(rebuilt.repo().store().backend().read_commit(commit_id)).unwrap();
-        assert_eq!(source_commit.change_id, rebuilt_commit.change_id);
-        assert_eq!(source_commit.root_tree, rebuilt_commit.root_tree);
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
+async fn two_machines_round_trip_v2_git_packs_through_a_live_worker() {
+    let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
+    let shared_secret =
+        std::env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
+    let (repository_id, incarnation) = create_live_repository(&base_url, &shared_secret).await;
+    let machine_a = "11".repeat(16);
+    let machine_b = "22".repeat(16);
+    let transport_a = GitHttpTransport::new(
+        &base_url,
+        &shared_secret,
+        &machine_a,
+        &repository_id,
+        &incarnation,
+    )
+    .unwrap();
+    let transport_b = GitHttpTransport::new(
+        &base_url,
+        &shared_secret,
+        &machine_b,
+        &repository_id,
+        &incarnation,
+    )
+    .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = MachineGitRepository::init(temp.path().join("machine-a"), &settings())
+        .await
+        .unwrap();
+    let (conflict_commit, foreign_commit) = build_semantic_fixture(&source);
+    let closure = source
+        .object_closure([conflict_commit, foreign_commit])
+        .unwrap();
+    let built = build_packs(&source, &closure, &BTreeSet::new(), PackOptions::default()).unwrap();
+    assert_eq!(built.packs.len(), 1);
+    let pack = &built.packs[0];
+
+    assert_eq!(
+        transport_a.upload_pack(pack).await.unwrap(),
+        GitInstallReceipt {
+            installed: true,
+            inserted_objects: closure.objects.len(),
+        }
+    );
+    assert_eq!(
+        transport_a
+            .upload_manifest(pack.id, &pack.manifest_bytes)
+            .await
+            .unwrap(),
+        GitUploadReceipt {
+            inserted: false,
+            installed: true,
+        }
+    );
+    for (position, chunk) in pack.chunks.iter().enumerate() {
         assert_eq!(
-            source_commit.conflict_labels,
-            rebuilt_commit.conflict_labels
+            transport_a
+                .upload_chunk(pack.id, position, chunk)
+                .await
+                .unwrap(),
+            GitUploadReceipt {
+                inserted: false,
+                installed: true,
+            }
         );
-        assert_eq!(source_commit, rebuilt_commit);
     }
-    let foreign_id = CommitId::from_bytes(&foreign_commit.0);
-    let foreign = block_on(rebuilt.repo().store().backend().read_commit(&foreign_id)).unwrap();
-    assert_eq!(foreign.change_id.as_bytes().len(), 16);
+    assert_eq!(
+        transport_a.install_pack(pack.id).await.unwrap(),
+        GitInstallReceipt {
+            installed: false,
+            inserted_objects: 0,
+        }
+    );
+
+    let destination_path = temp.path().join("machine-b");
+    let destination = MachineGitRepository::init(&destination_path, &settings())
+        .await
+        .unwrap();
+    let mut after = 0;
+    let mut through = None;
+    let mut downloaded = 0;
+    loop {
+        let page = transport_b.list_packs(after, through).await.unwrap();
+        through = Some(*through.get_or_insert(page.through));
+        assert_eq!(page.through, through.unwrap());
+        for entry in page.packs {
+            let pack = transport_b.download_pack(entry.id).await.unwrap();
+            destination
+                .install_pack(pack.id, &pack.manifest, &pack.chunks)
+                .unwrap();
+            downloaded += 1;
+        }
+        after = page.next_after;
+        if !page.has_more {
+            break;
+        }
+    }
+    assert_eq!(downloaded, 1);
+    assert_exact_rebuild(
+        &source,
+        &destination_path,
+        destination,
+        &closure,
+        foreign_commit,
+    )
+    .await;
+
+    let interrupted_head = write_foreign_commit(&source, b"interrupted upload recovery\n");
+    let interrupted_closure = source.object_closure([interrupted_head]).unwrap();
+    let interrupted = build_packs(
+        &source,
+        &interrupted_closure,
+        &BTreeSet::new(),
+        PackOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(interrupted.packs.len(), 1);
+    let interrupted = &interrupted.packs[0];
+    assert_eq!(
+        transport_a
+            .upload_manifest(interrupted.id, &interrupted.manifest_bytes)
+            .await
+            .unwrap(),
+        GitUploadReceipt {
+            inserted: true,
+            installed: false,
+        }
+    );
+    let quarantined_catalog = transport_a.list_packs(0, None).await.unwrap();
+    assert_eq!(quarantined_catalog.through, 1);
+    assert_eq!(quarantined_catalog.packs.len(), 1);
+    assert_eq!(
+        transport_a.upload_pack(interrupted).await.unwrap(),
+        GitInstallReceipt {
+            installed: true,
+            inserted_objects: interrupted_closure.objects.len(),
+        }
+    );
+    let recovered_catalog = transport_b.list_packs(1, None).await.unwrap();
+    assert_eq!(recovered_catalog.through, 2);
+    assert_eq!(recovered_catalog.packs.len(), 1);
+    assert_eq!(recovered_catalog.packs[0].id, interrupted.id);
 }
 
 #[test]
@@ -285,6 +403,106 @@ fn build_semantic_fixture(repository: &MachineGitRepository) -> (Oid, Oid) {
 
     let foreign = write_foreign_commit(repository, b"foreign synthetic change id\n");
     (Oid(conflict.id().as_bytes().try_into().unwrap()), foreign)
+}
+
+async fn assert_exact_rebuild(
+    source: &MachineGitRepository,
+    destination_path: &std::path::Path,
+    destination: MachineGitRepository,
+    closure: &devspace_machine_git::ObjectClosure,
+    foreign_commit: Oid,
+) {
+    for object in &closure.objects {
+        assert_eq!(
+            read_raw(source, object.key),
+            read_raw(&destination, object.key),
+            "raw bytes differ for {:?}",
+            object.key
+        );
+    }
+
+    drop(destination);
+    fs::remove_dir_all(destination_path.join("store/extra")).unwrap();
+    assert!(!destination_path.join("store/extra").exists());
+    let rebuilt = MachineGitRepository::open(destination_path, &settings())
+        .await
+        .unwrap();
+    let commit_ids = closure
+        .objects
+        .iter()
+        .filter(|object| object.key.kind == ObjectKind::Commit)
+        .map(|object| CommitId::from_bytes(&object.key.id.0))
+        .collect::<Vec<_>>();
+    for commit_id in &commit_ids {
+        let source_commit = source
+            .repo()
+            .store()
+            .backend()
+            .read_commit(commit_id)
+            .await
+            .unwrap();
+        let rebuilt_commit = rebuilt
+            .repo()
+            .store()
+            .backend()
+            .read_commit(commit_id)
+            .await
+            .unwrap();
+        assert_eq!(source_commit.change_id, rebuilt_commit.change_id);
+        assert_eq!(source_commit.root_tree, rebuilt_commit.root_tree);
+        assert_eq!(
+            source_commit.conflict_labels,
+            rebuilt_commit.conflict_labels
+        );
+        assert_eq!(source_commit, rebuilt_commit);
+    }
+    let foreign_id = CommitId::from_bytes(&foreign_commit.0);
+    let foreign = rebuilt
+        .repo()
+        .store()
+        .backend()
+        .read_commit(&foreign_id)
+        .await
+        .unwrap();
+    assert_eq!(foreign.change_id.as_bytes().len(), 16);
+}
+
+async fn create_live_repository(base_url: &str, shared_secret: &str) -> (String, String) {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CreatedRepository {
+        repository_id: String,
+        incarnation: String,
+    }
+
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let response = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap()
+        .post(format!("{}/repositories", base_url.trim_end_matches('/')))
+        .header("authorization", format!("Bearer {shared_secret}"))
+        .header("x-devspace-machine-id", "11".repeat(16))
+        .json(&serde_json::json!({
+            "name": format!("git-spike-{suffix}"),
+            "idempotencyKey": format!("{suffix:032x}"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.bytes().await.unwrap();
+    assert!(
+        status.is_success(),
+        "repository creation failed with {status}: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let created: CreatedRepository = serde_json::from_slice(&bytes).unwrap();
+    (created.repository_id, created.incarnation)
 }
 
 async fn tree_with_file(

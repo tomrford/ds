@@ -5,12 +5,17 @@
 //! `op_store/` and `op_heads/`; they are intentionally not part of this pack
 //! format.
 
+mod http_transport;
 mod install;
 mod object_closure;
 mod pack;
 mod pack_manifest;
 mod store;
 
+pub use http_transport::{
+    DownloadedGitPack, GitHttpTransport, GitHttpTransportError, GitInstallReceipt,
+    GitPackCatalogEntry, GitPackCatalogPage, GitUploadReceipt,
+};
 pub use install::{InstalledPack, PackInstallError};
 pub use object_closure::{
     MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectKey,

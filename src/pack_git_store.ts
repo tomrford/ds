@@ -16,6 +16,8 @@ import {
   splitGitParts,
 } from "./pack_git_protocol";
 
+const PACK_CATALOG_PAGE = 256;
+
 interface UploadRow extends Record<string, SqlStorageValue> {
   manifest_length: number;
   pack_length: number;
@@ -23,6 +25,11 @@ interface UploadRow extends Record<string, SqlStorageValue> {
   chunk_bytes: number;
   object_count: number;
   chunk_count: number;
+}
+
+interface InstalledPackRow extends Record<string, SqlStorageValue> {
+  pack_id: ArrayBuffer;
+  sequence: number;
 }
 
 interface ObjectRow extends Record<string, SqlStorageValue> {
@@ -43,6 +50,11 @@ interface ChunkRow extends Record<string, SqlStorageValue> {
 
 interface BytesRow extends Record<string, SqlStorageValue> {
   bytes: ArrayBuffer;
+}
+
+interface InstalledObjectBytesRow extends BytesRow {
+  byte_offset: number;
+  byte_length: number;
 }
 
 interface MissingReferenceRow extends Record<string, SqlStorageValue> {
@@ -234,6 +246,135 @@ export class GitPackStore {
       .one().count;
   }
 
+  listInstalledPacks(afterValue: unknown, throughValue: unknown) {
+    if (typeof afterValue !== "number" || !Number.isSafeInteger(afterValue) || afterValue < 0) {
+      return { ok: false as const, status: 400, error: "pack cursor must be a non-negative integer" };
+    }
+    const highWater = this.installedPackHighWater();
+    const through = throughValue === undefined ? highWater : throughValue;
+    if (
+      typeof through !== "number" ||
+      !Number.isSafeInteger(through) ||
+      through < afterValue ||
+      through > highWater
+    ) {
+      return {
+        ok: false as const,
+        status: 400,
+        error: "pack high-water must be between the cursor and current catalog frontier",
+      };
+    }
+    const rows = this.sql
+      .exec<InstalledPackRow>(
+        `SELECT pack_id, sequence FROM installed_pack_catalog
+         WHERE sequence > ? AND sequence <= ? ORDER BY sequence LIMIT ?`,
+        afterValue,
+        through,
+        PACK_CATALOG_PAGE + 1,
+      )
+      .toArray();
+    const hasMore = rows.length > PACK_CATALOG_PAGE;
+    const page = rows.slice(0, PACK_CATALOG_PAGE);
+    return {
+      ok: true as const,
+      packs: page.map((row) => ({ sequence: row.sequence, id: gitToHex(new Uint8Array(row.pack_id)) })),
+      nextAfter: page.at(-1)?.sequence ?? afterValue,
+      through,
+      hasMore,
+    };
+  }
+
+  getInstalledPackManifest(packId: string) {
+    let id: ArrayBuffer;
+    try {
+      id = exactGitBuffer(gitHashFromHex(packId));
+    } catch (error) {
+      return {
+        ok: false as const,
+        status: 400,
+        error: error instanceof Error ? error.message : "invalid pack ID",
+      };
+    }
+    const installed = this.installed(id);
+    if (installed === undefined) {
+      return { ok: false as const, status: 404, error: "installed pack does not exist" };
+    }
+    const bytes = concatGitParts(
+      this.installedManifestParts(id),
+      Math.min(installed.manifest_length, MAX_GIT_MANIFEST_BYTES),
+    );
+    if (bytes.byteLength !== installed.manifest_length) {
+      throw new Error("installed pack manifest is incomplete");
+    }
+    if (!equalGitBytes(this.kernel.hash([bytes]), new Uint8Array(id))) {
+      throw new Error("installed pack manifest hash changed");
+    }
+    return { ok: true as const, bytes: exactGitBuffer(bytes) };
+  }
+
+  getInstalledPackChunk(packId: string, position: number) {
+    let id: ArrayBuffer;
+    try {
+      id = exactGitBuffer(gitHashFromHex(packId));
+    } catch (error) {
+      return {
+        ok: false as const,
+        status: 400,
+        error: error instanceof Error ? error.message : "invalid pack ID",
+      };
+    }
+    const chunk = this.sql
+      .exec<ChunkRow>(
+        `SELECT position, byte_offset, byte_length, hash, 1 AS received
+         FROM installed_pack_chunks WHERE pack_id = ? AND position = ?`,
+        id,
+        position,
+      )
+      .toArray()[0];
+    if (chunk === undefined) {
+      return { ok: false as const, status: 404, error: "installed pack chunk does not exist" };
+    }
+    const end = chunk.byte_offset + chunk.byte_length;
+    const objects = this.sql
+      .exec<InstalledObjectBytesRow>(
+        `SELECT indexed.byte_offset, indexed.byte_length, objects.bytes
+         FROM installed_pack_objects AS indexed
+         JOIN objects ON objects.kind = indexed.kind AND objects.id = indexed.id
+         WHERE indexed.pack_id = ?
+           AND indexed.byte_length > 0
+           AND indexed.byte_offset < ?
+           AND indexed.byte_offset + indexed.byte_length > ?
+         ORDER BY indexed.position`,
+        id,
+        end,
+        chunk.byte_offset,
+      )
+      .toArray();
+    const bytes = new Uint8Array(chunk.byte_length);
+    let filled = 0;
+    for (const object of objects) {
+      const objectBytes = new Uint8Array(object.bytes);
+      if (objectBytes.byteLength !== object.byte_length) {
+        throw new Error("installed object length does not match its pack index");
+      }
+      const overlapStart = Math.max(chunk.byte_offset, object.byte_offset);
+      const overlapEnd = Math.min(end, object.byte_offset + object.byte_length);
+      if (overlapStart !== chunk.byte_offset + filled || overlapEnd <= overlapStart) {
+        throw new Error("installed pack object ranges do not reconstruct the requested chunk");
+      }
+      bytes.set(
+        objectBytes.subarray(overlapStart - object.byte_offset, overlapEnd - object.byte_offset),
+        filled,
+      );
+      filled += overlapEnd - overlapStart;
+    }
+    if (filled !== bytes.byteLength) throw new Error("installed pack chunk is incomplete");
+    if (!equalGitBytes(this.kernel.hash([bytes]), new Uint8Array(chunk.hash))) {
+      throw new Error("installed pack chunk hash changed");
+    }
+    return { ok: true as const, bytes: exactGitBuffer(bytes) };
+  }
+
   private storeManifest(id: ArrayBuffer, bytes: Uint8Array, manifest: GitPackManifest) {
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(
@@ -379,6 +520,11 @@ export class GitPackStore {
       upload.chunk_count,
     );
     this.sql.exec(
+      "INSERT INTO installed_pack_catalog VALUES (?, ?)",
+      id,
+      this.nextInstalledPackSequence(),
+    );
+    this.sql.exec(
       `INSERT INTO installed_pack_manifest_parts
        SELECT pack_id, position, bytes FROM pack_upload_manifest_parts WHERE pack_id = ?`,
       id,
@@ -518,6 +664,20 @@ export class GitPackStore {
         id,
       )
       .toArray()[0];
+  }
+
+  private nextInstalledPackSequence(): number {
+    const previous = this.installedPackHighWater();
+    if (previous >= Number.MAX_SAFE_INTEGER) throw new Error("installed pack sequence exhausted");
+    return previous + 1;
+  }
+
+  private installedPackHighWater(): number {
+    return this.sql
+      .exec<{ sequence: number }>(
+        "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM installed_pack_catalog",
+      )
+      .one().sequence;
   }
 
   private manifestParts(id: ArrayBuffer): Uint8Array[] {

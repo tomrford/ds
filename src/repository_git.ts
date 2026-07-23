@@ -69,6 +69,22 @@ export class RepositoryGit extends DurableObject<Env> {
     return this.withAuthority(authority, () => this.packs.installPack(packId));
   }
 
+  listInstalledPacks(authority: RepositoryAuthority, afterValue: unknown, throughValue: unknown) {
+    return this.withAuthority(authority, () =>
+      this.packs.listInstalledPacks(afterValue, throughValue),
+    );
+  }
+
+  getInstalledPackManifest(authority: RepositoryAuthority, packId: string) {
+    return this.withAuthority(authority, () => this.packs.getInstalledPackManifest(packId));
+  }
+
+  getInstalledPackChunk(authority: RepositoryAuthority, packId: string, position: number) {
+    return this.withAuthority(authority, () =>
+      this.packs.getInstalledPackChunk(packId, position),
+    );
+  }
+
   countObjects() {
     return this.packs.countObjects();
   }

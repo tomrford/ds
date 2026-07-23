@@ -68,6 +68,10 @@ export function initializeGitSchema(sql: SqlStorage) {
       object_count INTEGER NOT NULL,
       chunk_count INTEGER NOT NULL
     ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS installed_pack_catalog (
+      pack_id BLOB PRIMARY KEY,
+      sequence INTEGER NOT NULL UNIQUE
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS installed_pack_manifest_parts (
       pack_id BLOB NOT NULL,
       position INTEGER NOT NULL,

@@ -13,6 +13,10 @@ const MANIFEST_HEADER_BYTES: usize = 96;
 const OBJECT_ENTRY_BYTES: usize = 44;
 const CHUNK_ENTRY_BYTES: usize = 80;
 const MAX_PACK_CHUNKS: usize = (MAX_PACK_BYTES / MIN_CHUNK_BYTES as u64) as usize;
+pub const MAX_MANIFEST_BYTES: usize = MANIFEST_HEADER_BYTES
+    + MAX_PACK_HEADS * Oid::LENGTH
+    + MAX_PACK_OBJECTS as usize * OBJECT_ENTRY_BYTES
+    + MAX_PACK_CHUNKS * CHUNK_ENTRY_BYTES;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectEntry {
     pub key: ObjectKey,

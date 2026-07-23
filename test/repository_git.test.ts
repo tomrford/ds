@@ -97,6 +97,51 @@ describe("Git v2 repository object store", () => {
       inserted: false,
       installed: true,
     });
+
+    expect(await json(await listPacks("git-install", 0))).toEqual({
+      packs: [{ sequence: 1, id: fixture.id }],
+      nextAfter: 1,
+      through: 1,
+      hasMore: false,
+    });
+    expect(await downloadManifest("git-install", fixture.id)).toEqual(fixture.manifest);
+    expect(await downloadChunk("git-install", fixture.id, 0)).toEqual(fixture.chunks[0]);
+  });
+
+  it("pages the installed-pack catalog under one fixed high-water", async () => {
+    const name = "git-catalog-paging";
+    const authority = await repositoryAuthority(name);
+    const stub = await repositoryGitStub(name);
+    expect(await stub.initializeRepository(authority)).toMatchObject({ ok: true });
+    const fixtures = Array.from({ length: 257 }, (_, index) => blobFixture(index));
+    for (const fixture of fixtures) {
+      expect(await stub.putPackManifest(authority, fixture.id, fixture.manifest)).toMatchObject({
+        ok: true,
+      });
+      expect(await stub.putPackChunk(authority, fixture.id, 0, fixture.chunks[0])).toMatchObject({
+        ok: true,
+      });
+      expect(await stub.installPack(authority, fixture.id)).toMatchObject({ ok: true });
+    }
+
+    const first = (await json(await listPacks(name, 0))) as {
+      packs: Array<{ sequence: number; id: string }>;
+      nextAfter: number;
+      through: number;
+      hasMore: boolean;
+    };
+    expect(first.packs).toHaveLength(256);
+    expect(first.nextAfter).toBe(256);
+    expect(first.through).toBe(257);
+    expect(first.hasMore).toBe(true);
+
+    const second = await json(await listPacks(name, first.nextAfter, first.through));
+    expect(second).toEqual({
+      packs: [{ sequence: 257, id: fixtures[256].id }],
+      nextAfter: 257,
+      through: 257,
+      hasMore: false,
+    });
   });
 
   it("rejects an incomplete closure, then installs it after the dependency arrives", async () => {
@@ -180,7 +225,24 @@ describe("Git v2 repository object store", () => {
       }),
     );
     expect(stale.status).toBe(404);
+    const catalogBase = `https://example.com/repositories/${repository.repositoryId}/git/packs`;
+    expect((await exports.default.fetch(new Request(catalogBase))).status).toBe(401);
+    expect(
+      (
+        await exports.default.fetch(
+          new Request(`${base}/manifest`, {
+            headers: { ...authorization, "x-devspace-incarnation": "00".repeat(16) },
+          }),
+        )
+      ).status,
+    ).toBe(404);
     expect((await routeRequest("git-bounds", "git/packs/bad/manifest", { method: "PUT" })).status).toBe(
+      400,
+    );
+    expect((await routeRequest("git-bounds", "git/packs?after=-1", { method: "GET" })).status).toBe(
+      400,
+    );
+    expect((await routeRequest("git-bounds", "git/packs?through=1", { method: "GET" })).status).toBe(
       400,
     );
 
@@ -213,6 +275,22 @@ describe("Git v2 repository object store", () => {
     expect(await oversizedChunk.json()).toEqual({
       error: `Git chunk exceeds ${MAX_GIT_CHUNK_BYTES} byte limit`,
     });
+
+    const missing = "ff".repeat(64);
+    const missingManifest = await routeRequest(
+      "git-bounds",
+      `git/packs/${missing}/manifest`,
+      { method: "GET" },
+    );
+    expect(missingManifest.status).toBe(404);
+    expect(await missingManifest.json()).toEqual({ error: "installed pack does not exist" });
+    const missingChunk = await routeRequest(
+      "git-bounds",
+      `git/packs/${missing}/chunks/0`,
+      { method: "GET" },
+    );
+    expect(missingChunk.status).toBe(404);
+    expect(await missingChunk.json()).toEqual({ error: "installed pack chunk does not exist" });
   });
 
   it("persists quarantine and installed objects across Durable Object eviction", async () => {
@@ -318,6 +396,51 @@ function putChunk(name: string, fixture: DecodedFixture, position: number) {
 
 function install(name: string, packId: string) {
   return routeRequest(name, `git/packs/${packId}/install`, { method: "POST" });
+}
+
+function listPacks(name: string, after: number, through?: number) {
+  const highWater = through === undefined ? "" : `&through=${through}`;
+  return routeRequest(name, `git/packs?after=${after}${highWater}`, { method: "GET" });
+}
+
+async function downloadManifest(name: string, packId: string): Promise<Uint8Array> {
+  const response = await routeRequest(name, `git/packs/${packId}/manifest`, { method: "GET" });
+  expect(response.status).toBe(200);
+  expect(response.headers.get("content-type")).toBe("application/octet-stream");
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+async function downloadChunk(name: string, packId: string, position: number): Promise<Uint8Array> {
+  const response = await routeRequest(name, `git/packs/${packId}/chunks/${position}`, {
+    method: "GET",
+  });
+  expect(response.status).toBe(200);
+  expect(response.headers.get("content-type")).toBe("application/octet-stream");
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+function blobFixture(index: number): DecodedFixture {
+  const bytes = new TextEncoder().encode(`catalog fixture ${index}\n`);
+  const kernel = new KernelGit();
+  const objectId = kernel.validate(0, bytes).id;
+  const hash = kernel.hash([bytes]);
+  const manifest = new Uint8Array(96 + 44 + 80);
+  const view = new DataView(manifest.buffer);
+  manifest.set([0x44, 0x53, 0x50, 0x4b]);
+  view.setUint16(4, 2, true);
+  view.setUint32(8, 64 * 1024, true);
+  view.setUint32(16, 1, true);
+  view.setUint32(20, 1, true);
+  view.setBigUint64(24, BigInt(bytes.byteLength), true);
+  manifest.set(hash, 32);
+  manifest[96] = 0;
+  manifest.set(objectId, 104);
+  view.setBigUint64(124, 0n, true);
+  view.setBigUint64(132, BigInt(bytes.byteLength), true);
+  view.setBigUint64(140, 0n, true);
+  view.setUint32(148, bytes.byteLength, true);
+  manifest.set(hash, 156);
+  return { id: gitToHex(kernel.hash([manifest])), manifest, chunks: [bytes] };
 }
 
 function authorizationFor(machineId: string): Record<string, string> {
