@@ -342,3 +342,143 @@ pub enum PackManifestError {
     #[error("object length {0} exceeds the limit")]
     ObjectTooLarge(u64),
 }
+
+#[cfg(test)]
+mod worker_fixture_generation {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use devspace_kernel_git::{ObjectKind, Oid, validate};
+    use serde_json::{Value, json};
+
+    use super::{ChunkEntry, ObjectEntry, PackManifest};
+    use crate::object_closure::ObjectKey;
+    use crate::pack::{MIN_CHUNK_BYTES, hash};
+
+    #[test]
+    #[ignore = "regenerates the checked-in Worker pack fixtures"]
+    fn write_worker_git_pack_fixtures() {
+        let blob_bytes = b"worker Git fixture\n".to_vec();
+        let blob = object(ObjectKind::Blob, blob_bytes.clone());
+
+        let mut tree_bytes = b"100644 fixture.txt\0".to_vec();
+        tree_bytes.extend_from_slice(&blob.0.id.0);
+        let tree = object(ObjectKind::Tree, tree_bytes);
+
+        let commit_bytes = format!(
+            "tree {}\nauthor Worker Fixture <worker@example.invalid> 1700000000 +0000\ncommitter Worker Fixture <worker@example.invalid> 1700000000 +0000\n\nworker fixture\n",
+            crate::hex(&tree.0.id.0),
+        )
+        .into_bytes();
+        let commit = object(ObjectKind::Commit, commit_bytes);
+
+        let complete = fixture(
+            vec![commit.0.id],
+            vec![blob.clone(), tree.clone(), commit.clone()],
+        );
+        let dependency = fixture(Vec::new(), vec![blob.clone()]);
+        let missing_reference = fixture(vec![commit.0.id], vec![tree, commit]);
+
+        let (malformed_id, malformed_bytes) = truncated_golden_commit();
+        let malformed = fixture(
+            vec![malformed_id],
+            vec![
+                blob,
+                (
+                    ObjectKey {
+                        kind: ObjectKind::Commit,
+                        id: malformed_id,
+                    },
+                    malformed_bytes,
+                ),
+            ],
+        );
+
+        let output = json!({
+            "complete": complete,
+            "dependency": dependency,
+            "missingReference": missing_reference,
+            "malformed": malformed,
+        });
+        let path = repository_root().join("test/fixtures/repository_git.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec_pretty(&output).unwrap()).unwrap();
+    }
+
+    fn object(kind: ObjectKind, bytes: Vec<u8>) -> (ObjectKey, Vec<u8>) {
+        let id = validate(kind, &bytes).unwrap().id;
+        (ObjectKey { kind, id }, bytes)
+    }
+
+    fn fixture(mut heads: Vec<Oid>, mut objects: Vec<(ObjectKey, Vec<u8>)>) -> Value {
+        heads.sort_unstable();
+        objects.sort_unstable_by_key(|(key, _)| *key);
+        let mut data = Vec::new();
+        let entries = objects
+            .into_iter()
+            .map(|(key, bytes)| {
+                let offset = data.len() as u64;
+                let length = bytes.len() as u64;
+                data.extend_from_slice(&bytes);
+                ObjectEntry {
+                    key,
+                    offset,
+                    length,
+                }
+            })
+            .collect();
+        let chunk = ChunkEntry {
+            offset: 0,
+            length: data.len() as u32,
+            hash: hash(&data),
+        };
+        let manifest = PackManifest::new(
+            MIN_CHUNK_BYTES,
+            data.len() as u64,
+            hash(&data),
+            heads,
+            entries,
+            vec![chunk],
+        )
+        .unwrap();
+        let manifest = manifest.encode();
+        json!({
+            "id": crate::hex(&hash(&manifest)),
+            "manifest": crate::hex(&manifest),
+            "chunks": [crate::hex(&data)],
+        })
+    }
+
+    fn truncated_golden_commit() -> (Oid, Vec<u8>) {
+        let golden =
+            fs::read_to_string(repository_root().join("crates/kernel-git/tests/git_golden.txt"))
+                .unwrap();
+        let line = golden
+            .lines()
+            .find(|line| line.starts_with("commit|"))
+            .unwrap();
+        let mut fields = line.split('|');
+        assert_eq!(fields.next(), Some("commit"));
+        let id = Oid::from_hex(fields.next().unwrap().as_bytes()).unwrap();
+        let bytes = decode_hex(fields.next().unwrap());
+        let terminator = bytes.windows(2).position(|pair| pair == b"\n\n").unwrap();
+        (id, bytes[..=terminator].to_vec())
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn repository_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned()
+    }
+}

@@ -759,6 +759,7 @@ dependencies = [
  "futures 0.3.32",
  "gix",
  "jj-lib",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
 ]

@@ -16,6 +16,10 @@
         "class_name": "Repository"
       },
       {
+        "name": "REPOSITORIES_GIT",
+        "class_name": "RepositoryGit"
+      },
+      {
         "name": "CONTROL_PLANE",
         "class_name": "ControlPlane"
       }
@@ -29,6 +33,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["ControlPlane"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["RepositoryGit"]
     }
   ],
   "rules": [

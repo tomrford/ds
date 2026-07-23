@@ -5,6 +5,7 @@ import { MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, readBoundedBody } from "./pack_pro
 import { MAX_PROJECTION_REQUEST_BYTES } from "./projection_protocol";
 import { MAX_REMOTE_REQUEST_BYTES } from "./remote_protocol";
 import type { Repository } from "./repository";
+import { routeGitRepository } from "./router_git";
 import {
   cursorStringSchema,
   objectIdStringSchema,
@@ -41,6 +42,8 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
     const principal = authentication.principal;
     const control = env.CONTROL_PLANE.getByName(CONTROL_PLANE_NAME);
     const url = new URL(request.url);
+    const gitResponse = await routeGitRepository(request, env, principal, control, url);
+    if (gitResponse !== undefined) return gitResponse;
 
     const chunkMatch = /^\/repositories\/([^/]+)\/packs\/([^/]+)\/chunks\/([^/]+)$/.exec(
       url.pathname,
