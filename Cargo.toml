@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cli", "crates/kernel", "crates/kernel-git", "crates/kernel-git-oracle", "crates/kernel-git-wasm", "crates/kernel-wasm", "crates/machine"]
+members = ["crates/cli", "crates/kernel", "crates/kernel-git", "crates/kernel-git-oracle", "crates/kernel-git-wasm", "crates/kernel-wasm", "crates/machine", "crates/machine-git"]
 resolver = "2"
 
 [workspace.package]

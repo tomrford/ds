@@ -751,6 +751,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "devspace-machine-git"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "devspace-kernel-git",
+ "futures 0.3.32",
+ "gix",
+ "jj-lib",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
