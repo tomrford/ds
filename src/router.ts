@@ -13,7 +13,7 @@ import {
   MAX_OP_OBJECT_BYTES,
 } from "./op_store";
 import { MAX_HEAD_REQUEST_BYTES } from "./op_protocol";
-import type { RepositoryGit } from "./repository";
+import type { Repository } from "./repository";
 import { cursorStringSchema, lowerHexStringSchema } from "./validation";
 
 const gitPackIdSchema = lowerHexStringSchema(64, "pack ID");
@@ -159,7 +159,7 @@ async function routeRepository(
   }
 
   const authority = authorization.authority;
-  const stub: DurableObjectStub<RepositoryGit> = env.REPOSITORIES.getByName(repositoryId);
+  const stub: DurableObjectStub<Repository> = env.REPOSITORIES.getByName(repositoryId);
   const initialized = await stub.initializeRepository(authority);
   if (!initialized.ok) return rpcResponse(initialized);
 

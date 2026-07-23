@@ -12,6 +12,12 @@ after re-initialization.
 
 Gate: `nix develop -c pnpm check` and `nix develop -c pnpm test`.
 
+Latest state only, while in development: no data migrations, no backwards
+compatibility, no version-suffixed names. A Worker shape change is a
+wipe-and-redeploy — pull the data off, delete the Worker, deploy fresh,
+re-upload from a machine. `wrangler.jsonc` keeps exactly one migration entry
+describing the current classes.
+
 ## jj format parity
 
 - `crates/kernel` is a maintained mini-fork of jj's GitBackend commit format

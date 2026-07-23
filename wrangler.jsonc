@@ -13,34 +13,20 @@
     "bindings": [
       {
         "name": "REPOSITORIES",
-        "class_name": "RepositoryGit"
+        "class_name": "Repository"
       },
       {
         "name": "CONTROL_PLANE",
-        "class_name": "ControlPlaneV2"
+        "class_name": "ControlPlane"
       }
     ]
   },
+  // Latest state only: no migration history. A worker shape change is a
+  // wipe-and-redeploy — pull the data off, delete the worker, deploy fresh.
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["Repository"]
-    },
-    {
-      "tag": "v2",
-      "new_sqlite_classes": ["ControlPlane"]
-    },
-    {
-      "tag": "v3",
-      "new_sqlite_classes": ["RepositoryGit"]
-    },
-    {
-      "tag": "v4",
-      "new_sqlite_classes": ["ControlPlaneV2"]
-    },
-    {
-      "tag": "v5",
-      "deleted_classes": ["Repository", "ControlPlane"]
+      "new_sqlite_classes": ["Repository", "ControlPlane"]
     }
   ],
   "rules": [

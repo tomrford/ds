@@ -6,7 +6,7 @@ import { GitPackStore } from "./pack_store";
 import { ProjectionGitStore } from "./projection_store";
 import { initializeGitSchema } from "./schema";
 
-class RepositoryGitAuthorityError extends Error {
+class RepositoryAuthorityError extends Error {
   constructor(
     message: string,
     readonly code: "repository-retired" | "repository-authority-stale",
@@ -23,7 +23,7 @@ interface AuthorityRow extends Record<string, SqlStorageValue> {
   retired: number;
 }
 
-export class RepositoryGit extends DurableObject<Env> {
+export class Repository extends DurableObject<Env> {
   private readonly packs: GitPackStore;
   private readonly ops: OpGitStore;
   private readonly projection: ProjectionGitStore;
@@ -50,7 +50,7 @@ export class RepositoryGit extends DurableObject<Env> {
       const control = this.env.CONTROL_PLANE.getByName("directory");
       const allowed = await control.validateRepositoryInitialization(authority);
       if (!allowed.ok) {
-        throw new RepositoryGitAuthorityError(
+        throw new RepositoryAuthorityError(
           "repository authority is stale",
           "repository-authority-stale",
         );
@@ -75,7 +75,7 @@ export class RepositoryGit extends DurableObject<Env> {
       const confirmed = await control.validateRepositoryInitialization(authority);
       if (!confirmed.ok) {
         await this.ctx.storage.deleteAll();
-        throw new RepositoryGitAuthorityError(
+        throw new RepositoryAuthorityError(
           "repository authority is stale",
           "repository-authority-stale",
         );
@@ -250,13 +250,13 @@ export class RepositoryGit extends DurableObject<Env> {
       state.creation_nonce !== authority.creationNonce ||
       !equalGitBytes(new Uint8Array(state.incarnation), incarnationBytes(authority.incarnation))
     ) {
-      throw new RepositoryGitAuthorityError(
+      throw new RepositoryAuthorityError(
         "repository authority is stale",
         "repository-authority-stale",
       );
     }
     if (state.retired !== 0) {
-      throw new RepositoryGitAuthorityError("repository was deleted", "repository-retired");
+      throw new RepositoryAuthorityError("repository was deleted", "repository-retired");
     }
   }
 }
@@ -267,7 +267,7 @@ function authorityFailure(error: unknown) {
     status: 409,
     error: error instanceof Error ? error.message : "repository authority is stale",
     code:
-      error instanceof RepositoryGitAuthorityError
+      error instanceof RepositoryAuthorityError
         ? error.code
         : "repository-authority-stale",
   };
