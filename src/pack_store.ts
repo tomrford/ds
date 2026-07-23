@@ -1,17 +1,22 @@
-import { HeadStore } from "./head_store";
-import { Kernel, equalBytes, exactBuffer, fromHex, toHex } from "./kernel";
 import {
-  MAX_CHUNK_BYTES,
-  MAX_MANIFEST_BYTES,
-  MAX_OBJECT_BYTES,
-  PackManifest,
-  concatParts,
-  decodeManifest,
-  splitParts,
+  GIT_OBJECT_KIND,
+  GIT_REFERENCE_KIND,
+  Kernel,
+  equalGitBytes,
+  exactGitBuffer,
+  gitHashFromHex,
+  gitToHex,
+} from "./kernel";
+import {
+  MAX_GIT_MANIFEST_BYTES,
+  MAX_GIT_OBJECT_BYTES,
+  GitPackManifest,
+  concatGitParts,
+  decodeGitManifest,
+  splitGitParts,
 } from "./pack_protocol";
-import { decodeObjectInventory, InventoryObject } from "./object_protocol";
+
 const PACK_CATALOG_PAGE = 256;
-const INVENTORY_SQL_OBJECTS = 32;
 
 interface UploadRow extends Record<string, SqlStorageValue> {
   manifest_length: number;
@@ -52,49 +57,54 @@ interface InstalledObjectBytesRow extends BytesRow {
   byte_length: number;
 }
 
-class PackValidationError extends Error {}
+interface MissingReferenceRow extends Record<string, SqlStorageValue> {
+  object_kind: number;
+  object_id: ArrayBuffer;
+  referenced_id: ArrayBuffer;
+}
 
-export class PackStore {
+class GitPackValidationError extends Error {}
+
+export class GitPackStore {
   constructor(
     private readonly ctx: DurableObjectState,
     private readonly sql: SqlStorage,
     private readonly kernel: Kernel,
-    private readonly heads: HeadStore,
   ) {}
 
   putPackManifest(packId: string, bytes: Uint8Array) {
     try {
-      const id = exactBuffer(fromHex(packId));
+      const id = exactGitBuffer(gitHashFromHex(packId));
       const actualId = this.kernel.hash([bytes]);
-      if (!equalBytes(actualId, new Uint8Array(id))) {
-        throw new PackValidationError(`manifest hashes to ${toHex(actualId)}, not ${packId}`);
+      if (!equalGitBytes(actualId, new Uint8Array(id))) {
+        throw new GitPackValidationError(`manifest hashes to ${gitToHex(actualId)}, not ${packId}`);
       }
-      let manifest: PackManifest;
+      let manifest: GitPackManifest;
       try {
-        manifest = decodeManifest(bytes);
+        manifest = decodeGitManifest(bytes);
       } catch (error) {
-        throw new PackValidationError(
+        throw new GitPackValidationError(
           error instanceof Error ? error.message : "manifest validation failed",
         );
       }
       const installed = this.installed(id);
       if (installed !== undefined) {
-        const installedBytes = concatParts(
+        const installedBytes = concatGitParts(
           this.installedManifestParts(id),
-          Math.min(installed.manifest_length, MAX_MANIFEST_BYTES),
+          Math.min(installed.manifest_length, MAX_GIT_MANIFEST_BYTES),
         );
-        if (!equalBytes(installedBytes, bytes)) {
+        if (!equalGitBytes(installedBytes, bytes)) {
           throw new Error("installed pack ID collision with different manifest bytes");
         }
         return { ok: true as const, inserted: false, installed: true };
       }
       const existing = this.upload(id);
       if (existing !== undefined) {
-        const existingBytes = concatParts(
+        const existingBytes = concatGitParts(
           this.manifestParts(id),
-          Math.min(existing.manifest_length, MAX_MANIFEST_BYTES),
+          Math.min(existing.manifest_length, MAX_GIT_MANIFEST_BYTES),
         );
-        if (!equalBytes(existingBytes, bytes)) {
+        if (!equalGitBytes(existingBytes, bytes)) {
           throw new Error("pack ID collision with different manifest bytes");
         }
         return { ok: true as const, inserted: false, installed: false };
@@ -103,11 +113,8 @@ export class PackStore {
       return { ok: true as const, inserted: true, installed: false };
     } catch (error) {
       this.resetTrappedKernel(error);
-      if (error instanceof PackValidationError) {
-        return {
-          ok: false as const,
-          error: error instanceof Error ? error.message : "manifest validation failed",
-        };
+      if (error instanceof GitPackValidationError) {
+        return { ok: false as const, error: error.message };
       }
       throw error;
     }
@@ -115,7 +122,7 @@ export class PackStore {
 
   putPackChunk(packId: string, position: number, bytes: Uint8Array) {
     try {
-      const id = exactBuffer(fromHex(packId));
+      const id = exactGitBuffer(gitHashFromHex(packId));
       const installed = this.installed(id);
       const expected =
         installed === undefined
@@ -135,32 +142,34 @@ export class PackStore {
                 position,
               )
               .toArray()[0];
-      if (expected === undefined) throw new PackValidationError("unknown pack or chunk position");
+      if (expected === undefined) throw new GitPackValidationError("unknown pack or chunk position");
       if (bytes.byteLength !== expected.byte_length) {
-        throw new PackValidationError(
+        throw new GitPackValidationError(
           `chunk ${position} is ${bytes.byteLength} bytes, expected ${expected.byte_length}`,
         );
       }
       const actualHash = this.kernel.hash([bytes]);
-      if (!equalBytes(actualHash, new Uint8Array(expected.hash))) {
-        throw new PackValidationError(`chunk ${position} hash does not match manifest`);
+      if (!equalGitBytes(actualHash, new Uint8Array(expected.hash))) {
+        throw new GitPackValidationError(`chunk ${position} hash does not match manifest`);
       }
       if (installed !== undefined) {
         return { ok: true as const, inserted: false, installed: true };
       }
       if (expected.received !== 0) {
-        const existing = concatParts(this.chunkParts(id, position), expected.byte_length);
-        if (!equalBytes(existing, bytes)) throw new Error("chunk hash collision with different bytes");
+        const existing = concatGitParts(this.chunkParts(id, position), expected.byte_length);
+        if (!equalGitBytes(existing, bytes)) {
+          throw new Error("chunk hash collision with different bytes");
+        }
         return { ok: true as const, inserted: false, installed: false };
       }
       this.ctx.storage.transactionSync(() => {
-        for (const [partPosition, part] of splitParts(bytes).entries()) {
+        for (const [partPosition, part] of splitGitParts(bytes).entries()) {
           this.sql.exec(
             "INSERT INTO pack_upload_chunk_parts VALUES (?, ?, ?, ?)",
             id,
             position,
             partPosition,
-            exactBuffer(part),
+            exactGitBuffer(part),
           );
         }
         this.sql.exec(
@@ -172,11 +181,8 @@ export class PackStore {
       return { ok: true as const, inserted: true, installed: false };
     } catch (error) {
       this.resetTrappedKernel(error);
-      if (error instanceof PackValidationError) {
-        return {
-          ok: false as const,
-          error: error instanceof Error ? error.message : "chunk validation failed",
-        };
+      if (error instanceof GitPackValidationError) {
+        return { ok: false as const, error: error.message };
       }
       throw error;
     }
@@ -185,7 +191,7 @@ export class PackStore {
   installPack(packId: string) {
     let id: ArrayBuffer;
     try {
-      id = exactBuffer(fromHex(packId));
+      id = exactGitBuffer(gitHashFromHex(packId));
     } catch (error) {
       return { ok: false as const, error: error instanceof Error ? error.message : "invalid pack ID" };
     }
@@ -194,20 +200,24 @@ export class PackStore {
     }
     const upload = this.upload(id);
     if (upload === undefined) return { ok: false as const, error: "pack manifest is not uploaded" };
-    const missing = this.sql
+    const missingChunks = this.sql
       .exec<{ count: number }>(
         "SELECT count(*) AS count FROM pack_upload_chunks WHERE pack_id = ? AND received = 0",
         id,
       )
       .one().count;
-    if (missing !== 0) return { ok: false as const, error: `pack is missing ${missing} chunks` };
+    if (missingChunks !== 0) {
+      return { ok: false as const, error: `pack is missing ${missingChunks} chunks` };
+    }
 
     try {
-      const insertedObjects = this.ctx.storage.transactionSync(() => this.installUploadedPack(id, upload));
+      const insertedObjects = this.ctx.storage.transactionSync(() =>
+        this.installUploadedPack(id, upload),
+      );
       return { ok: true as const, installed: true, insertedObjects };
     } catch (error) {
       this.resetTrappedKernel(error);
-      if (error instanceof PackValidationError) {
+      if (error instanceof GitPackValidationError) {
         return { ok: false as const, error: error.message };
       }
       throw error;
@@ -215,8 +225,13 @@ export class PackStore {
   }
 
   countObjects(): number {
-    return this.sql.exec<{ count: number }>("SELECT count(*) AS count FROM objects").one()
-      .count;
+    return this.sql.exec<{ count: number }>("SELECT count(*) AS count FROM objects").one().count;
+  }
+
+  countObjectReferences(): number {
+    return this.sql
+      .exec<{ count: number }>("SELECT count(*) AS count FROM object_references")
+      .one().count;
   }
 
   countInstalledPacks(): number {
@@ -225,52 +240,13 @@ export class PackStore {
       .one().count;
   }
 
-  /**
-   * Returns the installed subset of one bounded, canonical candidate set.
-   *
-   * Installed objects are immutable and content-addressed, so an affirmative
-   * answer remains safe if another pack installs concurrently. A stale
-   * negative only causes an idempotent re-upload.
-   */
-  inventoryObjects(value: unknown) {
-    let request;
-    try {
-      request = decodeObjectInventory(value);
-    } catch (error) {
-      return {
-        ok: false as const,
-        status: 400,
-        error: error instanceof Error ? error.message : "object inventory request failed",
-        code: "invalid-object-inventory-request",
-      };
-    }
-    const state = this.heads.get(toHex(request.incarnation));
-    if (!state.ok) return state;
-
-    const installed: InventoryObject[] = [];
-    for (let offset = 0; offset < request.objects.length; offset += INVENTORY_SQL_OBJECTS) {
-      const candidates = request.objects.slice(offset, offset + INVENTORY_SQL_OBJECTS);
-      const predicate = candidates.map(() => "(kind = ? AND id = ?)").join(" OR ");
-      const bindings = candidates.flatMap((object) => [object.kind, exactBuffer(object.id)]);
-      installed.push(
-        ...this.sql
-          .exec<{ kind: number; id: ArrayBuffer }>(
-            `SELECT kind, id FROM objects WHERE ${predicate} ORDER BY kind, id`,
-            ...bindings,
-          )
-          .toArray()
-          .map((row) => ({ kind: row.kind, id: new Uint8Array(row.id) })),
-      );
-    }
-    return {
-      ok: true as const,
-      objects: installed.map((object) => ({ kind: object.kind, id: toHex(object.id) })),
-    };
+  countQuarantinedPacks(): number {
+    return this.sql
+      .exec<{ count: number }>("SELECT count(*) AS count FROM pack_uploads")
+      .one().count;
   }
 
-  listInstalledPacks(incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
-    const state = this.heads.get(incarnationValue);
-    if (!state.ok) return state;
+  listInstalledPacks(afterValue: unknown, throughValue: unknown) {
     if (typeof afterValue !== "number" || !Number.isSafeInteger(afterValue) || afterValue < 0) {
       return { ok: false as const, status: 400, error: "pack cursor must be a non-negative integer" };
     }
@@ -301,19 +277,17 @@ export class PackStore {
     const page = rows.slice(0, PACK_CATALOG_PAGE);
     return {
       ok: true as const,
-      packs: page.map((row) => ({ sequence: row.sequence, id: toHex(new Uint8Array(row.pack_id)) })),
+      packs: page.map((row) => ({ sequence: row.sequence, id: gitToHex(new Uint8Array(row.pack_id)) })),
       nextAfter: page.at(-1)?.sequence ?? afterValue,
       through,
       hasMore,
     };
   }
 
-  getInstalledPackManifest(packId: string, incarnationValue: unknown) {
-    const state = this.heads.get(incarnationValue);
-    if (!state.ok) return state;
+  getInstalledPackManifest(packId: string) {
     let id: ArrayBuffer;
     try {
-      id = exactBuffer(fromHex(packId));
+      id = exactGitBuffer(gitHashFromHex(packId));
     } catch (error) {
       return {
         ok: false as const,
@@ -325,25 +299,23 @@ export class PackStore {
     if (installed === undefined) {
       return { ok: false as const, status: 404, error: "installed pack does not exist" };
     }
-    const bytes = concatParts(
+    const bytes = concatGitParts(
       this.installedManifestParts(id),
-      Math.min(installed.manifest_length, MAX_MANIFEST_BYTES),
+      Math.min(installed.manifest_length, MAX_GIT_MANIFEST_BYTES),
     );
     if (bytes.byteLength !== installed.manifest_length) {
       throw new Error("installed pack manifest is incomplete");
     }
-    if (!equalBytes(this.kernel.hash([bytes]), new Uint8Array(id))) {
+    if (!equalGitBytes(this.kernel.hash([bytes]), new Uint8Array(id))) {
       throw new Error("installed pack manifest hash changed");
     }
-    return { ok: true as const, bytes: exactBuffer(bytes) };
+    return { ok: true as const, bytes: exactGitBuffer(bytes) };
   }
 
-  getInstalledPackChunk(packId: string, position: number, incarnationValue: unknown) {
-    const state = this.heads.get(incarnationValue);
-    if (!state.ok) return state;
+  getInstalledPackChunk(packId: string, position: number) {
     let id: ArrayBuffer;
     try {
-      id = exactBuffer(fromHex(packId));
+      id = exactGitBuffer(gitHashFromHex(packId));
     } catch (error) {
       return {
         ok: false as const,
@@ -396,41 +368,39 @@ export class PackStore {
       );
       filled += overlapEnd - overlapStart;
     }
-    if (filled !== bytes.byteLength) {
-      throw new Error("installed pack chunk is incomplete");
-    }
-    if (!equalBytes(this.kernel.hash([bytes]), new Uint8Array(chunk.hash))) {
+    if (filled !== bytes.byteLength) throw new Error("installed pack chunk is incomplete");
+    if (!equalGitBytes(this.kernel.hash([bytes]), new Uint8Array(chunk.hash))) {
       throw new Error("installed pack chunk hash changed");
     }
-    return { ok: true as const, bytes: exactBuffer(bytes) };
+    return { ok: true as const, bytes: exactGitBuffer(bytes) };
   }
 
-  private storeManifest(id: ArrayBuffer, bytes: Uint8Array, manifest: PackManifest) {
+  private storeManifest(id: ArrayBuffer, bytes: Uint8Array, manifest: GitPackManifest) {
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(
         "INSERT INTO pack_uploads VALUES (?, ?, ?, ?, ?, ?, ?)",
         id,
         bytes.byteLength,
         manifest.packLength,
-        exactBuffer(manifest.packHash),
+        exactGitBuffer(manifest.packHash),
         manifest.chunkBytes,
         manifest.objects.length,
         manifest.chunks.length,
       );
-      for (const [position, part] of splitParts(bytes).entries()) {
+      for (const [position, part] of splitGitParts(bytes).entries()) {
         this.sql.exec(
           "INSERT INTO pack_upload_manifest_parts VALUES (?, ?, ?)",
           id,
           position,
-          exactBuffer(part),
+          exactGitBuffer(part),
         );
       }
-      for (const [position, head] of manifest.operationHeads.entries()) {
+      for (const [position, head] of manifest.headCommits.entries()) {
         this.sql.exec(
           "INSERT INTO pack_upload_heads VALUES (?, ?, ?)",
           id,
           position,
-          exactBuffer(head),
+          exactGitBuffer(head),
         );
       }
       for (const [position, object] of manifest.objects.entries()) {
@@ -439,7 +409,7 @@ export class PackStore {
           id,
           position,
           object.kind,
-          exactBuffer(object.id),
+          exactGitBuffer(object.id),
           object.offset,
           object.length,
         );
@@ -451,7 +421,7 @@ export class PackStore {
           position,
           chunk.offset,
           chunk.length,
-          exactBuffer(chunk.hash),
+          exactGitBuffer(chunk.hash),
         );
       }
     });
@@ -473,7 +443,7 @@ export class PackStore {
       )
       .toArray();
     if (objects.length !== upload.object_count || chunks.length !== upload.chunk_count) {
-      throw new PackValidationError("quarantined pack index is incomplete");
+      throw new GitPackValidationError("quarantined pack index is incomplete");
     }
 
     let objectIndex = 0;
@@ -487,7 +457,7 @@ export class PackStore {
         while (objectIndex < objects.length && objectWritten === objects[objectIndex].byte_length) {
           const object = objects[objectIndex];
           if (object.byte_offset + object.byte_length !== packOffset) break;
-          insertedObjects += this.validateAndStoreManifestObject(object, objectBytes!);
+          insertedObjects += this.validateAndStoreManifestObject(object, objectBytes!) ? 1 : 0;
           objectIndex += 1;
           objectWritten = 0;
           objectBytes =
@@ -500,22 +470,22 @@ export class PackStore {
         const parts = this.chunkParts(id, chunk.position);
         const chunkLength = parts.reduce((length, part) => length + part.byteLength, 0);
         if (chunkLength !== chunk.byte_length) {
-          throw new PackValidationError(`stored chunk ${chunk.position} length changed`);
+          throw new GitPackValidationError(`stored chunk ${chunk.position} length changed`);
         }
         const chunkHash = this.kernel.hash(parts);
-        if (!equalBytes(chunkHash, new Uint8Array(chunk.hash))) {
-          throw new PackValidationError(`stored chunk ${chunk.position} hash changed`);
+        if (!equalGitBytes(chunkHash, new Uint8Array(chunk.hash))) {
+          throw new GitPackValidationError(`stored chunk ${chunk.position} hash changed`);
         }
         for (const part of parts) {
           packHash.update(part);
           let partOffset = 0;
           while (partOffset < part.byteLength) {
             if (objectIndex >= objects.length || objectBytes === undefined) {
-              throw new PackValidationError("pack contains bytes outside its object ranges");
+              throw new GitPackValidationError("pack contains bytes outside its object ranges");
             }
             const object = objects[objectIndex];
             if (object.byte_offset + objectWritten !== packOffset) {
-              throw new PackValidationError("pack object ranges changed after manifest upload");
+              throw new GitPackValidationError("pack object ranges changed after manifest upload");
             }
             const count = Math.min(object.byte_length - objectWritten, part.byteLength - partOffset);
             objectBytes.set(part.subarray(partOffset, partOffset + count), objectWritten);
@@ -528,16 +498,17 @@ export class PackStore {
       }
       finishReadyObjects();
       if (packOffset !== upload.pack_length || objectIndex !== objects.length) {
-        throw new PackValidationError("pack bytes do not fill every object range");
+        throw new GitPackValidationError("pack bytes do not fill every object range");
       }
       const actualPackHash = packHash.finish();
-      if (!equalBytes(actualPackHash, new Uint8Array(upload.pack_hash))) {
-        throw new PackValidationError("whole-pack hash does not match manifest");
+      if (!equalGitBytes(actualPackHash, new Uint8Array(upload.pack_hash))) {
+        throw new GitPackValidationError("whole-pack hash does not match manifest");
       }
     } finally {
       packHash.dispose();
     }
 
+    this.requirePackClosure(id);
     this.sql.exec(
       "INSERT INTO installed_packs VALUES (?, ?, ?, ?, ?, ?, ?)",
       id,
@@ -587,57 +558,92 @@ export class PackStore {
     return insertedObjects;
   }
 
-  private validateAndStoreManifestObject(object: ObjectRow, bytes: Uint8Array): number {
-    if (bytes.byteLength > MAX_OBJECT_BYTES) {
-      throw new PackValidationError(`object ${object.position} exceeds the object byte limit`);
+  private validateAndStoreManifestObject(object: ObjectRow, bytes: Uint8Array): boolean {
+    if (bytes.byteLength > MAX_GIT_OBJECT_BYTES) {
+      throw new GitPackValidationError(`object ${object.position} exceeds the object byte limit`);
     }
     let validated;
     try {
       validated = this.kernel.validate(object.kind, bytes);
     } catch (error) {
       if (error instanceof WebAssembly.RuntimeError) throw error;
-      throw new PackValidationError(
+      throw new GitPackValidationError(
         `object ${object.position} is invalid: ${error instanceof Error ? error.message : "validation failed"}`,
       );
     }
-    if (!equalBytes(validated.id, new Uint8Array(object.id))) {
-      throw new PackValidationError(`object ${object.position} ID does not match manifest`);
+    if (!equalGitBytes(validated.id, new Uint8Array(object.id))) {
+      throw new GitPackValidationError(`object ${object.position} ID does not match manifest`);
     }
-    return this.storeValidatedObject(object.kind, validated.id, bytes, validated.references) ? 1 : 0;
-  }
-
-  private storeValidatedObject(
-    kind: number,
-    idBytes: Uint8Array,
-    bytes: Uint8Array,
-    references: Array<{ kind: number; id: Uint8Array }>,
-  ): boolean {
-    const id = exactBuffer(idBytes);
+    const id = exactGitBuffer(validated.id);
     const existing = this.sql
-      .exec<{ bytes: ArrayBuffer }>("SELECT bytes FROM objects WHERE kind = ? AND id = ?", kind, id)
-      .toArray();
-    if (existing.length !== 0) {
-      if (!equalBytes(new Uint8Array(existing[0].bytes), bytes)) {
+      .exec<{ bytes: ArrayBuffer }>("SELECT bytes FROM objects WHERE kind = ? AND id = ?", object.kind, id)
+      .toArray()[0];
+    if (existing !== undefined) {
+      if (!equalGitBytes(new Uint8Array(existing.bytes), bytes)) {
         throw new Error("content ID collision with different canonical bytes");
       }
       return false;
     }
     this.sql.exec(
       "INSERT INTO objects (kind, id, bytes) VALUES (?, ?, ?)",
-      kind,
+      object.kind,
       id,
-      exactBuffer(bytes),
+      exactGitBuffer(bytes),
     );
-    for (const reference of references) {
+    for (const reference of validated.references) {
       this.sql.exec(
         "INSERT INTO object_references VALUES (?, ?, ?, ?)",
-        kind,
+        object.kind,
         id,
         reference.kind,
-        exactBuffer(reference.id),
+        exactGitBuffer(reference.id),
       );
     }
     return true;
+  }
+
+  private requirePackClosure(id: ArrayBuffer) {
+    const missing = this.sql
+      .exec<MissingReferenceRow>(
+        `SELECT refs.object_kind, refs.object_id, refs.referenced_id
+         FROM object_references AS refs
+         JOIN pack_upload_objects AS packed
+           ON packed.pack_id = ?
+          AND packed.kind = refs.object_kind
+          AND packed.id = refs.object_id
+         WHERE refs.reference_kind != ?
+           AND NOT EXISTS (
+             SELECT 1 FROM objects AS target
+             WHERE target.kind = CASE refs.reference_kind
+               WHEN ? THEN ?
+               WHEN ? THEN ?
+               WHEN ? THEN ?
+               WHEN ? THEN ?
+               WHEN ? THEN ?
+             END
+               AND target.id = refs.referenced_id
+           )
+         ORDER BY refs.object_kind, refs.object_id, refs.reference_kind, refs.referenced_id
+         LIMIT 1`,
+        id,
+        GIT_REFERENCE_KIND.gitlink,
+        GIT_REFERENCE_KIND.blob,
+        GIT_OBJECT_KIND.blob,
+        GIT_REFERENCE_KIND.executable,
+        GIT_OBJECT_KIND.blob,
+        GIT_REFERENCE_KIND.symlink,
+        GIT_OBJECT_KIND.blob,
+        GIT_REFERENCE_KIND.tree,
+        GIT_OBJECT_KIND.tree,
+        GIT_REFERENCE_KIND.commit,
+        GIT_OBJECT_KIND.commit,
+      )
+      .toArray()[0];
+    if (missing !== undefined) {
+      throw new GitPackValidationError(
+        `object ${gitToHex(new Uint8Array(missing.object_id))} is missing referenced object ${gitToHex(new Uint8Array(missing.referenced_id))}`,
+      );
+    }
   }
 
   private upload(id: ArrayBuffer): UploadRow | undefined {

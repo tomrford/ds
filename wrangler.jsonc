@@ -13,15 +13,11 @@
     "bindings": [
       {
         "name": "REPOSITORIES",
-        "class_name": "Repository"
-      },
-      {
-        "name": "REPOSITORIES_GIT",
         "class_name": "RepositoryGit"
       },
       {
         "name": "CONTROL_PLANE",
-        "class_name": "ControlPlane"
+        "class_name": "ControlPlaneV2"
       }
     ]
   },
@@ -37,6 +33,11 @@
     {
       "tag": "v3",
       "new_sqlite_classes": ["RepositoryGit"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["ControlPlaneV2"],
+      "deleted_classes": ["Repository", "ControlPlane"]
     }
   ],
   "rules": [

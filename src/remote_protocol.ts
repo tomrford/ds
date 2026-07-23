@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { MAX_PROJECTION_NAME_BYTES } from "./projection_protocol";
+import { MAX_GIT_PROJECTION_NAME_BYTES } from "./projection_protocol";
 import {
   boundedStringSchema,
   firstZodMessage,
@@ -12,7 +12,7 @@ export const MAX_REMOTE_URL_BYTES = 1024;
 
 const encoder = new TextEncoder();
 
-const remoteNameSchema = boundedStringSchema("remote name", MAX_PROJECTION_NAME_BYTES).refine(
+const remoteNameSchema = boundedStringSchema("remote name", MAX_GIT_PROJECTION_NAME_BYTES).refine(
   validRemoteName,
   { error: "remote name must be a valid single-component Git ref name" },
 );
@@ -92,7 +92,7 @@ function validRemoteName(value: string): boolean {
         "~^:?*[\\/".includes(character)
       );
     }) ||
-    encoder.encode(value).byteLength > MAX_PROJECTION_NAME_BYTES
+    encoder.encode(value).byteLength > MAX_GIT_PROJECTION_NAME_BYTES
   );
 }
 

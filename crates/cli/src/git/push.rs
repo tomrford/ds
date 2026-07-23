@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 
-use devspace_machine_git::{
+use devspace_machine::{
     GitProcessEnvironment, MachineGitRepository, Oid, ProjectionGitCursor, ProjectionGitSnapshot,
     PushFailpoint, PushHead, QualifiedRef, push_with_journal,
 };
@@ -171,7 +171,7 @@ struct PushOutcome {
 
 async fn push_requested(
     repository: &MachineGitRepository,
-    transport: &devspace_machine_git::GitHttpTransport,
+    transport: &devspace_machine::GitHttpTransport,
     remote: &str,
     requested: &[RequestedBookmark],
     snapshot: &ProjectionGitSnapshot,
@@ -219,7 +219,7 @@ async fn push_requested(
     )
     .await
     {
-        Err(devspace_machine_git::JournalFlowError::AfterPushFailpoint { .. }) => {
+        Err(devspace_machine::JournalFlowError::AfterPushFailpoint { .. }) => {
             std::process::exit(86);
         }
         Err(error) => return Err(projection_error(remote, requested, error)),
@@ -284,13 +284,13 @@ async fn push_requested(
 fn projection_error(
     remote: &str,
     requested: &[RequestedBookmark],
-    error: devspace_machine_git::JournalFlowError,
+    error: devspace_machine::JournalFlowError,
 ) -> String {
     let message = error.to_string();
     if matches!(
         error,
-        devspace_machine_git::JournalFlowError::Projection(
-            devspace_machine_git::ProjectionError::ReadObject { .. }
+        devspace_machine::JournalFlowError::Projection(
+            devspace_machine::ProjectionError::ReadObject { .. }
         )
     ) && requested.len() == 1
     {

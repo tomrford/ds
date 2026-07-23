@@ -1,12 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
-import { RepositoryAuthority } from "./control_plane";
-import { HeadStore } from "./head_store";
-import { Kernel, equalBytes, exactBuffer } from "./kernel";
-import { PackStore } from "./pack_store";
-import { ProjectionStore } from "./projection_store";
-import { initializeSchema, purgeRepositoryData } from "./schema";
+import type { RepositoryAuthority } from "./control_plane";
+import { Kernel, equalGitBytes, exactGitBuffer } from "./kernel";
+import { OpGitStore } from "./op_store";
+import { GitPackStore } from "./pack_store";
+import { ProjectionGitStore } from "./projection_store";
+import { initializeGitSchema } from "./schema";
 
-class RepositoryAuthorityError extends Error {
+class RepositoryGitAuthorityError extends Error {
   constructor(
     message: string,
     readonly code: "repository-retired" | "repository-authority-stale",
@@ -17,26 +17,60 @@ class RepositoryAuthorityError extends Error {
 
 interface AuthorityRow extends Record<string, SqlStorageValue> {
   incarnation: ArrayBuffer;
-  user_id: string | null;
-  repository_id: string | null;
+  user_id: string;
+  repository_id: string;
   retired: number;
 }
 
-export class Repository extends DurableObject<Env> {
-  private readonly heads: HeadStore;
-  private readonly packs: PackStore;
-  private readonly projection: ProjectionStore;
+export class RepositoryGit extends DurableObject<Env> {
+  private readonly packs: GitPackStore;
+  private readonly ops: OpGitStore;
+  private readonly projection: ProjectionGitStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const sql = this.ctx.storage.sql;
     this.ctx.blockConcurrencyWhile(async () =>
-      this.ctx.storage.transactionSync(() => initializeSchema(sql)),
+      this.ctx.storage.transactionSync(() => initializeGitSchema(sql)),
     );
     const kernel = new Kernel();
-    this.heads = new HeadStore(this.ctx, sql, kernel);
-    this.packs = new PackStore(this.ctx, sql, kernel, this.heads);
-    this.projection = new ProjectionStore(this.ctx, sql, kernel);
+    this.packs = new GitPackStore(this.ctx, sql, kernel);
+    this.ops = new OpGitStore(this.ctx, sql, kernel);
+    this.projection = new ProjectionGitStore(this.ctx, sql, kernel);
+  }
+
+  initializeRepository(authority: RepositoryAuthority) {
+    try {
+      return this.ctx.storage.transactionSync(() => {
+        const state = this.authorityState();
+        if (state === undefined) {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO repository_state
+             (singleton, incarnation, user_id, repository_id, retired)
+             VALUES (1, ?, ?, ?, 0)`,
+            exactGitBuffer(incarnationBytes(authority.incarnation)),
+            authority.userId,
+            authority.repositoryId,
+          );
+          return { ok: true as const, initialized: true };
+        }
+        this.requireAuthority(authority);
+        return { ok: true as const, initialized: false };
+      });
+    } catch (error) {
+      return authorityFailure(error);
+    }
+  }
+
+  async retireRepository(authority: RepositoryAuthority) {
+    try {
+      const state = this.authorityState();
+      if (state !== undefined) this.requireAuthority(authority);
+      await this.ctx.storage.deleteAll();
+      return { ok: true as const, retired: true };
+    } catch (error) {
+      return authorityFailure(error);
+    }
   }
 
   putPackManifest(authority: RepositoryAuthority, packId: string, bytes: Uint8Array) {
@@ -44,98 +78,62 @@ export class Repository extends DurableObject<Env> {
   }
 
   putPackChunk(authority: RepositoryAuthority, packId: string, position: number, bytes: Uint8Array) {
-    return this.withAuthority(authority, () => this.packs.putPackChunk(packId, position, bytes));
+    return this.withAuthority(authority, () =>
+      this.packs.putPackChunk(packId, position, bytes),
+    );
   }
 
   installPack(authority: RepositoryAuthority, packId: string) {
     return this.withAuthority(authority, () => this.packs.installPack(packId));
   }
 
-  countObjects() {
-    return this.packs.countObjects();
-  }
-
-  countInstalledPacks() {
-    return this.packs.countInstalledPacks();
-  }
-
-  inventoryObjects(authority: RepositoryAuthority, value: unknown) {
-    return this.withAuthority(authority, () => this.packs.inventoryObjects(value));
-  }
-
-  initializeRepository(authority: RepositoryAuthority) {
-    return this.heads.initialize(authority);
-  }
-
-  retireRepository(authority: RepositoryAuthority) {
-    try {
-      return this.ctx.storage.transactionSync(() => {
-        const state = this.ctx.storage.sql
-          .exec<AuthorityRow>(
-            `SELECT incarnation, user_id, repository_id, retired
-             FROM repository_state WHERE singleton = 1`,
-          )
-          .toArray()[0];
-        if (state === undefined) {
-          this.ctx.storage.sql.exec(
-            `INSERT INTO repository_state
-             (singleton, incarnation, user_id, repository_id, retired, cursor,
-              receipt_count, receipt_head_count)
-             VALUES (1, ?, ?, ?, 1, 0, 0, 0)`,
-            exactBuffer(hexBytes(authority.incarnation)),
-            authority.userId,
-            authority.repositoryId,
-          );
-          purgeRepositoryData(this.ctx.storage.sql);
-          return { ok: true as const, retired: true };
-        }
-        this.requireAuthority(authority, true);
-        if (state.retired === 0) {
-          const changed = this.ctx.storage.sql
-            .exec<{ singleton: number }>(
-              `UPDATE repository_state SET retired = 1
-               WHERE singleton = 1 AND retired = 0 RETURNING singleton`,
-            )
-            .toArray();
-          if (changed.length !== 1) {
-            throw new Error("repository retirement did not change exactly one active state row");
-          }
-        }
-        purgeRepositoryData(this.ctx.storage.sql);
-        return { ok: true as const, retired: true };
-      });
-    } catch (error) {
-      return authorityFailure(error);
-    }
-  }
-
-  getHeads(authority: RepositoryAuthority, incarnationValue: unknown) {
-    return this.withAuthority(authority, () => this.heads.get(incarnationValue));
-  }
-
-  transactHeads(authority: RepositoryAuthority, value: unknown) {
-    return this.withAuthority(authority, () => this.heads.transact(value));
-  }
-
-  listInstalledPacks(authority: RepositoryAuthority, incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
+  listInstalledPacks(authority: RepositoryAuthority, afterValue: unknown, throughValue: unknown) {
     return this.withAuthority(authority, () =>
-      this.packs.listInstalledPacks(incarnationValue, afterValue, throughValue),
+      this.packs.listInstalledPacks(afterValue, throughValue),
     );
   }
 
-  getInstalledPackManifest(authority: RepositoryAuthority, packId: string, incarnationValue: unknown) {
+  getInstalledPackManifest(authority: RepositoryAuthority, packId: string) {
+    return this.withAuthority(authority, () => this.packs.getInstalledPackManifest(packId));
+  }
+
+  getInstalledPackChunk(authority: RepositoryAuthority, packId: string, position: number) {
     return this.withAuthority(authority, () =>
-      this.packs.getInstalledPackManifest(packId, incarnationValue),
+      this.packs.getInstalledPackChunk(packId, position),
     );
   }
 
-  getInstalledPackChunk(authority: RepositoryAuthority, packId: string, position: number, incarnationValue: unknown) {
-    return this.withAuthority(authority, () =>
-      this.packs.getInstalledPackChunk(packId, position, incarnationValue),
-    );
+  putOpObject(
+    authority: RepositoryAuthority,
+    kind: "view" | "operation",
+    id: string,
+    bytes: Uint8Array,
+  ) {
+    return this.withAuthority(authority, () => this.ops.put(kind, id, bytes));
   }
 
-  getProjection(authority: RepositoryAuthority, incarnationValue: unknown, afterValue: unknown, throughValue: unknown) {
+  getOpObject(authority: RepositoryAuthority, kind: "view" | "operation", id: string) {
+    return this.withAuthority(authority, () => this.ops.get(kind, id));
+  }
+
+  inventoryOpObjects(authority: RepositoryAuthority, value: unknown) {
+    return this.withAuthority(authority, () => this.ops.inventory(value));
+  }
+
+  getOpHeads(authority: RepositoryAuthority) {
+    return this.withAuthority(authority, () => this.ops.getHeads(authority.incarnation));
+  }
+
+  transactOpHeads(authority: RepositoryAuthority, value: unknown) {
+    return this.withAuthority(authority, () => this.ops.transactHeads(value));
+  }
+
+  getProjection(
+    authority: RepositoryAuthority,
+    incarnationValue: unknown,
+    afterValue: unknown,
+    throughValue: unknown,
+  ) {
     return this.withAuthority(authority, () =>
       this.projection.get(incarnationValue, afterValue, throughValue),
     );
@@ -165,8 +163,14 @@ export class Repository extends DurableObject<Env> {
     );
   }
 
-  getProjectionPushReplay(authority: RepositoryAuthority, batchId: unknown, incarnationValue: unknown) {
-    return this.withAuthority(authority, () => this.projection.replay(batchId, incarnationValue));
+  getProjectionPushReplay(
+    authority: RepositoryAuthority,
+    batchId: unknown,
+    incarnationValue: unknown,
+  ) {
+    return this.withAuthority(authority, () =>
+      this.projection.replay(batchId, incarnationValue),
+    );
   }
 
   recoverProjectionPush(authority: RepositoryAuthority, batchId: unknown, value: unknown) {
@@ -175,35 +179,59 @@ export class Repository extends DurableObject<Env> {
     );
   }
 
+  countObjects() {
+    return this.packs.countObjects();
+  }
+
+  countObjectReferences() {
+    return this.packs.countObjectReferences();
+  }
+
+  countInstalledPacks() {
+    return this.packs.countInstalledPacks();
+  }
+
+  countQuarantinedPacks() {
+    return this.packs.countQuarantinedPacks();
+  }
+
+  countOpObjects() {
+    return this.ops.countObjects();
+  }
+
   private withAuthority<T>(authority: RepositoryAuthority, operation: () => T) {
     try {
-      this.requireAuthority(authority, false);
+      this.requireAuthority(authority);
     } catch (error) {
       return authorityFailure(error);
     }
     return operation();
   }
 
-  private requireAuthority(authority: RepositoryAuthority, allowRetired: boolean) {
-    const state = this.ctx.storage.sql
+  private authorityState(): AuthorityRow | undefined {
+    return this.ctx.storage.sql
       .exec<AuthorityRow>(
         `SELECT incarnation, user_id, repository_id, retired
          FROM repository_state WHERE singleton = 1`,
       )
       .toArray()[0];
+  }
+
+  private requireAuthority(authority: RepositoryAuthority) {
+    const state = this.authorityState();
     if (
       state === undefined ||
       state.user_id !== authority.userId ||
       state.repository_id !== authority.repositoryId ||
-      !equalBytes(new Uint8Array(state.incarnation), hexBytes(authority.incarnation))
+      !equalGitBytes(new Uint8Array(state.incarnation), incarnationBytes(authority.incarnation))
     ) {
-      throw new RepositoryAuthorityError(
+      throw new RepositoryGitAuthorityError(
         "repository authority is stale",
         "repository-authority-stale",
       );
     }
-    if (!allowRetired && state.retired !== 0) {
-      throw new RepositoryAuthorityError("repository was deleted", "repository-retired");
+    if (state.retired !== 0) {
+      throw new RepositoryGitAuthorityError("repository was deleted", "repository-retired");
     }
   }
 }
@@ -214,13 +242,13 @@ function authorityFailure(error: unknown) {
     status: 409,
     error: error instanceof Error ? error.message : "repository authority is stale",
     code:
-      error instanceof RepositoryAuthorityError
+      error instanceof RepositoryGitAuthorityError
         ? error.code
         : "repository-authority-stale",
   };
 }
 
-function hexBytes(value: string): Uint8Array {
+function incarnationBytes(value: string): Uint8Array {
   if (!/^[0-9a-f]{32}$/.test(value)) throw new Error("repository authority is invalid");
   return Uint8Array.from({ length: 16 }, (_, index) =>
     Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),

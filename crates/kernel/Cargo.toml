@@ -8,4 +8,4 @@ rust-version.workspace = true
 [dependencies]
 blake2.workspace = true
 prost.workspace = true
-
+sha1-checked = { version = "=0.10.0", default-features = false }

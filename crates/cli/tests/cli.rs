@@ -4,8 +4,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
+use devspace_machine::MachineGitRepository as MachineRepository;
 use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
-use devspace_machine_git::MachineGitRepository as MachineRepository;
 use jj_lib::default_index::DefaultIndexStore;
 use jj_lib::default_submodule_store::DefaultSubmoduleStore;
 use jj_lib::git_backend::GitBackend;

@@ -8,13 +8,6 @@ buildWasm({
   budget: 200 * 1024,
 });
 
-buildWasm({
-  packageName: "devspace-kernel-git-wasm",
-  artifactName: "devspace_kernel_git_wasm.wasm",
-  outputName: "kernel-git.wasm",
-  budget: 200 * 1024,
-});
-
 function buildWasm({ packageName, artifactName, outputName, budget }) {
   run("cargo", [
     "build",

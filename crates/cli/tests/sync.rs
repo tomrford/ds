@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use devspace_machine::MachineGitRepository as MachineRepository;
 use devspace_machine::{
-    CatalogEntry, MachineSyncStore, PendingHeadBatch, PendingHeadTransaction, RepositoryId,
-    RepositoryIdentity, RepositoryIncarnation, RepositoryName, SyncState,
+    CatalogEntry, OpSyncState, OpSyncStore, PendingOpHeadBatch, PendingOpHeadTransaction,
+    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
 };
-use devspace_machine_git::MachineGitRepository as MachineRepository;
 use jj_lib::object_id::ObjectId as _;
 #[cfg(unix)]
 use stalling_server::StallingServer;
@@ -340,7 +340,7 @@ async fn sync_run_reports_offline_transport_failure_without_mutating_durable_sta
     let config = write_cli_config(temp.path());
 
     drop(store.try_lock_repository_sync(&entry.identity).unwrap());
-    let sync_store = MachineSyncStore::open(store.repository_sync_path(&entry.identity)).unwrap();
+    let sync_store = OpSyncStore::open(store.repository_sync_path(&entry.identity)).unwrap();
     drop(sync_store.lock().unwrap());
     let before = snapshot_files(store.root());
     let operation_before = MachineRepository::open(&entry.native_repository_path, &settings())
@@ -416,7 +416,7 @@ async fn status_reports_local_sync_state_even_when_boundary_sync_is_disabled() {
     assert!(!stderr(&log).contains("sync:"), "{}", stderr(&log));
 
     let store = machine_store(temp.path());
-    let sync_store = MachineSyncStore::open(store.repository_sync_path(&entry.identity)).unwrap();
+    let sync_store = OpSyncStore::open(store.repository_sync_path(&entry.identity)).unwrap();
     let pending = ds(&checkout, temp.path(), &config, &["status"]);
     assert!(pending.status.success(), "{}", stderr(&pending));
     assert!(
@@ -427,9 +427,9 @@ async fn status_reports_local_sync_state_even_when_boundary_sync_is_disabled() {
 
     let accepted_heads = operation_head_ids(&entry.native_repository_path).await;
     sync_store
-        .save_state(&SyncState {
+        .save_state(&OpSyncState {
             accepted_heads: accepted_heads.clone(),
-            ..SyncState::default()
+            ..OpSyncState::default()
         })
         .unwrap();
     let synchronized = ds(&checkout, temp.path(), &config, &["status"]);
@@ -443,13 +443,13 @@ async fn status_reports_local_sync_state_even_when_boundary_sync_is_disabled() {
     let accepted_head = *accepted_heads.first().unwrap();
     sync_store
         .save_outbox(
-            &PendingHeadBatch::from_transactions(vec![
-                PendingHeadTransaction {
+            &PendingOpHeadBatch::from_transactions(vec![
+                PendingOpHeadTransaction {
                     idempotency_key: [1; 16],
                     new_head: accepted_head,
                     observed_heads: BTreeSet::new(),
                 },
-                PendingHeadTransaction {
+                PendingOpHeadTransaction {
                     idempotency_key: [2; 16],
                     new_head: [7; 64],
                     observed_heads: BTreeSet::new(),
@@ -495,27 +495,27 @@ async fn sync_status_snapshots_catalog_rows_and_daemon_liveness_from_local_state
         .unwrap();
 
     let accepted_heads = operation_head_ids(&in_sync.native_repository_path).await;
-    MachineSyncStore::open(store.repository_sync_path(&in_sync.identity))
+    OpSyncStore::open(store.repository_sync_path(&in_sync.identity))
         .unwrap()
-        .save_state(&SyncState {
+        .save_state(&OpSyncState {
             accepted_heads,
-            ..SyncState::default()
+            ..OpSyncState::default()
         })
         .unwrap();
     let pending_head = *operation_head_ids(&pending.native_repository_path)
         .await
         .first()
         .unwrap();
-    MachineSyncStore::open(store.repository_sync_path(&pending.identity))
+    OpSyncStore::open(store.repository_sync_path(&pending.identity))
         .unwrap()
         .save_outbox(
-            &PendingHeadBatch::from_transactions(vec![
-                PendingHeadTransaction {
+            &PendingOpHeadBatch::from_transactions(vec![
+                PendingOpHeadTransaction {
                     idempotency_key: [1; 16],
                     new_head: pending_head,
                     observed_heads: BTreeSet::new(),
                 },
-                PendingHeadTransaction {
+                PendingOpHeadTransaction {
                     idempotency_key: [2; 16],
                     new_head: [7; 64],
                     observed_heads: BTreeSet::new(),

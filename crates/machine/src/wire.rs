@@ -3,10 +3,6 @@ use std::fmt;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::sync_engine::TransportError;
-
-const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
-
 #[derive(Debug, Deserialize)]
 pub(crate) struct ErrorResponse {
     error: String,
@@ -21,33 +17,6 @@ impl fmt::Display for ErrorResponse {
             formatter.write_str(&self.error)
         }
     }
-}
-
-pub(crate) async fn send(
-    request: reqwest::RequestBuilder,
-    authorization: &reqwest::header::HeaderValue,
-    machine_id: &str,
-    incarnation: &str,
-) -> Result<reqwest::Response, TransportError> {
-    let response = request
-        .header(reqwest::header::AUTHORIZATION, authorization)
-        .header("x-devspace-machine-id", machine_id)
-        .header("x-devspace-incarnation", incarnation)
-        .send()
-        .await?;
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response);
-    }
-    let message = read_bounded(response, MAX_ERROR_RESPONSE_BYTES)
-        .await
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ErrorResponse>(&bytes).ok())
-        .map_or_else(
-            || "cloud request failed without an error body".to_owned(),
-            |body| body.to_string(),
-        );
-    Err(format!("cloud request failed with status {status}: {message}").into())
 }
 
 pub(crate) async fn read_bounded(
@@ -77,47 +46,6 @@ pub(crate) enum BoundedResponseError {
     TooLarge { limit: usize },
     #[error(transparent)]
     Request(#[from] reqwest::Error),
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
-    use std::thread;
-
-    use reqwest::header::HeaderValue;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn retired_repository_error_is_coded_and_comprehensible() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut connection, _) = listener.accept().unwrap();
-            let mut request = [0; 4096];
-            let _ = connection.read(&mut request).unwrap();
-            let body = r#"{"error":"repository was deleted","code":"repository-retired"}"#;
-            write!(
-                connection,
-                "HTTP/1.1 409 Conflict\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-        });
-        let error = send(
-            reqwest::Client::new().get(format!("http://{address}/heads")),
-            &HeaderValue::from_static("Bearer test-secret"),
-            &"12".repeat(16),
-            &"34".repeat(16),
-        )
-        .await
-        .unwrap_err();
-        server.join().unwrap();
-        let message = error.to_string();
-        assert!(message.contains("repository-retired: repository was deleted"));
-        assert!(!message.contains(r#"{"error""#));
-    }
 }
 
 pub fn encode_lower_hex(bytes: &[u8]) -> String {

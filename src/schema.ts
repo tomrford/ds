@@ -1,4 +1,4 @@
-export function initializeSchema(sql: SqlStorage) {
+export function initializeGitSchema(sql: SqlStorage) {
   sql.exec(`
     CREATE TABLE IF NOT EXISTS objects (
       kind INTEGER NOT NULL,
@@ -9,9 +9,9 @@ export function initializeSchema(sql: SqlStorage) {
     CREATE TABLE IF NOT EXISTS object_references (
       object_kind INTEGER NOT NULL,
       object_id BLOB NOT NULL,
-      referenced_kind INTEGER NOT NULL,
+      reference_kind INTEGER NOT NULL,
       referenced_id BLOB NOT NULL,
-      PRIMARY KEY (object_kind, object_id, referenced_kind, referenced_id)
+      PRIMARY KEY (object_kind, object_id, reference_kind, referenced_id)
     ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS pack_uploads (
       pack_id BLOB PRIMARY KEY,
@@ -101,23 +101,33 @@ export function initializeSchema(sql: SqlStorage) {
       hash BLOB NOT NULL,
       PRIMARY KEY (pack_id, position)
     ) WITHOUT ROWID;
-  `);
-
-  sql.exec(`
     CREATE TABLE IF NOT EXISTS repository_state (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
       incarnation BLOB NOT NULL,
-      user_id TEXT,
-      repository_id TEXT,
+      user_id TEXT NOT NULL,
+      repository_id TEXT NOT NULL,
       retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
-      cursor INTEGER NOT NULL CHECK (cursor >= 0),
-      receipt_count INTEGER NOT NULL CHECK (receipt_count >= 0),
-      receipt_head_count INTEGER NOT NULL CHECK (receipt_head_count >= 0)
+      op_cursor INTEGER NOT NULL DEFAULT 0 CHECK (op_cursor >= 0),
+      op_receipt_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_count >= 0),
+      op_receipt_head_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_head_count >= 0)
     );
-    CREATE TABLE IF NOT EXISTS operation_heads (
+    CREATE TABLE IF NOT EXISTS op_objects (
+      kind INTEGER NOT NULL CHECK (kind IN (0, 1)),
+      id BLOB NOT NULL,
+      bytes BLOB NOT NULL,
+      PRIMARY KEY (kind, id)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS op_object_references (
+      object_kind INTEGER NOT NULL CHECK (object_kind IN (0, 1)),
+      object_id BLOB NOT NULL,
+      reference_kind INTEGER NOT NULL CHECK (reference_kind IN (0, 1, 2)),
+      referenced_id BLOB NOT NULL,
+      PRIMARY KEY (object_kind, object_id, reference_kind, referenced_id)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS op_heads (
       id BLOB PRIMARY KEY
     ) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS head_transactions (
+    CREATE TABLE IF NOT EXISTS op_head_transactions (
       incarnation BLOB NOT NULL,
       idempotency_key BLOB NOT NULL,
       request_hash BLOB NOT NULL,
@@ -125,37 +135,26 @@ export function initializeSchema(sql: SqlStorage) {
       created_at_ms INTEGER NOT NULL,
       PRIMARY KEY (incarnation, idempotency_key)
     ) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS head_transactions_created_at
-      ON head_transactions (created_at_ms);
-    CREATE TABLE IF NOT EXISTS head_transaction_heads (
+    CREATE INDEX IF NOT EXISTS op_head_transactions_created_at
+      ON op_head_transactions (created_at_ms);
+    CREATE TABLE IF NOT EXISTS op_head_transaction_heads (
       incarnation BLOB NOT NULL,
       idempotency_key BLOB NOT NULL,
       position INTEGER NOT NULL,
       id BLOB NOT NULL,
       PRIMARY KEY (incarnation, idempotency_key, position)
     ) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS pending_observed_heads (
-      id BLOB PRIMARY KEY
-    ) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS complete_object_closures (
-      kind INTEGER NOT NULL,
-      id BLOB NOT NULL,
-      PRIMARY KEY (kind, id)
-    ) WITHOUT ROWID;
-  `);
-
-  sql.exec(`
-    CREATE TABLE IF NOT EXISTS projection_meta (
+    CREATE TABLE IF NOT EXISTS projection_git_meta (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
       next_fence INTEGER NOT NULL CHECK (next_fence >= 0),
       activation_cursor INTEGER NOT NULL CHECK (activation_cursor >= 0)
     );
-    INSERT OR IGNORE INTO projection_meta VALUES (1, 0, 0);
-    CREATE TABLE IF NOT EXISTS git_receipts (
-      git_oid BLOB PRIMARY KEY,
-      public_commit_id BLOB NOT NULL
+    INSERT OR IGNORE INTO projection_git_meta VALUES (1, 0, 0);
+    CREATE TABLE IF NOT EXISTS projection_git_receipts (
+      canonical_oid BLOB PRIMARY KEY,
+      public_oid BLOB NOT NULL
     ) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS projection_batches (
+    CREATE TABLE IF NOT EXISTS projection_git_batches (
       batch_id BLOB PRIMARY KEY,
       remote TEXT NOT NULL,
       owner_machine BLOB NOT NULL,
@@ -163,23 +162,24 @@ export function initializeSchema(sql: SqlStorage) {
       request_hash BLOB NOT NULL,
       created_at_ms INTEGER NOT NULL
     ) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS projection_states (
+    CREATE TABLE IF NOT EXISTS projection_git_states (
       state_id INTEGER PRIMARY KEY AUTOINCREMENT,
       remote TEXT NOT NULL,
       bookmark TEXT NOT NULL,
-      git_oid BLOB NOT NULL,
-      canonical_commit_id BLOB NOT NULL,
-      public_commit_id BLOB NOT NULL,
+      canonical_oid BLOB NOT NULL,
+      public_oid BLOB NOT NULL,
       hidden_set_id BLOB,
       pending_batch_id BLOB,
       activation_seq INTEGER UNIQUE
     );
-    CREATE INDEX IF NOT EXISTS projection_states_remote_bookmark_activation
-      ON projection_states (remote, bookmark, activation_seq);
-    CREATE INDEX IF NOT EXISTS projection_states_pending_batch
-      ON projection_states (pending_batch_id)
+    CREATE INDEX IF NOT EXISTS projection_git_states_remote_bookmark_activation
+      ON projection_git_states (remote, bookmark, activation_seq);
+    CREATE INDEX IF NOT EXISTS projection_git_states_pending_batch
+      ON projection_git_states (pending_batch_id)
       WHERE pending_batch_id IS NOT NULL;
-    CREATE TABLE IF NOT EXISTS projection_batch_refs (
+    CREATE INDEX IF NOT EXISTS projection_git_states_canonical_oid
+      ON projection_git_states (canonical_oid);
+    CREATE TABLE IF NOT EXISTS projection_git_batch_refs (
       batch_id BLOB NOT NULL,
       position INTEGER NOT NULL,
       remote TEXT NOT NULL,
@@ -189,13 +189,20 @@ export function initializeSchema(sql: SqlStorage) {
       PRIMARY KEY (batch_id, position),
       UNIQUE (remote, bookmark)
     ) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS projection_cursors (
+    CREATE TABLE IF NOT EXISTS projection_git_cursors (
       remote TEXT NOT NULL,
       bookmark TEXT NOT NULL,
       state_id INTEGER NOT NULL,
       PRIMARY KEY (remote, bookmark)
     ) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS projection_batch_results (
+    CREATE TABLE IF NOT EXISTS projection_git_identity_cursors (
+      remote TEXT NOT NULL,
+      bookmark TEXT NOT NULL,
+      oid BLOB NOT NULL,
+      activation_seq INTEGER NOT NULL CHECK (activation_seq >= 0),
+      PRIMARY KEY (remote, bookmark)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS projection_git_batch_results (
       batch_id BLOB PRIMARY KEY,
       remote TEXT NOT NULL,
       request_hash BLOB NOT NULL,
@@ -203,36 +210,41 @@ export function initializeSchema(sql: SqlStorage) {
       outcome TEXT NOT NULL CHECK (outcome IN ('accepted', 'aborted')),
       finished_at_ms INTEGER NOT NULL
     ) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS projection_batch_results_finished_at
-      ON projection_batch_results (finished_at_ms);
-    CREATE TABLE IF NOT EXISTS projection_recovery_claims (
+    CREATE INDEX IF NOT EXISTS projection_git_batch_results_finished_at
+      ON projection_git_batch_results (finished_at_ms);
+    CREATE TABLE IF NOT EXISTS projection_git_recovery_claims (
       batch_id BLOB PRIMARY KEY
     ) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS projection_fetch_results (
+    CREATE TABLE IF NOT EXISTS projection_git_fetch_results (
       fetch_id BLOB PRIMARY KEY,
       remote TEXT NOT NULL,
       request_hash BLOB NOT NULL,
       activation_cursor INTEGER NOT NULL CHECK (activation_cursor >= 0),
       created_at_ms INTEGER NOT NULL
     ) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS projection_fetch_results_created_at
-      ON projection_fetch_results (created_at_ms);
-    CREATE TABLE IF NOT EXISTS remotes (
+    CREATE INDEX IF NOT EXISTS projection_git_fetch_results_created_at
+      ON projection_git_fetch_results (created_at_ms);
+    CREATE TABLE IF NOT EXISTS projection_git_remotes (
       name TEXT PRIMARY KEY,
       url TEXT NOT NULL
     ) WITHOUT ROWID;
   `);
-}
-
-export function purgeRepositoryData(sql: SqlStorage) {
-  const tables = sql
-    .exec<{ name: string }>(
-      `SELECT name FROM sqlite_master
-       WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'repository_state'`,
-    )
+  const repositoryColumns = sql
+    .exec<{ name: string }>("PRAGMA table_info(repository_state)")
     .toArray();
-  for (const { name } of tables) {
-    sql.exec(`DELETE FROM "${name}"`);
+  if (!repositoryColumns.some((column) => column.name === "op_cursor")) {
+    sql.exec(
+      "ALTER TABLE repository_state ADD COLUMN op_cursor INTEGER NOT NULL DEFAULT 0 CHECK (op_cursor >= 0)",
+    );
   }
-  sql.exec("DELETE FROM sqlite_sequence");
+  if (!repositoryColumns.some((column) => column.name === "op_receipt_count")) {
+    sql.exec(
+      "ALTER TABLE repository_state ADD COLUMN op_receipt_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_count >= 0)",
+    );
+  }
+  if (!repositoryColumns.some((column) => column.name === "op_receipt_head_count")) {
+    sql.exec(
+      "ALTER TABLE repository_state ADD COLUMN op_receipt_head_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_head_count >= 0)",
+    );
+  }
 }

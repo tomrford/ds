@@ -1,135 +1,20 @@
-//! Mirrors `jj_lib::content_hash`, which defines every object ID.
+use alloc::string::ToString;
 
-use blake2::digest::Update;
-use blake2::{Blake2b512, Digest};
+use sha1_checked::{Digest, Sha1};
 
-pub(crate) trait ContentHash {
-    fn hash(&self, state: &mut Blake2b512);
-}
+use crate::{HashError, ObjectKind, Oid};
 
-pub(crate) fn content_id(value: &impl ContentHash) -> [u8; 64] {
-    let mut state = Blake2b512::default();
-    value.hash(&mut state);
-    state.finalize().into()
-}
-
-pub struct RawHasher(Blake2b512);
-
-impl RawHasher {
-    pub fn new() -> Self {
-        Self(Blake2b512::default())
+pub fn object_id(kind: ObjectKind, payload: &[u8]) -> Result<Oid, HashError> {
+    let mut hasher = Sha1::builder().safe_hash(false).build();
+    Digest::update(&mut hasher, kind.as_bytes());
+    Digest::update(&mut hasher, b" ");
+    Digest::update(&mut hasher, payload.len().to_string().as_bytes());
+    Digest::update(&mut hasher, b"\0");
+    Digest::update(&mut hasher, payload);
+    let result = hasher.try_finalize();
+    if result.has_collision() {
+        return Err(HashError::CollisionDetected);
     }
-
-    pub fn update(&mut self, bytes: &[u8]) {
-        Update::update(&mut self.0, bytes);
-    }
-
-    pub fn finalize(self) -> [u8; 64] {
-        self.0.finalize().into()
-    }
-}
-
-impl Default for RawHasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub(crate) fn raw_id(bytes: &[u8]) -> [u8; 64] {
-    let mut hasher = RawHasher::new();
-    hasher.update(bytes);
-    hasher.finalize()
-}
-
-impl ContentHash for bool {
-    fn hash(&self, state: &mut Blake2b512) {
-        (*self as u8).hash(state);
-    }
-}
-
-impl ContentHash for u8 {
-    fn hash(&self, state: &mut Blake2b512) {
-        Update::update(state, &[*self]);
-    }
-}
-
-impl ContentHash for u32 {
-    fn hash(&self, state: &mut Blake2b512) {
-        Update::update(state, &self.to_le_bytes());
-    }
-}
-
-impl ContentHash for i32 {
-    fn hash(&self, state: &mut Blake2b512) {
-        Update::update(state, &self.to_le_bytes());
-    }
-}
-
-impl ContentHash for u64 {
-    fn hash(&self, state: &mut Blake2b512) {
-        Update::update(state, &self.to_le_bytes());
-    }
-}
-
-impl ContentHash for i64 {
-    fn hash(&self, state: &mut Blake2b512) {
-        Update::update(state, &self.to_le_bytes());
-    }
-}
-
-impl<T: ContentHash> ContentHash for [T] {
-    fn hash(&self, state: &mut Blake2b512) {
-        (self.len() as u64).hash(state);
-        for item in self {
-            item.hash(state);
-        }
-    }
-}
-
-impl<T: ContentHash> ContentHash for Vec<T> {
-    fn hash(&self, state: &mut Blake2b512) {
-        self.as_slice().hash(state);
-    }
-}
-
-impl ContentHash for str {
-    fn hash(&self, state: &mut Blake2b512) {
-        self.as_bytes().hash(state);
-    }
-}
-
-impl ContentHash for String {
-    fn hash(&self, state: &mut Blake2b512) {
-        self.as_str().hash(state);
-    }
-}
-
-impl<T: ContentHash> ContentHash for Option<T> {
-    fn hash(&self, state: &mut Blake2b512) {
-        match self {
-            None => 0_u32.hash(state),
-            Some(value) => {
-                1_u32.hash(state);
-                value.hash(state);
-            }
-        }
-    }
-}
-
-impl<A: ContentHash, B: ContentHash> ContentHash for (A, B) {
-    fn hash(&self, state: &mut Blake2b512) {
-        self.0.hash(state);
-        self.1.hash(state);
-    }
-}
-
-pub(crate) fn hash_map<'a, K: ContentHash + 'a, V: ContentHash + 'a>(
-    entries: impl ExactSizeIterator<Item = (&'a K, &'a V)>,
-    state: &mut Blake2b512,
-) {
-    (entries.len() as u64).hash(state);
-    for (key, value) in entries {
-        key.hash(state);
-        value.hash(state);
-    }
+    let bytes: [u8; 20] = (*result.hash()).into();
+    Ok(Oid(bytes))
 }

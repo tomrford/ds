@@ -677,7 +677,6 @@ dependencies = [
  "blake2",
  "clap",
  "devspace-machine",
- "devspace-machine-git",
  "dunce",
  "etcetera",
  "futures 0.3.32",
@@ -700,40 +699,25 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "prost",
-]
-
-[[package]]
-name = "devspace-kernel-git"
-version = "0.1.0"
-dependencies = [
- "blake2",
- "prost",
  "sha1-checked",
 ]
 
 [[package]]
-name = "devspace-kernel-git-oracle"
+name = "devspace-kernel-oracle"
 version = "0.0.0"
 dependencies = [
- "devspace-kernel-git",
- "devspace-machine-git",
+ "devspace-kernel",
+ "devspace-machine",
  "futures 0.3.32",
  "jj-lib",
  "tempfile",
 ]
 
 [[package]]
-name = "devspace-kernel-git-wasm"
-version = "0.1.0"
-dependencies = [
- "blake2",
- "devspace-kernel-git",
-]
-
-[[package]]
 name = "devspace-kernel-wasm"
 version = "0.1.0"
 dependencies = [
+ "blake2",
  "devspace-kernel",
 ]
 
@@ -743,24 +727,6 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "devspace-kernel",
- "devspace-machine-git",
- "futures 0.3.32",
- "jj-lib",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "devspace-machine-git"
-version = "0.1.0"
-dependencies = [
- "blake2",
- "devspace-kernel-git",
  "futures 0.3.32",
  "gix",
  "jj-lib",
@@ -770,6 +736,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
 ]
 
 [[package]]

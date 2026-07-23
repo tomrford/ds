@@ -4,7 +4,7 @@ use std::process::Command;
 use devspace_machine::{
     CatalogEntry, ControlPlaneClient, MachineConfig, MachineStore, encode_lower_hex,
 };
-use devspace_machine_git::{GitHttpTransport, PendingProjectionGitBatch};
+use devspace_machine::{GitHttpTransport, PendingProjectionGitBatch};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;

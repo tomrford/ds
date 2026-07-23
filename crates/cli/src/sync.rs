@@ -8,7 +8,7 @@ use devspace_machine::{
     CatalogEntry, MachineConfig, MachineStore, MachineStoreError, RepositoryIdentity,
     RepositoryName, RepositorySyncGuard,
 };
-use devspace_machine_git::{
+use devspace_machine::{
     GitHttpTransport, MachineGitRepository, OpSyncEngine, OpSyncEngineError, OpSyncStore,
 };
 use jj_cli::cli_util::CommandHelper;

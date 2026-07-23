@@ -1,4 +1,19 @@
-use devspace_kernel::{ObjectKind, RawHasher, validate};
+#![no_std]
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::string::ToString;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use blake2::digest::Update;
+use blake2::{Blake2b512, Digest};
+use devspace_kernel::ops::{
+    OpObjectKind, OpReferenceKind, OpValidatedObject, ValidationError as OpValidationError,
+    validate_op,
+};
+use devspace_kernel::{ObjectKind, ReferenceKind, validate};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_alloc(length: u32) -> u32 {
@@ -14,7 +29,7 @@ pub unsafe extern "C" fn kernel_dealloc(pointer: u32, length: u32) {
     if length == 0 {
         return;
     }
-    let slice = std::ptr::slice_from_raw_parts_mut(pointer as *mut u8, length as usize);
+    let slice = core::ptr::slice_from_raw_parts_mut(pointer as *mut u8, length as usize);
     // SAFETY: The caller contract requires the exact allocation returned by this module.
     unsafe { drop(Box::from_raw(slice)) };
 }
@@ -34,7 +49,7 @@ pub unsafe extern "C" fn kernel_validate(kind: u32, pointer: u32, length: u32) -
         &[]
     } else {
         // SAFETY: The caller contract requires a live, initialized input allocation.
-        unsafe { std::slice::from_raw_parts(pointer as *const u8, length as usize) }
+        unsafe { core::slice::from_raw_parts(pointer as *const u8, length as usize) }
     };
     let response = match u8::try_from(kind)
         .ok()
@@ -49,12 +64,47 @@ pub unsafe extern "C" fn kernel_validate(kind: u32, pointer: u32, length: u32) -
     (u64::from(length) << 32) | u64::from(pointer)
 }
 
+/// Validates a stock jj simple operation-store view.
+///
+/// # Safety
+///
+/// `pointer` and `length` must identify a live, initialized input allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kernel_validate_view(pointer: u32, length: u32) -> u64 {
+    // SAFETY: Forwarding the caller contract unchanged.
+    unsafe { validate_op_input(OpObjectKind::View, pointer, length) }
+}
+
+/// Validates a stock jj simple operation-store operation.
+///
+/// # Safety
+///
+/// `pointer` and `length` must identify a live, initialized input allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kernel_validate_operation(pointer: u32, length: u32) -> u64 {
+    // SAFETY: Forwarding the caller contract unchanged.
+    unsafe { validate_op_input(OpObjectKind::Operation, pointer, length) }
+}
+
+unsafe fn validate_op_input(kind: OpObjectKind, pointer: u32, length: u32) -> u64 {
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: The caller contract requires a live, initialized input allocation.
+        unsafe { core::slice::from_raw_parts(pointer as *const u8, length as usize) }
+    };
+    let response = encode_op(validate_op(kind, input));
+    let length = response.len() as u32;
+    let pointer = leak(response);
+    (u64::from(length) << 32) | u64::from(pointer)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_hash_new() -> u32 {
     Box::into_raw(Box::new(RawHasher::new())) as u32
 }
 
-/// Adds bytes to a raw Blake2b-512 hash state.
+/// Adds bytes to a raw Blake2b-512 hash state used for pack and chunk IDs.
 ///
 /// # Safety
 ///
@@ -66,7 +116,7 @@ pub unsafe extern "C" fn kernel_hash_update(state: u32, pointer: u32, length: u3
         &[]
     } else {
         // SAFETY: The caller contract requires a live, initialized input allocation.
-        unsafe { std::slice::from_raw_parts(pointer as *const u8, length as usize) }
+        unsafe { core::slice::from_raw_parts(pointer as *const u8, length as usize) }
     };
     // SAFETY: The caller contract requires a live hash state.
     unsafe { &mut *(state as *mut RawHasher) }.update(bytes);
@@ -102,17 +152,58 @@ fn encode(
 ) -> Vec<u8> {
     match result {
         Ok(object) => {
-            let mut output = Vec::with_capacity(69 + object.references.len() * 65);
+            let mut output = Vec::with_capacity(25 + object.references.len() * 21);
+            output.push(0);
+            output.extend_from_slice(&object.id.0);
+            output.extend_from_slice(&(object.references.len() as u32).to_le_bytes());
+            for reference in object.references {
+                output.push(reference_kind(reference.kind));
+                output.extend_from_slice(&reference.id.0);
+            }
+            output
+        }
+        Err(error) => encode_error(&error.to_string()),
+    }
+}
+
+fn encode_op(result: Result<OpValidatedObject, OpValidationError>) -> Vec<u8> {
+    match result {
+        Ok(object) => {
+            let reference_bytes = object
+                .references
+                .iter()
+                .map(|reference| 1 + reference.id.len())
+                .sum::<usize>();
+            let mut output = Vec::with_capacity(69 + reference_bytes);
             output.push(0);
             output.extend_from_slice(&object.id);
             output.extend_from_slice(&(object.references.len() as u32).to_le_bytes());
             for reference in object.references {
-                output.push(reference.kind as u8);
+                output.push(op_reference_kind(reference.kind));
                 output.extend_from_slice(&reference.id);
             }
             output
         }
         Err(error) => encode_error(&error.to_string()),
+    }
+}
+
+const fn reference_kind(kind: ReferenceKind) -> u8 {
+    match kind {
+        ReferenceKind::Blob => 0,
+        ReferenceKind::Executable => 1,
+        ReferenceKind::Symlink => 2,
+        ReferenceKind::Tree => 3,
+        ReferenceKind::Commit => 4,
+        ReferenceKind::Gitlink => 5,
+    }
+}
+
+const fn op_reference_kind(kind: OpReferenceKind) -> u8 {
+    match kind {
+        OpReferenceKind::Commit => 0,
+        OpReferenceKind::View => 1,
+        OpReferenceKind::Operation => 2,
     }
 }
 
@@ -130,25 +221,52 @@ fn leak(bytes: Vec<u8>) -> u32 {
     Box::into_raw(bytes.into_boxed_slice()) as *mut u8 as u32
 }
 
+struct RawHasher(Blake2b512);
+
+impl RawHasher {
+    fn new() -> Self {
+        Self(Blake2b512::default())
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        Update::update(&mut self.0, bytes);
+    }
+
+    fn finalize(self) -> [u8; 64] {
+        self.0.finalize().into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn response_format_carries_id_and_references() {
-        let response = encode(validate(ObjectKind::File, b"hello"));
+    fn response_format_carries_git_id_and_references() {
+        let response = encode(validate(ObjectKind::Blob, b"hello"));
         assert_eq!(response[0], 0);
-        assert_eq!(&response[65..69], &[0, 0, 0, 0]);
+        assert_eq!(&response[21..25], &[0, 0, 0, 0]);
     }
 
     #[test]
-    fn streaming_hash_matches_file_validation() {
+    fn streaming_hash_is_blake2b_512() {
         let mut hasher = RawHasher::new();
         hasher.update(b"hel");
         hasher.update(b"lo");
-        assert_eq!(
-            hasher.finalize(),
-            validate(ObjectKind::File, b"hello").unwrap().id
-        );
+        let expected: [u8; 64] = Blake2b512::digest(b"hello").into();
+        assert_eq!(hasher.finalize(), expected);
+    }
+
+    #[test]
+    fn operation_store_response_carries_blake2_id_and_mixed_width_references() {
+        let mut view = Vec::new();
+        view.extend_from_slice(&[0x0a, 20]);
+        view.extend_from_slice(&[1; 20]);
+        view.extend_from_slice(&[0x4a, 4, 0x1a, 2, 0x12, 0]);
+        view.extend_from_slice(&[0x60, 1]);
+        let response = encode_op(validate_op(OpObjectKind::View, &view));
+        assert_eq!(response[0], 0);
+        assert_eq!(&response[65..69], &[1, 0, 0, 0]);
+        assert_eq!(response.len(), 90);
     }
 }

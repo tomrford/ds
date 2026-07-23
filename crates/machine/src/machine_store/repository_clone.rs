@@ -2,14 +2,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use devspace_machine_git::MachineGitRepository;
 use jj_lib::settings::UserSettings;
 
 use super::{
     MATERIALIZATION_LOCK_FILE, MachineStore, MachineStoreError, RepositoryIdentity, RepositoryName,
     RepositorySyncGuard,
 };
-use crate::sync_directory;
+use crate::{MachineGitRepository, sync_directory};
 
 const CLONE_STAGING_DIRECTORY: &str = ".clone-staging";
 

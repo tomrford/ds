@@ -7,8 +7,8 @@ use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use devspace_machine::{MachineStore, MachineSyncStore, RepositoryName};
-use devspace_machine_git::MachineGitRepository as MachineRepository;
+use devspace_machine::MachineGitRepository as MachineRepository;
+use devspace_machine::{MachineStore, OpSyncStore, RepositoryName};
 #[cfg(unix)]
 use support::daemon_socket_path;
 use support::{
@@ -130,14 +130,14 @@ async fn two_machine_cli_sync_converges_through_a_live_worker() {
         );
     }
     assert!(
-        MachineSyncStore::open(store_a.repository_sync_path(&entry_a.identity))
+        OpSyncStore::open(store_a.repository_sync_path(&entry_a.identity))
             .unwrap()
             .load_outbox()
             .unwrap()
             .is_none()
     );
     assert!(
-        MachineSyncStore::open(store_b.repository_sync_path(&entry_b.identity))
+        OpSyncStore::open(store_b.repository_sync_path(&entry_b.identity))
             .unwrap()
             .load_outbox()
             .unwrap()
@@ -612,7 +612,7 @@ async fn daemon_restart_drains_one_offline_commit_exactly_once() {
     let name = RepositoryName::parse(repository_name.clone()).unwrap();
     let store = machine_store(&home);
     let entry = store.resolve(&name).unwrap().unwrap();
-    let sync_store = MachineSyncStore::open(store.repository_sync_path(&entry.identity)).unwrap();
+    let sync_store = OpSyncStore::open(store.repository_sync_path(&entry.identity)).unwrap();
     assert!(sync_store.load_outbox().unwrap().is_none());
 
     let daemon = start_daemon(&home, &config);

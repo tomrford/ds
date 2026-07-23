@@ -2,7 +2,7 @@ use std::io::Write as _;
 use std::path::Path;
 
 use devspace_machine::{CatalogEntry, MachineStore};
-use devspace_machine_git::{MachineGitRepository, OpSyncStore};
+use devspace_machine::{MachineGitRepository, OpSyncStore};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;

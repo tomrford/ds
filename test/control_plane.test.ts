@@ -58,7 +58,7 @@ describe("cloud identity and repository directory", () => {
       status: 404,
       code: "repository-not-found",
     });
-    const repository = env.REPOSITORIES.get(env.REPOSITORIES.idFromString(created.repositoryId));
+    const repository = env.REPOSITORIES.getByName(created.repositoryId);
     expect(
       await repository.putPackManifest(
         { ...stranger, repositoryId: created.repositoryId, incarnation: created.incarnation },
@@ -309,9 +309,7 @@ describe("cloud identity and repository directory", () => {
       replacement,
     );
 
-    const repositoryStub = env.REPOSITORIES.get(
-      env.REPOSITORIES.idFromString(repository.repositoryId),
-    );
+    const repositoryStub = env.REPOSITORIES.getByName(repository.repositoryId);
     expect(
       await repositoryStub.initializeRepository({
         userId,
@@ -365,52 +363,23 @@ describe("cloud identity and repository directory", () => {
     }
   });
 
-  it("fences initialization when retirement reaches a repository first", async () => {
-    const repositoryId = env.REPOSITORIES.newUniqueId().toString();
-    const authority = {
-      userId: "retire-before-init-user",
-      machineId: "43".repeat(16),
-      repositoryId,
-      incarnation: "43".repeat(16),
-    };
-    const repository = env.REPOSITORIES.get(env.REPOSITORIES.idFromString(repositoryId));
-    expect(await repository.retireRepository(authority)).toEqual({ ok: true, retired: true });
-    expect(await repository.initializeRepository(authority)).toMatchObject({
-      ok: false,
-      status: 409,
-      code: "repository-authority-mismatch",
-    });
-  });
-
   it("retires a deleted incarnation before recreating the name", async () => {
     const machineId = "51".repeat(16);
     const first = await createRepository(machineId, "replaceable", "51".repeat(16));
-    const firstStub = env.REPOSITORIES.get(env.REPOSITORIES.idFromString(first.repositoryId));
-    const firstGitStub = env.REPOSITORIES_GIT.getByName(first.repositoryId);
+    const firstStub = env.REPOSITORIES.getByName(first.repositoryId);
     const firstAuthority = {
       userId: env.DEVSPACE_DEVELOPMENT_USER_ID,
       machineId,
       repositoryId: first.repositoryId,
       incarnation: first.incarnation,
     };
-    expect(await firstGitStub.initializeRepository(firstAuthority)).toMatchObject({ ok: true });
-    await runInDurableObject(firstGitStub, (_instance, state) => {
+    expect(await firstStub.initializeRepository(firstAuthority)).toMatchObject({ ok: true });
+    await runInDurableObject(firstStub, (_instance, state) => {
       state.storage.sql.exec(
         "INSERT INTO objects (kind, id, bytes) VALUES (?, ?, ?)",
         1,
         new Uint8Array(20).fill(1),
         new Uint8Array([2]),
-      );
-    });
-    await runInDurableObject(firstStub, (_instance, state) => {
-      state.storage.sql.exec(
-        "INSERT INTO objects (kind, id, bytes) VALUES (?, ?, ?)",
-        1,
-        new Uint8Array([1]).buffer,
-        new Uint8Array([2]).buffer,
-      );
-      state.storage.sql.exec(
-        "INSERT INTO remotes (name, url) VALUES ('origin', 'https://example.test/repository')",
       );
     });
     await evictDurableObject(firstStub);
@@ -425,34 +394,14 @@ describe("cloud identity and repository directory", () => {
     });
     expect(deleted.status).toBe(200);
     expect(await deleted.json()).toEqual({ deleted: true });
-    await evictDurableObject(firstGitStub);
-    expect(await firstGitStub.countObjects()).toBe(0);
-    await runInDurableObject(firstGitStub, (_instance, state) => {
+    await evictDurableObject(firstStub);
+    expect(await firstStub.countObjects()).toBe(0);
+    await runInDurableObject(firstStub, (_instance, state) => {
       expect(
         state.storage.sql
           .exec<{ count: number }>("SELECT count(*) AS count FROM repository_state")
           .one().count,
       ).toBe(0);
-    });
-    await runInDurableObject(firstStub, (_instance, state) => {
-      const tombstone = state.storage.sql
-        .exec<{ retired: number; repository_id: string }>(
-          "SELECT retired, repository_id FROM repository_state WHERE singleton = 1",
-        )
-        .one();
-      expect(tombstone).toEqual({ retired: 1, repository_id: first.repositoryId });
-      const tables = state.storage.sql
-        .exec<{ name: string }>(
-          "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'repository_state'",
-        )
-        .toArray();
-      for (const { name } of tables) {
-        expect(
-          state.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) AS count FROM ${name}`).one()
-            .count,
-          `${name} should be empty after retirement`,
-        ).toBe(0);
-      }
     });
     expect(
       await firstStub.putPackManifest(
@@ -468,7 +417,7 @@ describe("cloud identity and repository directory", () => {
     ).toMatchObject({
       ok: false,
       status: 409,
-      code: "repository-retired",
+      code: "repository-authority-stale",
     });
 
     const second = await createRepository(machineId, "replaceable", "52".repeat(16));
@@ -480,14 +429,14 @@ describe("cloud identity and repository directory", () => {
       (
         await apiRequest(
           machineId,
-          `/repositories/${first.repositoryId}/heads?incarnation=${first.incarnation}`,
+          `/repositories/${first.repositoryId}/git/ops/heads`,
           { headers: staleHeaders },
         )
       ).status,
     ).toBe(404);
     expect(
       (
-        await apiRequest(machineId, `/repositories/${first.repositoryId}/heads`, {
+        await apiRequest(machineId, `/repositories/${first.repositoryId}/git/ops/heads/transactions`, {
           method: "POST",
           headers: { ...staleHeaders, "content-type": "application/json" },
           body: "{}",
@@ -498,7 +447,7 @@ describe("cloud identity and repository directory", () => {
       (
         await apiRequest(
           machineId,
-          `/repositories/${second.repositoryId}/heads?incarnation=${first.incarnation}`,
+          `/repositories/${second.repositoryId}/git/ops/heads`,
           { headers: staleHeaders },
         )
       ).status,
@@ -506,7 +455,7 @@ describe("cloud identity and repository directory", () => {
 
     const current = await apiRequest(
       machineId,
-      `/repositories/${second.repositoryId}/heads?incarnation=${second.incarnation}`,
+      `/repositories/${second.repositoryId}/git/ops/heads`,
       { headers: { "x-devspace-incarnation": second.incarnation } },
     );
     expect(current.status).toBe(200);

@@ -12,50 +12,54 @@ Gate: `nix develop -c pnpm check` and `nix develop -c pnpm test`.
 
 ## jj format parity
 
-- `crates/kernel` is a maintained mini-fork of jj's storage format, pinned to
-  jj-lib 0.42.0 semantics. It must never depend on jj-lib, even as a dev
-  dependency.
+- `crates/kernel` is a maintained mini-fork of jj's GitBackend commit format
+  and simple operation-store format, pinned to jj-lib 0.42.0 semantics. It must
+  never depend on jj-lib, even as a dev dependency.
 - On any jj version bump, audit the kernel against the jj-lib source itself
-  (cargo registry copy), surface by surface: `content_hash.rs` impls;
-  `ContentHash` struct field orders and enum ordinals in `backend.rs`,
-  `op_store.rs`, `merge.rs`; `conflict_labels.rs`; conversion and legacy
-  decode branches and object path layouts in `simple_backend.rs` and
-  `simple_op_store.rs`. Mirror what changed, regenerate
-  `crates/kernel/tests/jj_golden.txt` from the new jj version, and run the full
-  gate.
-- Gitignore matching through jj-lib's gix-ignore wrapper is canonical projection
-  behavior; audit it against the machine matcher golden tests on every jj bump.
+  (cargo registry copy). For Git objects, inspect `git_backend.rs`: commit
+  header parsing and encoding, derived and stored change IDs, `jj:trees`,
+  conflict-label headers, unknown-header handling, and reconstruction of the
+  rebuildable `store/extra` cache. Mirror changes in `commit.rs`, `tree.rs`,
+  `hash.rs`, and object-reference extraction.
+- Audit operation and view encoding in `simple_op_store.rs` plus the
+  `ContentHash` implementations, struct field orders, merge encodings, and enum
+  ordinals in `backend.rs`, `op_store.rs`, `merge.rs`, and
+  `conflict_labels.rs`. Mirror changes in `crates/kernel/src/ops/`.
+- Regenerate `git_golden.txt`, `git_golden_oracle.txt`, and `ops_golden.txt`
+  from the new jj version. Golden Git vectors are exact object payloads with
+  standard Git OIDs. Operation vectors are canonical protobuf bytes with jj
+  semantic Blake2b IDs. The kernel rejects non-canonical operation encodings
+  rather than normalizing them.
+- The accepted schemas are exactly Git blob/tree/commit objects as used by
+  GitBackend and jj's simple operation store. Do not add Devspace-only object
+  fields. Values GitBackend cannot store, including Git submodules, must fail
+  before a canonical commit is written.
+- Gitignore matching through jj-lib's gix-ignore wrapper is canonical private
+  projection behavior. Audit it against the machine projection and working-copy
+  tests on every jj bump.
 - `crates/cli/src/working_copy.rs::base_ignores` mirrors jj-cli's
-  `WorkspaceCommandHelper::base_ignores` (non-Git-backend branch) for hidden
-  discovery outside snapshotting; audit it on every jj bump.
-- Golden vectors are canonical bytes with jj ContentHash IDs, originally
-  emitted by the old server as a jj-lib 0.42.0 oracle. The kernel rejects
-  non-canonical encodings rather than normalizing; normalization is
-  machine-side work.
-- The accepted schema is exactly jj's simple backend and simple operation-store
-  schema. Do not add Devspace-only fields. Values the simple backend cannot
-  store, including Git submodules, must fail before encoding.
-- The simple-store on-disk layout knowledge in
-  `crates/machine/src/object_closure.rs::object_path` is fork surface living
-  outside the kernel; audit it on every bump alongside the encodings.
+  GitBackend branch of `WorkspaceCommandHelper::base_ignores`: the backend Git
+  config's global excludes plus `.git/info/exclude`. Audit it on every bump.
+- `crates/machine/src/op_sync.rs::object_path` knows the simple operation
+  store's on-disk layout outside the kernel. Audit it with operation encodings
+  on every bump.
 
-## jj bump rollout (encoding changes)
+## jj bump rollout
 
-Cloud replication is byte-exact and objects are content-addressed by jj's
-semantic hash, so a bump only matters for rollout when the audit above finds
-that canonical bytes changed for existing object shapes (proto3 field
-additions usually don't). When they did:
+Git object bytes and OIDs are standard, immutable Git data. Operation objects
+are byte-exact and content-addressed. A jj bump needs a protocol rollout only
+if the audit finds that an existing logical object shape now has different
+canonical bytes or reference semantics.
 
-1. Bump `devspace_kernel::ENCODING_VERSION`. Clients advertise it via the
-   `x-devspace-client` header (set in `hardened_http_client`).
-2. Deploy the Worker FIRST, with the kernel accepting both the old and new
-   canonical forms (an accept-set decode branch, never a data migration —
-   stored bytes are immutable and are never rewritten). The Worker may gate
-   stale clients on the advertised encoding with an "upgrade ds" error;
-   never let them hit a canonicality failure.
-3. Upgrade machines after. Mixed-epoch machines writing the same logical
-   object as different bytes trip the no-clobber check by design.
-4. Accept-set branches are deletable at any time by re-incarnating the
-   affected repositories: the cloud store is fully derivable from any
-   up-to-date machine (re-upload under the new encoding). No migration code,
-   ever.
+When that happens:
+
+1. define a new advertised transport capability after `git-pack/2`;
+2. deploy the Worker first with an explicit accept set for every live canonical
+   form and an upgrade error for stale clients;
+3. upgrade machines after the Worker accepts the new capability;
+4. reject mixed writers that propose different bytes for one object ID through
+   the existing no-clobber checks.
+
+Stored objects are immutable and are never migrated or normalized in place. A
+repository can be re-incarnated and re-uploaded from an up-to-date machine when
+an old accepted form must be retired.

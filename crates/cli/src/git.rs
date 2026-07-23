@@ -6,7 +6,7 @@ use std::path::Path;
 
 use clap::parser::ValueSource;
 use devspace_machine::{CatalogEntry, MachineStore, RepositorySyncGuard};
-use devspace_machine_git::{GitHttpTransport, MachineGitRepository, Oid, RegisteredGitRemote};
+use devspace_machine::{GitHttpTransport, MachineGitRepository, Oid, RegisteredGitRemote};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;

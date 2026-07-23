@@ -2,11 +2,11 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use devspace_machine::MachineGitRepository;
 use devspace_machine::{
     CatalogEntry, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
     MachineConfig, MachineStore, RepositoryName, sync_directory,
 };
-use devspace_machine_git::MachineGitRepository;
 use jj_cli::cli_util::{CommandHelper, RevisionArg};
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;

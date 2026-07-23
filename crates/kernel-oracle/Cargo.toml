@@ -1,0 +1,18 @@
+[package]
+name = "devspace-kernel-oracle"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+devspace-kernel = { path = "../kernel" }
+devspace-machine = { path = "../machine" }
+futures.workspace = true
+jj-lib.workspace = true
+tempfile.workspace = true
+
+[[bin]]
+name = "kernel-oracle"
+path = "src/main.rs"

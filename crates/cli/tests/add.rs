@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::thread;
 
-use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
-use devspace_machine_git::{
+use devspace_machine::{
     BuiltPack, MachineGitRepository as MachineRepository, Oid, PackOptions, build_packs,
 };
+use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{StoreFactories, StoreLoadError};

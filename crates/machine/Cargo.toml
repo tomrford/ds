@@ -8,8 +8,7 @@ rust-version.workspace = true
 [dependencies]
 blake2.workspace = true
 devspace-kernel = { path = "../kernel" }
-devspace-machine-git = { path = "../machine-git" }
-futures.workspace = true
+gix.workspace = true
 jj-lib.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -19,4 +18,5 @@ thiserror.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
 tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread"] }

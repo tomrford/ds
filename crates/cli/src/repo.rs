@@ -1,12 +1,12 @@
 use std::fs;
 use std::io::Write as _;
 
+use devspace_machine::MachineGitRepository;
 use devspace_machine::{
     CatalogEntry, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
     MachineConfig, MachineStore, RepositoryCreationIntent, RepositoryCreationIntentError,
     RepositoryCreationKey, RepositoryCreationTarget, RepositoryIdentity, RepositoryName,
 };
-use devspace_machine_git::MachineGitRepository;
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::formatter::FormatterExt as _;

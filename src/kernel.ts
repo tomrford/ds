@@ -1,34 +1,33 @@
 import kernelModule from "../dist/kernel.wasm";
 
-export const KIND = {
-  file: 0,
-  symlink: 1,
-  tree: 2,
-  commit: 3,
-  view: 4,
-  operation: 5,
+export const GIT_OBJECT_KIND = {
+  blob: 0,
+  tree: 1,
+  commit: 2,
 } as const;
 
-export const KIND_BY_NUMBER = [
-  "file",
-  "symlink",
-  "tree",
-  "commit",
-  "view",
-  "operation",
-] as const;
+export const GIT_REFERENCE_KIND = {
+  blob: 0,
+  executable: 1,
+  symlink: 2,
+  tree: 3,
+  commit: 4,
+  gitlink: 5,
+} as const;
 
-export type KindName = keyof typeof KIND;
-
-export function isKindName(value: string): value is KindName {
-  return Object.hasOwn(KIND, value);
-}
+export const OP_REFERENCE_KIND = {
+  commit: 0,
+  view: 1,
+  operation: 2,
+} as const;
 
 interface KernelExports extends WebAssembly.Exports {
   memory: WebAssembly.Memory;
   kernel_alloc(length: number): number;
   kernel_dealloc(pointer: number, length: number): void;
   kernel_validate(kind: number, pointer: number, length: number): bigint;
+  kernel_validate_view(pointer: number, length: number): bigint;
+  kernel_validate_operation(pointer: number, length: number): bigint;
   kernel_hash_new(): number;
   kernel_hash_update(state: number, pointer: number, length: number): void;
   kernel_hash_finish(state: number): number;
@@ -52,10 +51,42 @@ export class Kernel {
   }
 
   validate(kind: number, bytes: Uint8Array): KernelResult {
+    return this.call(bytes, (pointer, length) =>
+      this.exports.kernel_validate(kind, pointer, length),
+    );
+  }
+
+  validateView(bytes: Uint8Array): KernelResult {
+    return decodeOpKernelResult(
+      this.callRaw(bytes, (pointer, length) =>
+        this.exports.kernel_validate_view(pointer, length),
+      ),
+    );
+  }
+
+  validateOperation(bytes: Uint8Array): KernelResult {
+    return decodeOpKernelResult(
+      this.callRaw(bytes, (pointer, length) =>
+        this.exports.kernel_validate_operation(pointer, length),
+      ),
+    );
+  }
+
+  private call(
+    bytes: Uint8Array,
+    validate: (pointer: number, length: number) => bigint,
+  ): KernelResult {
+    return decodeKernelResult(this.callRaw(bytes, validate));
+  }
+
+  private callRaw(
+    bytes: Uint8Array,
+    validate: (pointer: number, length: number) => bigint,
+  ): Uint8Array {
     const inputPointer = this.exports.kernel_alloc(bytes.byteLength);
     try {
       new Uint8Array(this.exports.memory.buffer, inputPointer, bytes.byteLength).set(bytes);
-      const packed = this.exports.kernel_validate(kind, inputPointer, bytes.byteLength);
+      const packed = validate(inputPointer, bytes.byteLength);
       const outputPointer = Number(packed & 0xffff_ffffn);
       const outputLength = Number(packed >> 32n);
       try {
@@ -64,7 +95,7 @@ export class Kernel {
           outputPointer,
           outputLength,
         ).slice();
-        return decodeKernelResult(output);
+        return output;
       } finally {
         this.exports.kernel_dealloc(outputPointer, outputLength);
       }
@@ -131,52 +162,84 @@ function instantiate(): KernelExports {
 }
 
 function decodeKernelResult(bytes: Uint8Array): KernelResult {
-  if (bytes[0] === 1) {
-    throw new Error(new TextDecoder().decode(bytes.subarray(1)));
+  if (bytes[0] === 1) throw new Error(new TextDecoder().decode(bytes.subarray(1)));
+  if (bytes[0] !== 0 || bytes.byteLength < 25) {
+    throw new Error("Git validation kernel returned a malformed response");
   }
-  if (bytes[0] !== 0 || bytes.byteLength < 69) {
-    throw new Error("validation kernel returned a malformed response");
-  }
-  const count = new DataView(bytes.buffer, bytes.byteOffset + 65, 4).getUint32(0, true);
-  if (bytes.byteLength !== 69 + count * 65) {
-    throw new Error("validation kernel returned malformed references");
+  const count = new DataView(bytes.buffer, bytes.byteOffset + 21, 4).getUint32(0, true);
+  if (bytes.byteLength !== 25 + count * 21) {
+    throw new Error("Git validation kernel returned malformed references");
   }
   const references = [];
   for (let index = 0; index < count; index += 1) {
-    const offset = 69 + index * 65;
+    const offset = 25 + index * 21;
     const kind = bytes[offset];
-    if (KIND_BY_NUMBER[kind] === undefined) {
-      throw new Error("validation kernel returned an unknown reference kind");
+    if (kind > GIT_REFERENCE_KIND.gitlink) {
+      throw new Error("Git validation kernel returned an unknown reference kind");
     }
-    references.push({ kind, id: bytes.slice(offset + 1, offset + 65) });
+    references.push({ kind, id: bytes.slice(offset + 1, offset + 21) });
+  }
+  return { id: bytes.slice(1, 21), references };
+}
+
+function decodeOpKernelResult(bytes: Uint8Array): KernelResult {
+  if (bytes[0] === 1) throw new Error(new TextDecoder().decode(bytes.subarray(1)));
+  if (bytes[0] !== 0 || bytes.byteLength < 69) {
+    throw new Error("operation-store validation kernel returned a malformed response");
+  }
+  const count = new DataView(bytes.buffer, bytes.byteOffset + 65, 4).getUint32(0, true);
+  const references = [];
+  let offset = 69;
+  for (let index = 0; index < count; index += 1) {
+    const kind = bytes[offset];
+    const idLength =
+      kind === OP_REFERENCE_KIND.commit
+        ? 20
+        : kind === OP_REFERENCE_KIND.view || kind === OP_REFERENCE_KIND.operation
+          ? 64
+          : undefined;
+    if (idLength === undefined || offset + 1 + idLength > bytes.byteLength) {
+      throw new Error("operation-store validation kernel returned malformed references");
+    }
+    references.push({ kind, id: bytes.slice(offset + 1, offset + 1 + idLength) });
+    offset += 1 + idLength;
+  }
+  if (offset !== bytes.byteLength) {
+    throw new Error("operation-store validation kernel returned trailing response bytes");
   }
   return { id: bytes.slice(1, 65), references };
 }
 
-export function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+export function equalGitBytes(left: Uint8Array, right: Uint8Array): boolean {
   return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index]);
 }
 
-export function compareBytes(left: Uint8Array, right: Uint8Array): number {
-  const shared = Math.min(left.byteLength, right.byteLength);
-  for (let index = 0; index < shared; index += 1) {
+export function compareGitBytes(left: Uint8Array, right: Uint8Array): number {
+  const length = Math.min(left.byteLength, right.byteLength);
+  for (let index = 0; index < length; index += 1) {
     const difference = left[index] - right[index];
     if (difference !== 0) return difference;
   }
   return left.byteLength - right.byteLength;
 }
 
-export function exactBuffer(bytes: Uint8Array): ArrayBuffer {
-  return new Uint8Array(bytes).buffer;
+export function exactGitBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.slice().buffer as ArrayBuffer;
 }
 
-export function toHex(bytes: Uint8Array): string {
+export function gitToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export function fromHex(value: string): Uint8Array {
-  if (!/^[0-9a-f]{128}$/.test(value)) throw new Error("ID must be 128 lowercase hex characters");
-  return Uint8Array.from({ length: 64 }, (_, index) =>
+export function gitHashFromHex(value: string): Uint8Array {
+  if (!/^[0-9a-f]{128}$/.test(value)) {
+    throw new Error("hash must be 128 lowercase hex characters");
+  }
+  return decodeHex(value, 64);
+}
+
+function decodeHex(value: string, length: number): Uint8Array {
+  return Uint8Array.from({ length }, (_, index) =>
     Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
   );
 }

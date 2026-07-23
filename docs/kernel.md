@@ -1,67 +1,81 @@
 # Validation kernel
 
-Object validation runs inside the TypeScript Durable Object through a narrow
-Rust kernel compiled to Wasm. The kernel has these constraints:
+Devspace has one validation kernel for every byte stored by the repository
+Durable Object. The native Rust library and zero-import WebAssembly build share
+the same parsers, identity functions, bounds, and reference extraction.
 
-- Narrow dependency graph: the kernel depends on `prost` and `blake2` only —
-  no `jj-lib`. It is a maintained mini-fork of jj's simple backend and
-  op-store storage formats (see the crate docs in `crates/kernel`); every jj
-  format change must be mirrored there.
-- No reachable panic path: protobuf conversion returns `Result` throughout,
-  with no panic-catching. The mutation suite validates every truncation and
-  single-byte mutation of each structured golden vector.
-- Small Wasm binary: the optimized module is ~140 KiB with zero imports; the
-  build fails above 200 KiB.
-- jj ID parity: every golden vector produces the canonical jj-lib 0.42.0 ID
-  and the same accept/reject outcome in the native kernel and the Wasm kernel
-  inside the Durable Object.
+The kernel does not depend on `jj-lib`, `gix`, or a system Git library. It
+implements only the canonical formats that the cloud must validate.
 
-The validation kernel is a no-I/O Rust crate with two dependencies: `prost` for
-the jj-compatible protobuf envelope and `blake2` for object IDs. It does not
-depend on `jj-lib`.
+## Git objects
 
-The kernel validates canonical bytes, calculates the content ID, and returns the
-object references needed for closure checks. It covers files, symlinks, trees,
-commits, views and operations. Hidden-path parsing and matching live
-machine-side on jj's `GitIgnoreFile`, alongside tree traversal and Git
-projection.
+Canonical repository objects use Git's object formats:
 
-The kernel rejects non-canonical bytes. Both stores hold only canonical bytes;
-normalization belongs on the machine because replication is byte-exact, so the
-cloud must never rewrite what a client uploaded.
+- blobs are opaque bytes;
+- trees are ordered binary entries containing a mode, raw name, and 20-byte
+  object ID;
+- commits contain a tree, zero or more parents, identity headers, a message,
+  and preserved continuation-line headers such as `gpgsig` and `mergetag`.
 
-`kernel-wasm` exposes a small allocation and validation ABI plus an incremental
-raw Blake2b-512 state used for pack and chunk verification. The release profile
-uses `panic = "abort"`. Checked conversion replaces panic-catching at the
-protobuf boundary, so malformed object bytes return an error. The optimized
-module has no imports, and the build rejects modules larger than 200 KiB.
+Commit validation recognizes GitBackend metadata including `change-id`,
+`jj:trees`, and conflict-label headers. Unknown well-formed headers remain
+opaque. The validator rejects malformed modes, duplicate or unsorted tree
+entries, invalid object IDs, broken headers, oversized inputs, and references
+whose type is not permitted at that position.
 
-One SQLite-backed `Repository` Durable Object owns each opaque repository ID. It
-quarantines bounded pack manifests and chunks, then runs the Wasm validator
-before inserting immutable object bytes and their references in one synchronous
-install transaction. The Worker authenticates a typed machine principal and
-resolves the current repository incarnation through the control-plane Durable Object before each
-typed RPC. The repository object independently rechecks the user, repository ID
-and incarnation before reading or mutating state.
+An object's identity is the SHA-1 of Git's exact
+`"<type> <length>\\0<payload>"` preimage. The SHA-1 implementation performs
+collision detection. Validation never normalizes or re-encodes an accepted Git
+object; byte identity is the contract.
+
+Standalone tag objects are outside the repository transport. A signed tag
+embedded in a commit's `mergetag` header remains part of the commit bytes.
+
+## Operation store
+
+Jujutsu views and operations use the simple operation-store protobuf schema.
+Their identities are 64-byte Blake2b hashes of the canonical semantic content.
+The kernel decodes the protobuf, validates every field and referenced object,
+reconstructs the semantic value, and rejects non-canonical encodings.
+
+The accepted schema is exactly jj's operation and view format. Devspace adds no
+fields to these objects.
+
+Git objects and operation objects have separate namespaces, routes, and
+closure rules. A commit references a tree and parents; a tree references its
+entries; an operation references its parent operations and view; a view
+references Git commits through jj's commit IDs.
+
+## WebAssembly boundary
+
+`crates/kernel-wasm` exports validation for Git and operation objects from one
+module. The Worker calls it before an object can enter durable storage.
+Malformed input returns a typed error and cannot trap the Worker.
+
+The current release build is:
+
+- `dist/kernel.wasm`: 192,676 bytes;
+- imports: zero;
+- Worker dry-run bundle: 897.01 KiB raw, 181.92 KiB gzip.
+
+`scripts/build-wasm.mjs` builds exactly this one module and enforces the
+200 KiB WebAssembly budget.
 
 ## Verification
 
-`crates/kernel/tests/jj_golden.txt` contains 32 frozen objects and IDs. Most
-come from walking the stored history of a real repository (mint, about 90
-commits). The remaining vectors cover jj simple-store edge cases that import
-does not produce: signed commits, conflicted root trees with labels, merge
-commits with predecessors, executable files, symlinks and nested trees. Every
-vector uses the unextended jj-lib 0.42.0 simple backend or simple
-operation-store schema.
+Golden vectors come from real Git repositories and jj-lib 0.42.0 stores. They
+cover signed and merged commits, non-UTF-8 metadata, GitBackend conflicted
+trees, executable files, symlinks, nested trees, operation merges, and
+repository views.
 
-The Rust suite and Workers Vitest suite validate all six object kinds against
-the same vectors. The malformed-input suite exercises every truncation and
-single-byte mutation of each structured vector without panic-catching.
+Native and WebAssembly validators must return the same identity and references
+for every vector. Structured vectors are also checked under every truncation
+and single-byte mutation. Pack installation repeats identity validation and
+rejects missing references or no-clobber violations.
 
-Workers Vitest also covers canonical rejection, reference extraction,
-idempotent insertion, bounded requests, authentication, quarantine and install
-retries, and SQLite persistence across Durable Object eviction.
+Run the complete proof:
 
-The Worker uses pack manifests and chunks. The kernel and per-object reference
-index remain the validation boundary beneath that protocol. Head transactions,
-Git projection and machine ownership sit outside the kernel.
+```sh
+nix develop -c pnpm check
+nix develop -c pnpm test
+```

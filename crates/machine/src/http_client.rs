@@ -13,9 +13,8 @@ pub(crate) fn hardened_http_client() -> Result<reqwest::Client, reqwest::Error> 
     headers.insert(
         "x-devspace-client",
         reqwest::header::HeaderValue::from_str(&format!(
-            "ds/{} encoding/{}",
+            "ds/{} git-pack/2",
             env!("CARGO_PKG_VERSION"),
-            devspace_kernel::ENCODING_VERSION,
         ))
         .expect("client version header is static ASCII"),
     );

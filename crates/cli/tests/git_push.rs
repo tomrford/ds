@@ -8,11 +8,11 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use devspace_machine::MachineGitRepository as MachineRepository;
 use devspace_machine::{
-    HttpTransport, MachineStoreError, ProjectionSnapshot, RepositoryId, RepositoryIdentity,
+    GitHttpTransport, MachineStoreError, ProjectionGitSnapshot, RepositoryId, RepositoryIdentity,
     RepositoryIncarnation, RepositoryName, encode_lower_hex,
 };
-use devspace_machine_git::MachineGitRepository as MachineRepository;
 use jj_lib::op_store::RemoteRef;
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 
@@ -843,7 +843,9 @@ async fn fresh_machine_claims_and_replays_a_push_left_pending_after_git_moved() 
     let accepted = fixture.snapshot(&fixture.home_b).await;
     assert!(accepted.pending.is_empty());
     assert!(accepted.cursors.iter().any(|cursor| {
-        cursor.remote == "origin" && cursor.bookmark == "main" && cursor.git_oid == first_remote
+        cursor.remote == "origin"
+            && cursor.bookmark == "main"
+            && cursor.public_oid.0 == first_remote
     }));
 
     fs::write(checkout_b.join("visible.txt"), b"after recovery\n").unwrap();
@@ -856,7 +858,9 @@ async fn fresh_machine_claims_and_replays_a_push_left_pending_after_git_moved() 
     let advanced_snapshot = fixture.snapshot(&fixture.home_b).await;
     assert!(advanced_snapshot.pending.is_empty());
     assert!(advanced_snapshot.cursors.iter().any(|cursor| {
-        cursor.remote == "origin" && cursor.bookmark == "main" && cursor.git_oid == advanced_remote
+        cursor.remote == "origin"
+            && cursor.bookmark == "main"
+            && cursor.public_oid.0 == advanced_remote
     }));
     assert_public_object_store(&fixture.remote, PRIVATE_SENTINEL);
 }
@@ -1080,17 +1084,19 @@ impl LiveFixture {
         ds(checkout, home, config, &["git", "push", "-b", bookmark])
     }
 
-    async fn snapshot(&self, home: &Path) -> ProjectionSnapshot {
+    async fn snapshot(&self, home: &Path) -> ProjectionGitSnapshot {
         let store = machine_store(home);
         let entry = store
             .resolve(&RepositoryName::parse(&self.repository_name).unwrap())
             .unwrap()
             .unwrap();
         let config = store.load_config().unwrap();
-        let transport = HttpTransport::new(
-            &config,
+        let transport = GitHttpTransport::new(
+            config.base_url(),
+            config.shared_secret().as_str(),
+            config.machine_id().as_str(),
             entry.identity.repository_id.as_str(),
-            parse_incarnation(entry.identity.incarnation.as_str()),
+            entry.identity.incarnation.as_str(),
         )
         .unwrap();
         load_snapshot(&transport).await
@@ -1700,23 +1706,8 @@ fn sync_log(home: &Path, repository_name: &str) -> String {
     .unwrap_or_default()
 }
 
-async fn load_snapshot(transport: &HttpTransport) -> ProjectionSnapshot {
-    let mut snapshot = transport.get(0, None).await.unwrap();
-    let through = snapshot.through;
-    while snapshot.has_more {
-        let page = transport
-            .get(snapshot.next_after, Some(through))
-            .await
-            .unwrap();
-        snapshot.mappings.extend(page.mappings);
-        snapshot.next_after = page.next_after;
-        snapshot.has_more = page.has_more;
-    }
-    snapshot
-}
-
-fn parse_incarnation(value: &str) -> [u8; 16] {
-    std::array::from_fn(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap())
+async fn load_snapshot(transport: &GitHttpTransport) -> ProjectionGitSnapshot {
+    transport.projection_snapshot_all().await.unwrap()
 }
 
 fn parse_git_oid(value: &str) -> [u8; 20] {

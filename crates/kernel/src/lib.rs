@@ -1,37 +1,62 @@
-//! A maintained mini-fork of jj's storage format: the simple backend and
-//! simple op-store canonical encodings and their `ContentHash` scheme,
-//! reimplemented without jj-lib so validation is no-I/O and panic-free.
-//! Mirrors the format as of jj-lib 0.42.0, audited against that source;
-//! every jj format change (new fields, hash inputs, validity rules) must be
-//! mirrored here per the AGENTS.md parity procedure. ID parity is guarded by
-//! `tests/jj_golden.txt`.
+#![no_std]
+//! A no-I/O validation kernel for Git blob, tree, and commit payloads.
+//!
+//! The parser is hand-written and has no `gix` or `jj-lib` dependency. It
+//! validates the Git shapes used by jj-lib 0.42.0's Git backend, preserves
+//! commit headers and arbitrary message bytes, and reports object references
+//! without imposing Devspace's product policy on Gitlinks.
+//!
+//! Object identity uses `sha1-checked` 0.10.0 with default features disabled.
+//! It was selected over `sha1collisiondetection` 0.3.4 in July 2026: both are
+//! pure Rust and `no_std`, but the port's last release and repository activity
+//! were in March 2024. `sha1-checked` is maintained in the active RustCrypto
+//! hashes repository, had about 24.4 million downloads, published a 0.11.0
+//! release candidate in January 2026, and received repository updates through
+//! March 2026. Version 0.10.0 was released in March 2024, satisfying the
+//! minimum release-age rule. Plain SHA-1 crates were excluded because they do
+//! not detect collisions. The hasher reports detected collisions explicitly;
+//! this kernel rejects them.
 
-mod backend;
+extern crate alloc;
+
+mod commit;
 mod error;
 mod hash;
-mod op_store;
-mod proto;
+pub mod ops;
+mod tree;
 
-pub use error::ValidationError;
-pub use hash::RawHasher;
-use hash::raw_id;
+use alloc::vec::Vec;
 
-/// Monotonic canonical-encoding epoch. Bump only when a jj upgrade changes the
-/// canonical bytes this kernel accepts for existing object shapes (see the
-/// AGENTS.md jj bump procedure). Clients advertise it in `x-devspace-client`
-/// so the Worker can refuse stale fleets with an upgrade error instead of a
-/// canonicality failure.
-pub const ENCODING_VERSION: u32 = 1;
+pub use commit::{Commit, CommitHeader, Signature, parse_commit};
+pub use error::{CommitError, HashError, TreeError, ValidationError};
+pub use hash::object_id;
+pub use tree::{Tree, TreeEntry, TreeEntryKind, parse_tree};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Blob<'a> {
+    pub data: &'a [u8],
+}
+
+pub const fn parse_blob(payload: &[u8]) -> Blob<'_> {
+    Blob { data: payload }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum ObjectKind {
-    File = 0,
-    Symlink = 1,
-    Tree = 2,
-    Commit = 3,
-    View = 4,
-    Operation = 5,
+    Blob = 0,
+    Tree = 1,
+    Commit = 2,
+}
+
+impl ObjectKind {
+    const fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Blob => b"blob",
+            Self::Tree => b"tree",
+            Self::Commit => b"commit",
+        }
+    }
 }
 
 impl TryFrom<u8> for ObjectKind {
@@ -39,50 +64,120 @@ impl TryFrom<u8> for ObjectKind {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::File),
-            1 => Ok(Self::Symlink),
-            2 => Ok(Self::Tree),
-            3 => Ok(Self::Commit),
-            4 => Ok(Self::View),
-            5 => Ok(Self::Operation),
-            _ => Err(ValidationError::new(format!(
-                "unknown object kind: {value}"
-            ))),
+            0 => Ok(Self::Blob),
+            1 => Ok(Self::Tree),
+            2 => Ok(Self::Commit),
+            _ => Err(ValidationError::UnknownObjectKind(value)),
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Oid(pub [u8; Self::LENGTH]);
+
+impl Oid {
+    pub const LENGTH: usize = 20;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let bytes: [u8; Self::LENGTH] = bytes.try_into().ok()?;
+        Some(Self(bytes))
+    }
+
+    pub fn from_hex(hex: &[u8]) -> Option<Self> {
+        if hex.len() != Self::LENGTH.checked_mul(2)? {
+            return None;
+        }
+        let mut bytes = [0_u8; Self::LENGTH];
+        for (index, pair) in hex.chunks_exact(2).enumerate() {
+            let high = hex_digit(*pair.first()?)?;
+            let low = hex_digit(*pair.get(1)?)?;
+            let slot = bytes.get_mut(index)?;
+            *slot = high.checked_shl(4)? | low;
+        }
+        Some(Self(bytes))
+    }
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReferenceKind {
+    Blob,
+    Executable,
+    Symlink,
+    Tree,
+    Commit,
+    Gitlink,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ObjectReference {
-    pub kind: ObjectKind,
-    pub id: [u8; 64],
+    pub kind: ReferenceKind,
+    pub id: Oid,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedObject {
-    pub id: [u8; 64],
+    pub id: Oid,
     pub references: Vec<ObjectReference>,
 }
 
-pub fn validate(kind: ObjectKind, bytes: &[u8]) -> Result<ValidatedObject, ValidationError> {
-    match kind {
-        ObjectKind::File => Ok(ValidatedObject {
-            id: raw_id(bytes),
-            references: Vec::new(),
-        }),
-        ObjectKind::Symlink => {
-            std::str::from_utf8(bytes)
-                .map_err(|_| ValidationError::new("symlink target is not valid UTF-8"))?;
-            Ok(ValidatedObject {
-                id: raw_id(bytes),
-                references: Vec::new(),
-            })
+pub fn validate(kind: ObjectKind, payload: &[u8]) -> Result<ValidatedObject, ValidationError> {
+    let mut references = match kind {
+        ObjectKind::Blob => {
+            let _ = parse_blob(payload);
+            Vec::new()
         }
-        ObjectKind::Tree => backend::validate_tree(bytes),
-        ObjectKind::Commit => backend::validate_commit(bytes),
-        ObjectKind::View => op_store::validate_view(bytes),
-        ObjectKind::Operation => op_store::validate_operation(bytes),
-    }
+        ObjectKind::Tree => parse_tree(payload)?
+            .entries
+            .into_iter()
+            .map(|entry| ObjectReference {
+                kind: match entry.kind {
+                    TreeEntryKind::File => ReferenceKind::Blob,
+                    TreeEntryKind::Executable => ReferenceKind::Executable,
+                    TreeEntryKind::Symlink => ReferenceKind::Symlink,
+                    TreeEntryKind::Tree => ReferenceKind::Tree,
+                    TreeEntryKind::Gitlink => ReferenceKind::Gitlink,
+                },
+                id: entry.oid,
+            })
+            .collect(),
+        ObjectKind::Commit => {
+            let commit = parse_commit(payload)?;
+            let mut references = Vec::with_capacity(
+                1_usize
+                    .checked_add(commit.parents.len())
+                    .and_then(|value| value.checked_add(commit.jj_trees.len()))
+                    .unwrap_or(0),
+            );
+            references.push(ObjectReference {
+                kind: ReferenceKind::Tree,
+                id: commit.tree,
+            });
+            references.extend(commit.parents.into_iter().map(|id| ObjectReference {
+                kind: ReferenceKind::Commit,
+                id,
+            }));
+            references.extend(commit.jj_trees.into_iter().map(|id| ObjectReference {
+                kind: ReferenceKind::Tree,
+                id,
+            }));
+            references
+        }
+    };
+    references.sort_unstable();
+    references.dedup();
+    Ok(ValidatedObject {
+        id: object_id(kind, payload)?,
+        references,
+    })
 }
 
 #[cfg(test)]
@@ -90,33 +185,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn malformed_bytes_never_panic() {
-        let mut cases = vec![Vec::new(), vec![0xff; 512], (0_u8..=255).collect()];
-        for length in 1..128 {
-            cases.push(
-                (0..length)
-                    .map(|index| (index as u8).wrapping_mul(31).wrapping_add(length as u8))
-                    .collect(),
-            );
-        }
-        for kind in [
-            ObjectKind::Tree,
-            ObjectKind::Commit,
-            ObjectKind::View,
-            ObjectKind::Operation,
-        ] {
-            for bytes in &cases {
-                let _ = validate(kind, bytes);
-            }
-        }
+    fn object_kind_is_checked() {
+        assert_eq!(ObjectKind::try_from(0), Ok(ObjectKind::Blob));
+        assert!(ObjectKind::try_from(3).is_err());
     }
 
     #[test]
-    fn raw_ids_are_stable_and_symlinks_require_utf8() {
-        assert_eq!(
-            validate(ObjectKind::File, b"hello").unwrap().id,
-            validate(ObjectKind::File, b"hello").unwrap().id
-        );
-        assert!(validate(ObjectKind::Symlink, &[0xff]).is_err());
+    fn invalid_tree_names_and_modes_are_typed_errors() {
+        assert!(matches!(
+            parse_tree(b"100600 file\0xxxxxxxxxxxxxxxxxxxx"),
+            Err(TreeError::InvalidMode { .. })
+        ));
+        assert!(matches!(
+            parse_tree(b"100644 ..\0xxxxxxxxxxxxxxxxxxxx"),
+            Err(TreeError::InvalidName { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_commits_return_errors() {
+        assert!(matches!(
+            parse_commit(b"tree 0000000000000000000000000000000000000000\n"),
+            Err(CommitError::MissingHeaderTerminator)
+        ));
+        assert!(matches!(
+            parse_commit(b" continuation\n\n"),
+            Err(CommitError::UnexpectedContinuation { .. })
+        ));
     }
 }

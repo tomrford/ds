@@ -1,149 +1,129 @@
 # Git push
 
-`ds git push` publishes hidden-safe Git history from a native Devspace checkout.
-The repository Durable Object journals exact expected-old-OID leases and decides
-the result from the observed remote refs. The Git process exit code is never the
-authority for whether a push succeeded.
+`ds git push` is the only supported path from canonical Devspace history to a
+public Git remote. It projects hidden paths, uploads both sides of every
+required canonical/public pair to the cloud, and binds the Git subprocess
+result to the cloud journal.
 
 ## Commands
 
-The Git boundary is available only in Devspace checkouts:
+Register a remote:
 
-```text
-ds git remote add <name> <url>
+```sh
+ds git remote add origin git@example.com:owner/project.git
 ds git remote list
-ds git fetch [--remote <name>] [-b <bookmark> ...]
-ds git push [-b <bookmark> ...] [--deleted] [--remote <name>]
 ```
 
-The default remote is `origin`. Bookmark arguments are literal Git branch names,
-not patterns. Tags, push options and the remaining stock jj Git commands are
-fenced because the native store is not Git-backed.
+Push literal bookmark names:
 
-The repository Durable Object owns the remote registry, so a fresh recovery
-machine resolves the same remote without inheriting another machine's Git
-configuration. A same-URL registration is idempotent. Changing a URL clears
-that remote's projection states, cursors and pending work while retaining the
-repository-wide immutable Git receipts. Password-bearing URL userinfo is
-rejected; credentials do not live in the registry.
+```sh
+ds git push --remote origin --bookmark main
+ds git push --remote origin --bookmark main --bookmark release
+```
+
+Delete every tracked remote bookmark whose local bookmark is absent:
+
+```sh
+ds git push --remote origin --deleted
+```
+
+`--deleted` can be combined with explicit bookmarks. Devspace rejects inferred
+or unjournaled deletions.
 
 ## Push flow
 
-A push acquires the per-repository sync lock and performs the ordinary
-in-process repository sync before resolving requested local bookmarks from the
-locked repository state. A conflicted bookmark fails before Git contact.
-An absent local bookmark is a deletion only when the selected remote has a
-projection cursor for it; otherwise the command reports `no such bookmark`.
-`--deleted` selects every cursor for the selected remote whose local bookmark
-is absent and whose local remote bookmark is tracked. It excludes untracked
-remote bookmarks, present local bookmarks and cursors for other remotes. An
-explicit push refuses to overwrite a present untracked remote bookmark and
-advises tracking it first. A creation with no remote bookmark still starts
-tracking automatically. `--deleted` can be combined with explicit `-b`
-arguments.
+One push holds the repository sync lock and performs this sequence:
 
-After sync, the command:
+1. recover any pending batch that overlaps the requested remote bookmarks;
+2. read the complete projection snapshot;
+3. resolve each local bookmark to its canonical Git OID;
+4. seed projection with existing canonical/public pairs;
+5. project hidden paths parent-first;
+6. scan each complete public tree against the canonical hidden policy;
+7. upload the Git closure of every canonical and public head;
+8. begin a durable projection batch with expected old public OIDs;
+9. invoke `git push --porcelain` with an exact force-with-lease for each ref;
+10. report the observed live OIDs to the Worker;
+11. atomically accept all journal cursors or record the batch as aborted;
+12. write one native Jujutsu operation that tracks the accepted remote
+    bookmarks.
 
-1. pages one projection snapshot at a fixed activation high-water and loads the
-   accepted mappings, cursors and pending batches;
-2. opens or creates the rebuildable Git sidecar at the machine repository's
-   `projection/` directory;
-3. supplies the repository's accepted mappings to `export_reachable`, exports
-   its canonical target and scans the resulting public head again under the
-   target commit's hidden set;
-4. imports the public Git commits as native public shadows and assembles each
-   new journal state from the Git OID, canonical commit, public commit and the
-   canonical commit's hidden-set identity;
-5. discovers the canonical target and public-shadow commit closure, negotiates
-   cloud inventory, and uploads and installs the missing immutable packs;
-6. creates a random 128-bit journal batch carrying one update per bookmark,
-   the cursor's expected old OID and the proposed head state, or no proposed
-   state for deletion;
-7. performs one foreground, atomic, lease-protected Git push through the
-   registered URL and Git's normal credential stack;
-8. observes the complete requested ref set and submits those values to journal
-   recovery; and
-9. reports success only when the journal accepts the batch; and
-10. records one jj operation that moves each pushed `<bookmark>@<remote>` to
-    the pushed canonical commit in tracked state, or removes it after deletion.
+An identity projection sends the canonical commit itself. No public mirror or
+mapping row exists, and existing Git signature bytes remain intact. A hidden
+path or rewritten parent creates a minimal public commit in the same Git
+object database.
 
-A cursor already binding the bookmark to the selected canonical commit is
-up-to-date and creates no journal batch. The command still repairs a stale
-local remote-tracking bookmark from that cursor in the same recorded operation.
-Creation pushes automatically track the new remote bookmark. Successful output
-is one line per requested ref: creation, deletion and up-to-date results are
-named directly; updates show the old and new short Git OIDs. Projection, pack
-and Git plumbing output stays captured.
+The cloud receives both canonical and public closures before the batch begins.
+This makes the batch recoverable by any enrolled machine with the repository
+identity.
 
-The journal decision remains authoritative if the local view transaction
-fails. The command prints the successful push lines, exits successfully and
-warns the operator to repair creations and updates with `ds git fetch`, or to
-remove a landed deletion from the view with
-`ds bookmark forget <bookmark> --include-remotes`.
+## Leases and atomic journal state
+
+Each requested bookmark carries an expected old public OID from the active
+journal cursor. The Git subprocess uses that value as its lease. A missing
+cursor permits only creation, not an unverified overwrite.
+
+A multi-ref Git server can accept some refs and reject others. Devspace treats
+the journal update as one unit: the Worker accepts the batch only when every
+observed ref equals its proposed public OID. Otherwise it aborts the batch and
+does not advance any cursor.
+
+The remote may therefore contain a partial Git-side result after a rejected
+multi-ref push. The next command observes that state under the same leases
+instead of fabricating success.
 
 ## Git subprocess
 
-Every non-empty batch uses:
+The subprocess receives:
 
-- `git push --porcelain --no-verify --atomic`;
-- one `--force-with-lease=<ref>:<expected-oid>` per ref, with an empty
-  expectation for creation;
-- unforced OID-to-ref refspecs, or deletion refspecs; and
-- `LC_ALL=C` for stable porcelain parsing.
+- the registered remote URL;
+- literal `refs/heads/<bookmark>` destinations;
+- canonical public source OIDs from the shared bare object database;
+- exact expected-old leases;
+- isolated credential and prompt settings.
 
-After every attempt, successful or not, `git ls-remote --refs` observes all
-requested refs. An atomic-capability or remote-policy rejection fails the whole
-batch. A lease rejection tells the operator to fetch the remote move before
-retrying the push.
+Devspace parses porcelain output and then observes the remote refs. Process
+exit alone is not proof of the final remote state.
 
-The subprocess wrapper retains one structured report entry for every requested
-ref, including refs Git did not mention. If remote observation fails, the
-journal batch remains pending because absence cannot be inferred from missing
-output. If the push process fails but observation shows every proposed value,
-the journal accepts the batch; if observation shows every expected value, an
-unclaimed batch aborts. Mixed or otherwise ambiguous values remain
-quarantined.
+The remote URL is stored in the projection journal. Normal Jujutsu Git commands
+that bypass this boundary are rejected for owned Devspace repositories.
 
 ## Recovery
 
-Before creating a new batch, the command checks for pending batches overlapping
-the requested remote and bookmarks. It also refreshes this check when
-`begin_push` loses a race to another pending owner.
+The durable batch is written before `git push`. If the process exits after the
+remote accepted refs but before the Worker records them, the next overlapping
+push or fetch:
 
-The recovery machine claims the complete pending batch, reads its exact replay
-payload and repeats the recorded multi-ref lease push. Active mappings plus the
-replay's quarantined mappings rebuild missing Git objects in an empty sidecar.
-If replay exposes a missing canonical object, the machine downloads and
-installs the cloud pack catalog through the normal pack path, then re-exports.
-Every rebuilt public head passes the hidden-path scan before Git contact.
+1. claims a new recovery fence;
+2. downloads any missing cloud Git packs;
+3. replays the exact proposed states and hidden-path scans;
+4. repeats the leased Git updates;
+5. submits the observed live OIDs;
+6. accepts or aborts the original batch.
 
-The command observes the complete replayed ref set and calls `recover_push`
-with the new fencing token. Only an accepted journal outcome completes
-recovery. This lets a machine with a fresh native clone and no sidecar finish a
-push after another machine moved the remote ref and stopped before finalising
-the journal.
-
-`ds doctor` surfaces this state. For each registered repository it reads the
-projection journal and warns about every pending batch with its remote,
-bookmark names and owner machine, noting that pushes to those bookmarks stay
-blocked until a push recovers the batch. When the cloud is unreachable the
-check degrades to a non-fatal warning.
+Batch IDs and request hashes make every transition idempotent. A stale recovery
+owner cannot commit after a newer fence is issued.
 
 ## Credentials and diagnostics
 
-HTTPS pushes inherit configured credential helpers. SSH pushes inherit the
-user's SSH configuration and `SSH_AUTH_SOCK`. Foreground pushes may prompt.
-Remote URLs never appear in arguments retained for diagnostics: the safe
-command shape uses `<remote>`. Diagnostic stderr is bounded and removes lines
-containing the remote URL, its authority or injected credential environment
-values. Callers pass the registry URL only through the redacting `RemoteUrl`
-wrapper and never format it themselves.
+Git credentials come from the user's Git configuration and credential helpers.
+Devspace does not store remote passwords or tokens in the cloud journal.
 
-The journal and wire protocol carry 20-byte SHA-1 OIDs. SHA-256 remotes remain
-unsupported because the journal does not yet carry an object-format field or
-variable-length OIDs.
+Diagnostics name the failed phase: projection, hidden-path scan, cloud upload,
+batch creation, Git subprocess, live-ref observation, or journal recovery.
+Sensitive credential material is not printed.
 
 ## Unsupported surface
 
-Push options, tags, signing and SHA-256 remotes are outside the native Git
-surface.
+The boundary deliberately excludes:
+
+- arbitrary refspecs and tag pushes;
+- bypassing projection with raw `git push`;
+- force without an exact journal lease;
+- partial journal acceptance for multi-ref pushes;
+- public export of conflicted canonical commits;
+- signing newly rewritten public projection commits.
+
+Identity commits keep signatures because their exact canonical bytes are
+pushed. Signing a public commit that projection must rewrite remains the only
+open signing question.

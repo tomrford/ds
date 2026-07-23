@@ -1,50 +1,53 @@
-import { compareBytes, equalBytes } from "./kernel";
+import { compareGitBytes, equalGitBytes } from "./kernel";
 
 const MANIFEST_MAGIC = new Uint8Array([0x44, 0x53, 0x50, 0x4b]);
-const MANIFEST_VERSION = 1;
+const MANIFEST_VERSION = 2;
 const MANIFEST_HEADER_BYTES = 96;
-const OBJECT_ENTRY_BYTES = 88;
+const HEAD_ENTRY_BYTES = 20;
+const OBJECT_ENTRY_BYTES = 44;
 const CHUNK_ENTRY_BYTES = 80;
 
-export const MIN_CHUNK_BYTES = 64 * 1024;
-export const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
-export const MAX_PACK_BYTES = 64 * 1024 * 1024;
-export const MAX_OBJECT_BYTES = 1024 * 1024;
-export const MAX_PACK_OBJECTS = 65_536;
-export const MAX_PACK_HEADS = 4_096;
-export const MAX_PACK_CHUNKS = MAX_PACK_BYTES / MIN_CHUNK_BYTES;
-export const MAX_MANIFEST_BYTES =
+export const MIN_GIT_CHUNK_BYTES = 64 * 1024;
+export const MAX_GIT_CHUNK_BYTES = 8 * 1024 * 1024;
+export const MAX_GIT_PACK_BYTES = 64 * 1024 * 1024;
+export const MAX_GIT_OBJECT_BYTES = 1024 * 1024;
+export const MAX_GIT_PACK_OBJECTS = 65_536;
+export const MAX_GIT_PACK_HEADS = 4_096;
+export const MAX_GIT_PACK_CHUNKS = MAX_GIT_PACK_BYTES / MIN_GIT_CHUNK_BYTES;
+export const MAX_GIT_MANIFEST_BYTES =
   MANIFEST_HEADER_BYTES +
-  MAX_PACK_HEADS * 64 +
-  MAX_PACK_OBJECTS * OBJECT_ENTRY_BYTES +
-  MAX_PACK_CHUNKS * CHUNK_ENTRY_BYTES;
-export const STORAGE_PART_BYTES = 1024 * 1024;
+  MAX_GIT_PACK_HEADS * HEAD_ENTRY_BYTES +
+  MAX_GIT_PACK_OBJECTS * OBJECT_ENTRY_BYTES +
+  MAX_GIT_PACK_CHUNKS * CHUNK_ENTRY_BYTES;
+export const GIT_STORAGE_PART_BYTES = 1024 * 1024;
 
-export interface ManifestObject {
+export interface GitManifestObject {
   kind: number;
   id: Uint8Array;
   offset: number;
   length: number;
 }
 
-export interface ManifestChunk {
+export interface GitManifestChunk {
   offset: number;
   length: number;
   hash: Uint8Array;
 }
 
-export interface PackManifest {
+export interface GitPackManifest {
   chunkBytes: number;
   packLength: number;
   packHash: Uint8Array;
-  operationHeads: Uint8Array[];
-  objects: ManifestObject[];
-  chunks: ManifestChunk[];
+  headCommits: Uint8Array[];
+  objects: GitManifestObject[];
+  chunks: GitManifestChunk[];
 }
 
-export function decodeManifest(bytes: Uint8Array): PackManifest {
+export function decodeGitManifest(bytes: Uint8Array): GitPackManifest {
   if (bytes.byteLength < MANIFEST_HEADER_BYTES) throw new Error("manifest header is truncated");
-  if (!equalBytes(bytes.subarray(0, 4), MANIFEST_MAGIC)) throw new Error("invalid manifest magic");
+  if (!equalGitBytes(bytes.subarray(0, 4), MANIFEST_MAGIC)) {
+    throw new Error("invalid manifest magic");
+  }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (view.getUint16(4, true) !== MANIFEST_VERSION) throw new Error("unsupported manifest version");
   requireZero(bytes.subarray(6, 8), "manifest header reserved bytes");
@@ -53,40 +56,40 @@ export function decodeManifest(bytes: Uint8Array): PackManifest {
   const objectCount = view.getUint32(16, true);
   const chunkCount = view.getUint32(20, true);
   const packLength = readLength(view, 24, "pack length");
-  if (chunkBytes < MIN_CHUNK_BYTES || chunkBytes > MAX_CHUNK_BYTES) {
+  if (chunkBytes < MIN_GIT_CHUNK_BYTES || chunkBytes > MAX_GIT_CHUNK_BYTES) {
     throw new Error("manifest chunk size is outside the canonical range");
   }
-  if (headCount > MAX_PACK_HEADS) throw new Error("manifest has too many operation heads");
+  if (headCount > MAX_GIT_PACK_HEADS) throw new Error("manifest has too many head commits");
   if (objectCount === 0) throw new Error("manifest must contain at least one object");
-  if (objectCount > MAX_PACK_OBJECTS) throw new Error("manifest has too many objects");
-  if (chunkCount > MAX_PACK_CHUNKS) throw new Error("manifest has too many chunks");
-  if (packLength > MAX_PACK_BYTES) throw new Error("manifest pack exceeds the byte limit");
+  if (objectCount > MAX_GIT_PACK_OBJECTS) throw new Error("manifest has too many objects");
+  if (chunkCount > MAX_GIT_PACK_CHUNKS) throw new Error("manifest has too many chunks");
+  if (packLength > MAX_GIT_PACK_BYTES) throw new Error("manifest pack exceeds the byte limit");
   const expectedLength =
     MANIFEST_HEADER_BYTES +
-    headCount * 64 +
+    headCount * HEAD_ENTRY_BYTES +
     objectCount * OBJECT_ENTRY_BYTES +
     chunkCount * CHUNK_ENTRY_BYTES;
   if (bytes.byteLength !== expectedLength) throw new Error("manifest length does not match counts");
 
   const packHash = bytes.slice(32, 96);
   let offset = MANIFEST_HEADER_BYTES;
-  const operationHeads: Uint8Array[] = [];
+  const headCommits: Uint8Array[] = [];
   for (let index = 0; index < headCount; index += 1) {
-    operationHeads.push(bytes.slice(offset, offset + 64));
-    offset += 64;
+    headCommits.push(bytes.slice(offset, offset + HEAD_ENTRY_BYTES));
+    offset += HEAD_ENTRY_BYTES;
   }
-  requireStrictOrder(operationHeads, compareBytes, "operation heads");
+  requireStrictOrder(headCommits, compareGitBytes, "head commits");
 
-  const objects: ManifestObject[] = [];
+  const objects: GitManifestObject[] = [];
   for (let index = 0; index < objectCount; index += 1) {
     const kind = bytes[offset];
-    if (kind > 5) throw new Error(`manifest object ${index} has an unknown kind`);
+    if (kind > 2) throw new Error(`manifest object ${index} has an unknown kind`);
     requireZero(bytes.subarray(offset + 1, offset + 8), `manifest object ${index} reserved bytes`);
     objects.push({
       kind,
-      id: bytes.slice(offset + 8, offset + 72),
-      offset: readLength(view, offset + 72, `object ${index} offset`),
-      length: readLength(view, offset + 80, `object ${index} length`),
+      id: bytes.slice(offset + 8, offset + 28),
+      offset: readLength(view, offset + 28, `object ${index} offset`),
+      length: readLength(view, offset + 36, `object ${index} length`),
     });
     offset += OBJECT_ENTRY_BYTES;
   }
@@ -97,11 +100,11 @@ export function decodeManifest(bytes: Uint8Array): PackManifest {
     undefined,
     "object",
   );
-  if (objects.some((object) => object.length > MAX_OBJECT_BYTES)) {
+  if (objects.some((object) => object.length > MAX_GIT_OBJECT_BYTES)) {
     throw new Error("manifest object exceeds the byte limit");
   }
 
-  const chunks: ManifestChunk[] = [];
+  const chunks: GitManifestChunk[] = [];
   for (let index = 0; index < chunkCount; index += 1) {
     const chunkOffset = readLength(view, offset, `chunk ${index} offset`);
     const length = view.getUint32(offset + 8, true);
@@ -119,7 +122,7 @@ export function decodeManifest(bytes: Uint8Array): PackManifest {
     chunkBytes,
     "chunk",
   );
-  return { chunkBytes, packLength, packHash, operationHeads, objects, chunks };
+  return { chunkBytes, packLength, packHash, headCommits, objects, chunks };
 }
 
 function readLength(view: DataView, offset: number, field: string): number {
@@ -144,8 +147,8 @@ function requireStrictOrder<T>(
   }
 }
 
-function compareObjects(left: ManifestObject, right: ManifestObject): number {
-  return left.kind - right.kind || compareBytes(left.id, right.id);
+function compareObjects(left: GitManifestObject, right: GitManifestObject): number {
+  return left.kind - right.kind || compareGitBytes(left.id, right.id);
 }
 
 function validateRanges(
@@ -168,15 +171,15 @@ function validateRanges(
   if (expectedOffset !== packLength) throw new Error(`manifest ${field} ranges do not fill pack`);
 }
 
-export function splitParts(bytes: Uint8Array): Uint8Array[] {
+export function splitGitParts(bytes: Uint8Array): Uint8Array[] {
   const parts: Uint8Array[] = [];
-  for (let offset = 0; offset < bytes.byteLength; offset += STORAGE_PART_BYTES) {
-    parts.push(bytes.slice(offset, offset + STORAGE_PART_BYTES));
+  for (let offset = 0; offset < bytes.byteLength; offset += GIT_STORAGE_PART_BYTES) {
+    parts.push(bytes.slice(offset, offset + GIT_STORAGE_PART_BYTES));
   }
   return parts;
 }
 
-export function concatParts(parts: Uint8Array[], limit: number): Uint8Array {
+export function concatGitParts(parts: Uint8Array[], limit: number): Uint8Array {
   const length = parts.reduce((total, part) => total + part.byteLength, 0);
   if (length > limit) throw new Error(`stored bytes exceed ${limit}-byte limit`);
   const bytes = new Uint8Array(length);
@@ -188,7 +191,7 @@ export function concatParts(parts: Uint8Array[], limit: number): Uint8Array {
   return bytes;
 }
 
-export async function readBoundedBody(
+export async function readBoundedGitBody(
   request: Request,
   limit: number,
   object: string,
@@ -211,5 +214,5 @@ export async function readBoundedBody(
     }
     chunks.push(value);
   }
-  return concatParts(chunks, limit);
+  return concatGitParts(chunks, limit);
 }

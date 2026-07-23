@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 
-use devspace_machine_git::{
+use devspace_machine::{
     FetchFlowResult, GitProcessEnvironment, MachineGitRepository, Oid, ProjectionGitCursor,
     QualifiedRef, RemoteUrl, fetch_with_journal, ls_remote_heads,
 };

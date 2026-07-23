@@ -15,7 +15,6 @@ async-trait.workspace = true
 blake2.workspace = true
 clap.workspace = true
 devspace-machine = { path = "../machine" }
-devspace-machine-git = { path = "../machine-git" }
 dunce.workspace = true
 etcetera.workspace = true
 futures.workspace = true

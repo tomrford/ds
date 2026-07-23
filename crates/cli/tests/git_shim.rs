@@ -5,8 +5,8 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use devspace_machine::MachineGitRepository as MachineRepository;
 use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
-use devspace_machine_git::MachineGitRepository as MachineRepository;
 
 mod support;
 

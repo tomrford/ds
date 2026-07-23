@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use devspace_machine::{HttpTransport, ProjectionSnapshot, RepositoryName};
-use devspace_machine_git::MachineGitRepository as MachineRepository;
+use devspace_machine::MachineGitRepository as MachineRepository;
+use devspace_machine::{GitHttpTransport, ProjectionGitSnapshot, RepositoryName};
 
 mod support;
 
@@ -399,31 +399,22 @@ impl LiveFixture {
             .iter()
             .find(|cursor| cursor.remote == "origin" && cursor.bookmark == name)
             .unwrap();
-        jj_lib::backend::CommitId::new(cursor.canonical_commit_id.to_vec())
+        jj_lib::backend::CommitId::new(cursor.canonical_oid.0.to_vec())
     }
 
-    async fn snapshot(&self) -> ProjectionSnapshot {
+    async fn snapshot(&self) -> ProjectionGitSnapshot {
         let store = machine_store(&self.home);
         let entry = self.entry();
         let config = store.load_config().unwrap();
-        let transport = HttpTransport::new(
-            &config,
+        let transport = GitHttpTransport::new(
+            config.base_url(),
+            config.shared_secret().as_str(),
+            config.machine_id().as_str(),
             entry.identity.repository_id.as_str(),
-            parse_incarnation(entry.identity.incarnation.as_str()),
+            entry.identity.incarnation.as_str(),
         )
         .unwrap();
-        let mut snapshot = transport.get(0, None).await.unwrap();
-        let through = snapshot.through;
-        while snapshot.has_more {
-            let page = transport
-                .get(snapshot.next_after, Some(through))
-                .await
-                .unwrap();
-            snapshot.mappings.extend(page.mappings);
-            snapshot.next_after = page.next_after;
-            snapshot.has_more = page.has_more;
-        }
-        snapshot
+        transport.projection_snapshot_all().await.unwrap()
     }
 }
 
@@ -495,8 +486,4 @@ fn unique_repository_name(temp: &Path, label: &str) -> String {
         .map(|byte| byte.to_ascii_lowercase() as char)
         .collect::<String>();
     format!("git-fetch-{label}-{}-{suffix}", std::process::id())
-}
-
-fn parse_incarnation(value: &str) -> [u8; 16] {
-    std::array::from_fn(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap())
 }

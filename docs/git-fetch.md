@@ -1,203 +1,147 @@
 # Git fetch
 
-Fetch moves public Git history into canonical native history: it imports new
-remote commits as raw public shadows, then lifts them onto private lineage so
-hidden content and private ancestry are preserved. The semantics follow
-`hidden.md`.
+`ds git fetch` imports public Git history through the projection journal. It
+fetches exact public objects into the canonical bare Git object database, lifts
+the inherited hidden overlay onto new history, makes both public and canonical
+closures cloud-durable, and updates remote-tracking bookmarks.
 
 ## Command
 
-The command is available only in a Devspace checkout:
+Fetch every branch from the default remote:
 
-```text
-ds git fetch [--remote <name>] [-b <bookmark> ...]
+```sh
+ds git fetch
 ```
 
-The default remote is `origin`. Bookmark arguments are literal Git branch
-names. With no bookmark arguments, fetch imports every advertised remote head.
-The command runs ordinary repository sync first and holds the repository sync
-lock through transport, journal mutation and native view update.
+Select a remote or literal branch names:
 
-## Import from a remote
-
-`ds repo add` imports an existing Git remote without creating a checkout:
-
-```text
-ds repo add <git-url> [--name <name>]
+```sh
+ds git fetch --remote origin
+ds git fetch --remote origin --branch main --branch release
 ```
 
-The name defaults to the remote URL basename without a trailing `.git`.
-`ds init` uses the same import path and adds the first checkout:
+The remote must be registered with `ds git remote add`. Arbitrary refspecs and
+unregistered URLs are outside this boundary.
 
-```text
-ds init <git-url> [<directory>] [--name <name>]
-```
+## Fetch flow
 
-Both commands are online-only. They do not convert an existing local Git
-repository in place. The checkout directory defaults to `./<name>`.
+One fetch holds the repository sync lock and performs this sequence:
 
-Import composes the repository creation, remote registry, empty native
-materialization and fetch paths. Initialization adds checkout creation. Both
-discover the symbolic remote HEAD with `git ls-remote --symref`, import every
-advertised head and track the HEAD bookmark at `origin`. Initialization leaves
-a new empty working-copy change on top. Empty remotes use `ds repo new`
-instead. SHA-256 Git remotes are not supported.
+1. recover any pending push batch that overlaps the requested bookmarks;
+2. read the complete projection snapshot;
+3. run `git fetch` into temporary refs in the shared bare object database;
+4. read the fetched public head OIDs;
+5. seed overlay-lift with journaled canonical/public pairs;
+6. replay canonical hidden state over each newly reached public commit;
+7. print every data-disclosure warning;
+8. upload the Git closure of all public and canonical heads;
+9. record one idempotent fetch transaction in the Worker;
+10. update Jujutsu remote-tracking bookmarks to the canonical heads in one
+    native operation.
 
-Without a Git URL, `ds init [<directory>]` creates a blank repository named
-after the directory and creates its first checkout there.
-
-Repository creation uses the same durable idempotency intent as `ds repo new`.
-A retry after a lost cloud response resumes that intent. A later failure keeps
-the created cloud repository visible in the error and reports that the local
-Git import is incomplete.
+The public objects are never translated or normalized. Their Git OIDs remain
+the remote OIDs.
 
 ## Seed selection
 
-For each fetched ref, the machine walks backwards from the exact fetched Git
-head. A Git commit can seed private history only when the cloud journal holds
-both its immutable Git-to-public receipt and an active projection state
-binding that Git object and public shadow to one private canonical commit and
-hidden-set identity for the relevant remote and bookmark.
+The journal snapshot supplies active and historical pair states:
 
-Lineage comes only from exact Git objects reached in the imported ancestry. A
-cursor or pending state for the same ref is not evidence that rewritten or
-unrelated history descends from private state. When the same Git object is
-recorded through several bookmarks, the newest state per bookmark must agree
-on one private commit and hidden-set identity; otherwise the seed is
-ambiguous and the fetch fails closed.
+```text
+canonicalOid  publicOid  hiddenSetId?
+```
 
-When a ref has a cursor, its fetched head must descend from the cursor's Git
-object in the sidecar graph. A non-descendant head is a rewritten ref and
-fails closed; force-pushed history is unsupported. A ref with neither a cursor
-nor any receipt-backed seed in its ancestry imports from scratch.
+Each public OID in those states is a stop point for overlay-lift. Its canonical
+OID supplies the hidden lineage from which new descendants continue.
 
-Pending push batches overlapping a fetched ref are recovered before import
-(see `git-projection.md`); stale no-op lineage is discarded before unrelated
-history is interpreted.
+If a fetched ref has an active cursor, its new public head must descend from
+the cursor's public OID. Devspace rejects a rewritten remote ref instead of
+guessing which canonical hidden lineage should own it.
 
-## Import
+An untracked public history with no hidden policy can start from identity. A
+history that requires private overlay needs an unambiguous journal seed.
 
-`import_reachable` translates new Git commits, trees, files and symlinks into
-canonical objects, stopping at known raw public shadows supplied from durable
-receipts. Import is a translation boundary, not an authority: it publishes no
-operation head. Git links fail before the simple backend can encode a tree;
-submodules are unsupported. Signatures, which cannot survive translation, are
-stripped; raw Git commit data carries a secure-signature field that is cleared
-before canonical encoding. Import limits one request to 256 heads, 1,024
-commits of ancestry per head, 256 levels of tree recursion and 8,192 entries
-in one tree. These are current safety limits aligned with the projection
-request bounds, not production quotas. Ordinary supplied mappings are
-recomputed and checked; only durable receipt stops terminate translation.
+## Overlay lift
 
-## Lifting
+Overlay-lift walks foreign commits parent-first. For each commit it maps public
+parents to canonical parents, compares the public-parent and canonical-parent
+base trees, and applies the public change over the canonical base.
 
-Newly imported public shadows are lifted parent-first. For each public commit
-C:
+If the parents are unchanged, no hidden policy exists, and no hidden path is
+published, the commit is an identity:
 
-1. each raw public parent is replaced by its already-lifted private commit;
-2. the raw public parent trees merge into P, the lifted private parent trees
-   merge into Q;
-3. the lifted tree is the 3-term merge Q − P + C.tree — the same tree rebase
-   jj itself uses;
-4. the applicable hidden set is resolved from Q; a conflict in any of Q's
-   `.dsprivate` files fails fetch closed;
-5. a clean public-introduced value at a hidden path that is absent from Q is
-   rewritten to the tombstone conflict defined in `hidden.md`; values supplied
-   by Q are not rewritten;
-6. the canonical commit is written with the lifted private parents, the
-   merged tree and the imported commit's metadata.
+```text
+canonicalOid == publicOid
+```
 
-Where public trees omit hidden paths, the merged private parents supply their
-values unchanged: hidden content, including `.dsprivate` itself, flows to
-lifted commits structurally. A public edit at a hidden path becomes a native jj
-conflict exactly as `hidden.md` specifies; a Git merge lifts by merging all
-public parents and all private parents separately and replaying the delta
-between them, preserving parent count and order.
+No mirror commit and no pair row are created. This preserves the exact foreign
+commit, including its signatures and unknown headers.
 
-Each lifted commit produces a parent-first state row containing its Git object,
-lifted canonical ID, raw public-shadow ID and the identity of the applicable
-hidden set resolved from Q. This identity remains deterministic even when the
-resulting lifted tree contains conflicts.
+If hidden state or rewritten parents require a mirror, Devspace creates a
+canonical Git commit while retaining the original public commit as the pair's
+`publicOid`. The canonical mirror inherits private paths and `.dsprivate`
+policy from its canonical parents. Both objects remain in the same Git object
+database and become cloud-durable.
 
-Lifted results are deterministic: the same fetched commits, seeds and
-hidden-set identities produce identical canonical objects on any machine.
+Merges replay all parent lineages through Jujutsu's merged-tree semantics.
+Hidden conflicts remain canonical conflicts; they are never flattened into a
+public tree.
+
+## Disclosure warning
+
+A foreign commit can publish a path that the inherited `.dsprivate` policy
+marks hidden. That content is already visible on the Git remote. Fetch prints:
+
+```text
+WARNING: DATA DISCLOSURE: foreign commit <oid> contains hidden path `<path>`;
+that foreign version is publicly visible on the remote
+```
+
+Devspace does not silently choose the public or private value. It creates a
+canonical Jujutsu tree conflict between the foreign content and a deterministic
+tombstone that explains the collision. The user must resolve the conflict.
+
+Fetch cannot retract the disclosed bytes. Rotate or revoke any exposed secret
+outside Devspace.
 
 ## Journal transaction
 
-Fetch records observed remote history with this idempotent repository Durable
-Object mutation:
+Each fetched bookmark records:
 
-```text
-POST /repositories/:repository/git/fetches
-```
+- the observed public OID;
+- the expected active cursor OID, if one exists;
+- newly created canonical/public pair states reachable from that bookmark;
+- either the proposed pair index or an `identityOid`.
 
-The strict request contains `incarnation`, a stable 16-byte `fetchId`, the
-authenticated 16-byte `machineId`, a registered `remote`, non-empty `refs` and
-`receipts`. Each ref contains `bookmark`, its exact `observedGitOid`, the
-nullable `expectedCursorOid`, parent-first projection `states`, and a nullable
-`proposedState` index. A null index selects an already-active state for the
-same remote, bookmark and observed Git object. Receipts contain `gitOid` and
-`publicCommitId`; the array can be empty when every mapping is known. The
-route uses the projection body, ref and state limits, and caps receipts at the
-same 8,192-entry limit as states.
+`identityOid` must equal the observed public OID and cannot accompany pair
+states. The Worker verifies every public and canonical commit is durable before
+it advances the cursor.
 
-One synchronous storage transaction validates, in order: the fetch request
-hash under `fetchId` (`fetch-request-mismatch`); exact expected cursors
-(`fetch-cursor-stale`); absence of an overlapping pending push
-(`fetch-overlaps-pending-push`); complete raw-public and lifted-private commit
-closures (`fetch-commit-not-durable`); immutable receipts
-(`git-receipt-conflict`); receipt coverage for every state
-(`fetch-state-receipt-mismatch`); and one lineage per Git object across the
-request and the newest active state per bookmark
-(`fetch-lineage-ambiguous`). An unregistered remote fails with
-`remote-not-found`.
-
-The transaction inserts receipts, appends every new state as active with an
-activation sequence, advances each ref cursor and records the response under
-`fetchId`. The response is `{fetchId, activationCursor}`. An identical retry
-returns that recorded response without inserting states again. No separate
-fetch cursor exists: the projection activation cursor pages journal changes
-and the per-ref cursor identifies the last accepted state.
-
-The machine uploads and confirms both the raw public and lifted private object
-closures before calling the mutation, so the durability gate holds. A lost
-response is replayed safely under the same fetch ID.
-
-The first version reads seed state from the existing paged projection
-snapshot; a bounded exact-lookup read (by Git ID list) is a later
-optimization, not a correctness surface.
+The fetch ID and canonical request hash make retries idempotent. Reusing the ID
+for different bytes is rejected. Cursor advancement is transactional across
+the request.
 
 ## Native view update and recovery
 
-After the journal accepts a fetch, one jj transaction described
-`fetch from <remote>` updates each `<bookmark>@<remote>` target from the
-journal cursor. Existing tracked remote bookmarks propagate into their local
-bookmarks through jj-lib's ref-target merge: an unchanged local bookmark
-fast-forwards, concurrent local and remote movement produces a conflicted
-bookmark, and no commit is discarded. Newly observed remote bookmarks remain
-untracked and do not create or move a local bookmark.
+The cloud journal is committed before the local Jujutsu remote-tracking
+operation. If the process stops between those steps, the next fetch reads the
+same journal result and can repeat the local update.
 
-The journal cursor is the source of truth for this update. An up-to-date Git
-observation still repairs a missing or stale native remote bookmark. If the
-process stops after `record_fetch` but before committing the view transaction,
-the next fetch performs that repair without another journal mutation.
+A fetch first recovers overlapping pending pushes because their final public
+OIDs determine the correct seed lineage. Recovery uses the original leases and
+fencing rules described in [Git push](git-push.md).
 
-## Pollution warning
-
-Lifting reports every conflict at a path hidden by the applicable hidden set,
-including both inserted tombstones and natural merge conflicts. Fetch prints
-one prominent warning listing those paths. The warning states that public
-bytes remain on the Git remote until its history is rewritten externally;
-resolving the native conflict does not erase already-published Git objects.
+Downloaded public and mirrored canonical objects are ordinary Git objects.
+Fresh-machine recovery obtains them from the cloud pack catalog; no local
+sidecar or export cache is authoritative.
 
 ## Exporter interaction
 
-Post-fetch history legitimately carries hidden-path conflicts, but export
-never needs to re-encode those commits: the fetch transaction records the
-binding between each lifted commit and its already-existing public Git
-counterpart, so export of later work stops at the mapped lifted parent.
-Export of a commit that itself carries a conflict — hidden or public — fails
-closed. Hidden-path conflicts present as ordinary jj conflicts; the boundary
-error names the hidden path. The exporter change the fetch path requires is
-therefore mapping-aware traversal plus path-aware rejection, not conflict-term
-filtering.
+The next push starts from the active pair cursor. Locally created canonical
+descendants project from that seed:
+
+- an unchanged hidden-free descendant remains identity;
+- a descendant with hidden paths gets a new public mirror;
+- the lease expects the public OID recorded by fetch.
+
+This round trip preserves the public lineage while the canonical lineage keeps
+its private overlay.

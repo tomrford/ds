@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use devspace_machine::MachineGitRepository as MachineRepository;
 use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
-use devspace_machine_git::MachineGitRepository as MachineRepository;
 
 mod support;
 

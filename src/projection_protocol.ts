@@ -1,29 +1,37 @@
+/**
+ * Projection journal v2 wire contract.
+ *
+ * A state is a canonical/public Git OID pair plus its nullable hidden-set
+ * identity. The v1 `gitOid` and `publicCommitId` fields collapse into
+ * `publicOid`; `canonicalCommitId` becomes `canonicalOid`. Fetch no longer
+ * carries a separate Git-to-public receipt array because a public OID is the
+ * immutable Git object identity. Consequently the v1 8,192 fetch-receipt
+ * bound is obsolete. Request bytes, refs, states, repository refs, and name
+ * bounds remain 4 MiB, 256, 8,192, 512, and 256 UTF-8 bytes respectively.
+ */
 import { z } from "zod";
 
-import { compareBytes, toHex } from "./kernel";
+import { compareGitBytes, gitToHex } from "./kernel";
 import {
   firstZodMessage,
   lowerHexBytesSchema,
   nonNegativeSafeIntegerSchema,
 } from "./validation";
 
-export const MAX_PROJECTION_REQUEST_BYTES = 4 * 1024 * 1024;
-export const MAX_PROJECTION_REFS = 256;
-export const MAX_PROJECTION_STATES = 8_192;
-export const MAX_FETCH_RECEIPTS = MAX_PROJECTION_STATES;
-export const MAX_REPOSITORY_PROJECTION_REFS = 512;
-export const MAX_PROJECTION_NAME_BYTES = 256;
+export const MAX_GIT_PROJECTION_REQUEST_BYTES = 4 * 1024 * 1024;
+export const MAX_GIT_PROJECTION_REFS = 256;
+export const MAX_GIT_PROJECTION_STATES = 8_192;
+export const MAX_REPOSITORY_GIT_PROJECTION_REFS = 512;
+export const MAX_GIT_PROJECTION_NAME_BYTES = 256;
 
 const encoder = new TextEncoder();
 
 const shortIdSchema = (label: string) => lowerHexBytesSchema(16, label);
-const nonZeroHexSchema = (bytes: number, label: string) =>
-  lowerHexBytesSchema(bytes, label).refine((value) => value.some((byte) => byte !== 0), {
+const nonZeroOidSchema = (label: string) =>
+  lowerHexBytesSchema(20, label).refine((value) => value.some((byte) => byte !== 0), {
     error: `${label} must not be zero`,
   });
-const gitOidSchema = (label: string) => nonZeroHexSchema(20, label);
-const objectIdSchema = (label: string) => nonZeroHexSchema(64, label);
-const nullableGitOidSchema = (label: string) => gitOidSchema(label).nullable();
+const nullableOidSchema = (label: string) => nonZeroOidSchema(label).nullable();
 const nameSchema = (label: string) =>
   z
     .string()
@@ -36,90 +44,79 @@ const nameSchema = (label: string) =>
         }),
       { error: `${label} must not contain control characters` },
     )
-    .refine((value) => encoder.encode(value).byteLength <= MAX_PROJECTION_NAME_BYTES, {
-      error: `${label} exceeds ${MAX_PROJECTION_NAME_BYTES} UTF-8 bytes`,
+    .refine((value) => encoder.encode(value).byteLength <= MAX_GIT_PROJECTION_NAME_BYTES, {
+      error: `${label} exceeds ${MAX_GIT_PROJECTION_NAME_BYTES} UTF-8 bytes`,
     });
 
-const projectionStateSchema = z.strictObject({
-  gitOid: gitOidSchema("gitOid"),
-  canonicalCommitId: objectIdSchema("canonicalCommitId"),
-  publicCommitId: objectIdSchema("publicCommitId"),
+const projectionGitStateSchema = z.strictObject({
+  canonicalOid: nonZeroOidSchema("canonicalOid"),
+  publicOid: nonZeroOidSchema("publicOid"),
   hiddenSetId: lowerHexBytesSchema(64, "hiddenSetId").nullable(),
 });
 
-const projectionUpdateSchema = z.strictObject({
+const projectionGitUpdateSchema = z.strictObject({
   bookmark: nameSchema("bookmark"),
-  expectedOldOid: nullableGitOidSchema("expectedOldOid"),
-  states: z.array(projectionStateSchema),
+  expectedOldOid: nullableOidSchema("expectedOldOid"),
+  states: z.array(projectionGitStateSchema),
   proposedState: nonNegativeSafeIntegerSchema.nullable(),
 });
 
-const beginProjectionBatchSchema = z.strictObject({
+const beginProjectionGitBatchSchema = z.strictObject({
   incarnation: shortIdSchema("incarnation"),
   batchId: shortIdSchema("batchId"),
   machineId: shortIdSchema("machineId"),
   remote: nameSchema("remote"),
-  updates: z.array(projectionUpdateSchema).min(1).max(MAX_PROJECTION_REFS),
+  updates: z.array(projectionGitUpdateSchema).min(1).max(MAX_GIT_PROJECTION_REFS),
 });
 
-const fetchReceiptSchema = z.strictObject({
-  gitOid: gitOidSchema("gitOid"),
-  publicCommitId: objectIdSchema("publicCommitId"),
-});
-
-const fetchRefSchema = z.strictObject({
+const fetchGitRefSchema = z.strictObject({
   bookmark: nameSchema("bookmark"),
-  observedGitOid: gitOidSchema("observedGitOid"),
-  expectedCursorOid: nullableGitOidSchema("expectedCursorOid"),
-  states: z.array(projectionStateSchema),
+  observedPublicOid: nonZeroOidSchema("observedPublicOid"),
+  expectedCursorOid: nullableOidSchema("expectedCursorOid"),
+  states: z.array(projectionGitStateSchema),
   proposedState: nonNegativeSafeIntegerSchema.nullable(),
+  identityOid: nullableOidSchema("identityOid"),
 });
 
-const recordFetchSchema = z
-  .strictObject({
-    incarnation: shortIdSchema("incarnation"),
-    fetchId: shortIdSchema("fetchId"),
-    machineId: shortIdSchema("machineId"),
-    remote: nameSchema("remote"),
-    refs: z.array(fetchRefSchema).max(MAX_PROJECTION_REFS),
-    receipts: z.array(fetchReceiptSchema).max(MAX_FETCH_RECEIPTS),
-  })
-  .refine((request) => request.refs.length !== 0 || request.receipts.length !== 0, {
-    error: "fetch request must include refs or receipts",
-  });
+const recordGitFetchSchema = z.strictObject({
+  incarnation: shortIdSchema("incarnation"),
+  fetchId: shortIdSchema("fetchId"),
+  machineId: shortIdSchema("machineId"),
+  remote: nameSchema("remote"),
+  refs: z.array(fetchGitRefSchema).min(1).max(MAX_GIT_PROJECTION_REFS),
+});
 
-const claimProjectionBatchSchema = z.strictObject({
+const claimProjectionGitBatchSchema = z.strictObject({
   incarnation: shortIdSchema("incarnation"),
   machineId: shortIdSchema("machineId"),
 });
 
-const projectionFenceSchema = z.strictObject({
+const projectionGitFenceSchema = z.strictObject({
   incarnation: shortIdSchema("incarnation"),
   machineId: shortIdSchema("machineId"),
   fence: nonNegativeSafeIntegerSchema,
 });
 
-const projectionObservationSchema = z.strictObject({
+const projectionGitObservationSchema = z.strictObject({
   bookmark: nameSchema("bookmark"),
-  liveOid: nullableGitOidSchema("liveOid"),
+  liveOid: nullableOidSchema("liveOid"),
 });
 
-const recoverProjectionBatchSchema = projectionFenceSchema.extend({
-  observations: z.array(projectionObservationSchema).max(MAX_PROJECTION_REFS),
+const recoverProjectionGitBatchSchema = projectionGitFenceSchema.extend({
+  observations: z.array(projectionGitObservationSchema).max(MAX_GIT_PROJECTION_REFS),
 });
 
-export type ProjectionState = z.output<typeof projectionStateSchema>;
-export type ProjectionUpdate = z.output<typeof projectionUpdateSchema>;
-export type BeginProjectionBatchRequest = z.output<typeof beginProjectionBatchSchema>;
-export type FetchReceipt = z.output<typeof fetchReceiptSchema>;
-export type FetchRef = z.output<typeof fetchRefSchema>;
-export type RecordFetchRequest = z.output<typeof recordFetchSchema>;
-export type ProjectionFenceRequest = z.output<typeof projectionFenceSchema>;
-export type ClaimProjectionBatchRequest = z.output<typeof claimProjectionBatchSchema>;
-export type ProjectionObservation = z.output<typeof projectionObservationSchema>;
-export type RecoverProjectionBatchRequest = z.output<typeof recoverProjectionBatchSchema>;
+export type ProjectionGitState = z.output<typeof projectionGitStateSchema>;
+export type ProjectionGitUpdate = z.output<typeof projectionGitUpdateSchema>;
+export type BeginProjectionGitBatchRequest = z.output<typeof beginProjectionGitBatchSchema>;
+export type FetchGitRef = z.output<typeof fetchGitRefSchema>;
+export type RecordGitFetchRequest = z.output<typeof recordGitFetchSchema>;
+export type ProjectionGitFenceRequest = z.output<typeof projectionGitFenceSchema>;
+export type ClaimProjectionGitBatchRequest = z.output<typeof claimProjectionGitBatchSchema>;
+export type ProjectionGitObservation = z.output<typeof projectionGitObservationSchema>;
+export type RecoverProjectionGitBatchRequest = z.output<typeof recoverProjectionGitBatchSchema>;
 
-export class ProjectionProtocolError extends Error {
+export class ProjectionGitProtocolError extends Error {
   constructor(
     message: string,
     readonly code: string,
@@ -128,8 +125,8 @@ export class ProjectionProtocolError extends Error {
   }
 }
 
-export function decodeBeginProjectionBatch(value: unknown): BeginProjectionBatchRequest {
-  const request = parseProjection(beginProjectionBatchSchema, value);
+export function decodeBeginProjectionGitBatch(value: unknown): BeginProjectionGitBatchRequest {
+  const request = parseProjectionGit(beginProjectionGitBatchSchema, value);
   for (const [index, update] of request.updates.entries()) validateUpdate(update, index);
   requireStateLimit(request.updates, "updates");
   request.updates.sort((left, right) => compareNames(left.bookmark, right.bookmark));
@@ -137,105 +134,102 @@ export function decodeBeginProjectionBatch(value: unknown): BeginProjectionBatch
   return request;
 }
 
-export function decodeRecordFetch(value: unknown): RecordFetchRequest {
-  const request = parseProjection(recordFetchSchema, value);
+export function decodeRecordGitFetch(value: unknown): RecordGitFetchRequest {
+  const request = parseProjectionGit(recordGitFetchSchema, value);
   for (const [index, ref] of request.refs.entries()) {
     if (ref.proposedState !== null && ref.proposedState >= ref.states.length) {
       throw new Error(`refs[${index}].proposedState is outside states`);
     }
     if (
       ref.proposedState !== null &&
-      compareBytes(ref.states[ref.proposedState].gitOid, ref.observedGitOid) !== 0
+      compareGitBytes(ref.states[ref.proposedState].publicOid, ref.observedPublicOid) !== 0
     ) {
-      throw new Error(`refs[${index}].proposedState must map the observed Git ID`);
+      throw new Error(`refs[${index}].proposedState must map the observed public OID`);
+    }
+    if (ref.identityOid !== null) {
+      if (ref.proposedState !== null || ref.states.length !== 0) {
+        throw new Error(`refs[${index}].identityOid requires no states or proposedState`);
+      }
+      if (compareGitBytes(ref.identityOid, ref.observedPublicOid) !== 0) {
+        throw new Error(`refs[${index}].identityOid must equal the observed public OID`);
+      }
     }
   }
   requireStateLimit(request.refs, "refs");
   request.refs.sort((left, right) => compareNames(left.bookmark, right.bookmark));
   requireUniqueNames(request.refs, "refs");
-  request.receipts.sort((left, right) => compareBytes(left.gitOid, right.gitOid));
   return request;
 }
 
-export function decodeClaimProjectionBatch(value: unknown): ClaimProjectionBatchRequest {
-  return parseProjection(claimProjectionBatchSchema, value);
+export function decodeClaimProjectionGitBatch(value: unknown): ClaimProjectionGitBatchRequest {
+  return parseProjectionGit(claimProjectionGitBatchSchema, value);
 }
 
-export function decodeRecoverProjectionBatch(value: unknown): RecoverProjectionBatchRequest {
-  const request = parseProjection(recoverProjectionBatchSchema, value);
+export function decodeRecoverProjectionGitBatch(value: unknown): RecoverProjectionGitBatchRequest {
+  const request = parseProjectionGit(recoverProjectionGitBatchSchema, value);
   request.observations.sort((left, right) => compareNames(left.bookmark, right.bookmark));
   requireUniqueNames(request.observations, "observations");
   return request;
 }
 
-export function decodeProjectionShortId(value: unknown, label: string): Uint8Array {
+export function decodeProjectionGitShortId(value: unknown, label: string): Uint8Array {
   return shortIdSchema(label).parse(value);
 }
 
-export function canonicalProjectionBatchBytes(request: BeginProjectionBatchRequest): Uint8Array {
+export function canonicalProjectionGitBatchBytes(
+  request: BeginProjectionGitBatchRequest,
+): Uint8Array {
   return encoder.encode(
     JSON.stringify({
-      incarnation: toHex(request.incarnation),
-      batchId: toHex(request.batchId),
-      machineId: toHex(request.machineId),
+      incarnation: gitToHex(request.incarnation),
+      batchId: gitToHex(request.batchId),
+      machineId: gitToHex(request.machineId),
       remote: request.remote,
       updates: request.updates.map((update) => ({
         bookmark: update.bookmark,
-        expectedOldOid: update.expectedOldOid === null ? null : toHex(update.expectedOldOid),
-        states: update.states.map(encodeProjectionState),
+        expectedOldOid:
+          update.expectedOldOid === null ? null : gitToHex(update.expectedOldOid),
+        states: update.states.map(encodeProjectionGitState),
         proposedState: update.proposedState,
       })),
     }),
   );
 }
 
-export function canonicalFetchBytes(request: RecordFetchRequest): Uint8Array {
+export function canonicalGitFetchBytes(request: RecordGitFetchRequest): Uint8Array {
   return encoder.encode(
     JSON.stringify({
-      incarnation: toHex(request.incarnation),
-      fetchId: toHex(request.fetchId),
-      machineId: toHex(request.machineId),
+      incarnation: gitToHex(request.incarnation),
+      fetchId: gitToHex(request.fetchId),
+      machineId: gitToHex(request.machineId),
       remote: request.remote,
       refs: request.refs.map((ref) => ({
         bookmark: ref.bookmark,
-        observedGitOid: toHex(ref.observedGitOid),
+        observedPublicOid: gitToHex(ref.observedPublicOid),
         expectedCursorOid:
-          ref.expectedCursorOid === null ? null : toHex(ref.expectedCursorOid),
-        states: ref.states.map(encodeProjectionState),
+          ref.expectedCursorOid === null ? null : gitToHex(ref.expectedCursorOid),
+        states: ref.states.map(encodeProjectionGitState),
         proposedState: ref.proposedState,
-      })),
-      receipts: request.receipts.map((receipt) => ({
-        gitOid: toHex(receipt.gitOid),
-        publicCommitId: toHex(receipt.publicCommitId),
+        identityOid: ref.identityOid === null ? null : gitToHex(ref.identityOid),
       })),
     }),
   );
 }
 
-export function compareNullableBytes(
+export function compareNullableGitOids(
   left: Uint8Array | null,
   right: Uint8Array | null,
 ): number {
   if (left === null) return right === null ? 0 : -1;
   if (right === null) return 1;
-  return compareBytes(left, right);
+  return compareGitBytes(left, right);
 }
 
-function parseProjection<T>(schema: z.ZodType<T>, value: unknown): T {
+function parseProjectionGit<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
   if (result.success) return result.data;
-  if (
-    result.error.issues.some(
-      (issue) => issue.code === "custom" && issue.path.length === 0,
-    )
-  ) {
-    throw new ProjectionProtocolError(
-      "fetch request must include refs or receipts",
-      "fetch-empty",
-    );
-  }
   if (result.error.issues.some((issue) => issue.path.includes("hiddenSetId"))) {
-    throw new ProjectionProtocolError(
+    throw new ProjectionGitProtocolError(
       "hiddenSetId must be null or 128 lowercase hex characters",
       "invalid-hidden-set-id",
     );
@@ -243,7 +237,7 @@ function parseProjection<T>(schema: z.ZodType<T>, value: unknown): T {
   throw new Error(firstZodMessage(result.error));
 }
 
-function validateUpdate(update: ProjectionUpdate, index: number) {
+function validateUpdate(update: ProjectionGitUpdate, index: number) {
   if (update.proposedState !== null && update.proposedState >= update.states.length) {
     throw new Error(`updates[${index}].proposedState is outside states`);
   }
@@ -251,26 +245,25 @@ function validateUpdate(update: ProjectionUpdate, index: number) {
     throw new Error(`updates[${index}].states must be empty for a deletion`);
   }
   const stateKeys = update.states
-    .map((state) => `${toHex(state.gitOid)}:${toHex(state.canonicalCommitId)}`)
+    .map((state) => `${gitToHex(state.canonicalOid)}:${gitToHex(state.publicOid)}`)
     .sort();
   if (stateKeys.some((key, stateIndex) => stateIndex > 0 && key === stateKeys[stateIndex - 1])) {
     throw new Error(`updates[${index}].states must not contain duplicate mappings`);
   }
 }
 
-function requireStateLimit(values: Array<{ states: ProjectionState[] }>, field: string) {
+function requireStateLimit(values: Array<{ states: ProjectionGitState[] }>, field: string) {
   const count = values.reduce((total, value) => total + value.states.length, 0);
-  if (count > MAX_PROJECTION_STATES) {
-    throw new Error(`${field} exceeds the ${MAX_PROJECTION_STATES}-state limit`);
+  if (count > MAX_GIT_PROJECTION_STATES) {
+    throw new Error(`${field} exceeds the ${MAX_GIT_PROJECTION_STATES}-state limit`);
   }
 }
 
-function encodeProjectionState(state: ProjectionState) {
+function encodeProjectionGitState(state: ProjectionGitState) {
   return {
-    gitOid: toHex(state.gitOid),
-    canonicalCommitId: toHex(state.canonicalCommitId),
-    publicCommitId: toHex(state.publicCommitId),
-    hiddenSetId: state.hiddenSetId === null ? null : toHex(state.hiddenSetId),
+    canonicalOid: gitToHex(state.canonicalOid),
+    publicOid: gitToHex(state.publicOid),
+    hiddenSetId: state.hiddenSetId === null ? null : gitToHex(state.hiddenSetId),
   };
 }
 
@@ -283,5 +276,5 @@ function requireUniqueNames(values: Array<{ bookmark: string }>, field: string) 
 }
 
 function compareNames(left: string, right: string): number {
-  return compareBytes(encoder.encode(left), encoder.encode(right));
+  return compareGitBytes(encoder.encode(left), encoder.encode(right));
 }

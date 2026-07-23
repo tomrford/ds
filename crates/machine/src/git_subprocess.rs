@@ -1,10 +1,4 @@
-//! Git fetch and lease-protected push through Git's credential and transport stack.
-
-mod fetch;
-
-pub use fetch::{
-    FetchError, FetchReport, RemoteHead, RemoteHeadsError, fetch, ls_remote_head, ls_remote_heads,
-};
+//! Redacting Git subprocess boundary for lease pushes and identity fetches.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -13,61 +7,28 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use crate::{decode_lower_hex, encode_lower_hex};
+use crate::{Oid, hex};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
-
-#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct GitOid(pub [u8; 20]);
-
-impl GitOid {
-    pub fn from_hex(value: &str) -> Result<Self, GitOidParseError> {
-        decode_lower_hex(value)
-            .map(Self)
-            .map_err(|_| GitOidParseError)
-    }
-
-    fn hex(self) -> String {
-        encode_lower_hex(&self.0)
-    }
-}
-
-impl fmt::Debug for GitOid {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("GitOid").field(&self.hex()).finish()
-    }
-}
-
-impl fmt::Display for GitOid {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.hex())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GitOidParseError;
-
-impl fmt::Display for GitOidParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Git object ID must be 40 lowercase hexadecimal characters")
-    }
-}
-
-impl std::error::Error for GitOidParseError {}
+const MAX_OBSERVATION_BYTES: usize = 1024 * 1024;
+const MAX_REMOTE_HEADS: usize = 256;
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct QualifiedRef(String);
 
 impl QualifiedRef {
     pub fn from_bookmark(bookmark: &str) -> Result<Self, QualifiedRefError> {
-        if !valid_bookmark(bookmark) {
-            return Err(QualifiedRefError);
-        }
-        Ok(Self(format!("refs/heads/{bookmark}")))
+        valid_bookmark(bookmark)
+            .then(|| Self(format!("refs/heads/{bookmark}")))
+            .ok_or(QualifiedRefError)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    fn from_qualified(value: &str) -> Result<Self, QualifiedRefError> {
+        Self::from_bookmark(value.strip_prefix("refs/heads/").ok_or(QualifiedRefError)?)
     }
 }
 
@@ -99,8 +60,8 @@ impl std::error::Error for QualifiedRefError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LeaseUpdate {
-    pub expected_old_oid: Option<GitOid>,
-    pub new_oid: Option<GitOid>,
+    pub expected_old_oid: Option<Oid>,
+    pub new_oid: Option<Oid>,
 }
 
 #[derive(Clone)]
@@ -111,7 +72,7 @@ impl RemoteUrl {
         Self(value.into())
     }
 
-    fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         &self.0
     }
 }
@@ -155,10 +116,6 @@ impl GitProcessEnvironment {
         self.extra = extra;
         self
     }
-
-    pub fn git_executable(&self) -> &Path {
-        &self.git_executable
-    }
 }
 
 impl Default for GitProcessEnvironment {
@@ -192,15 +149,15 @@ pub enum PushRefStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PushRefReport {
     pub status: PushRefStatus,
-    pub observed_oid: Option<GitOid>,
+    pub observed_oid: Option<Oid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandDiagnostic {
-    push_command: String,
-    push_exit_code: Option<i32>,
-    observation_command: String,
-    observation_exit_code: Option<i32>,
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub observation_command: String,
+    pub observation_exit_code: Option<i32>,
     pub stderr_excerpt: String,
 }
 
@@ -209,7 +166,7 @@ impl fmt::Display for CommandDiagnostic {
         write!(
             formatter,
             "{}; {}; {}",
-            self.push_command, self.observation_command, self.stderr_excerpt
+            self.command, self.observation_command, self.stderr_excerpt
         )
     }
 }
@@ -235,19 +192,117 @@ pub struct PushError {
 
 impl fmt::Display for PushError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self.kind {
-            PushErrorKind::InvalidInput => "Git push input is invalid",
-            PushErrorKind::PushFailed => "Git push failed",
-            PushErrorKind::ObservationFailed => "Git remote observation failed",
-        };
-        write!(formatter, "{message}: {}", self.report.diagnostic)
+        write!(formatter, "Git push failed: {}", self.report.diagnostic)
     }
 }
 
 impl std::error::Error for PushError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchReport {
+    pub heads: BTreeMap<String, Oid>,
+    pub diagnostic: CommandDiagnostic,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchError {
+    pub report: FetchReport,
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Git fetch failed: {}", self.report.diagnostic)
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteHeadsError {
+    command: String,
+    exit_code: Option<i32>,
+    stderr_excerpt: String,
+}
+
+impl fmt::Display for RemoteHeadsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Git remote observation failed: {}; exit code {:?}; {}",
+            self.command, self.exit_code, self.stderr_excerpt
+        )
+    }
+}
+
+impl std::error::Error for RemoteHeadsError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteHead {
+    pub branch: String,
+    pub oid: Oid,
+}
+
+pub fn ls_remote_heads(
+    remote_url: &RemoteUrl,
+    environment: &GitProcessEnvironment,
+) -> Result<BTreeMap<String, Oid>, RemoteHeadsError> {
+    let spec = remote_heads_command(remote_url, environment);
+    let result = run(&spec);
+    let parsed = result
+        .as_ref()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_remote_heads(&output.stdout));
+    if let Some(Ok(heads)) = parsed {
+        return Ok(heads);
+    }
+    let mut stderr = Vec::new();
+    append_result_stderr(&mut stderr, &result);
+    if let Some(Err(error)) = parsed {
+        stderr.extend_from_slice(error.as_bytes());
+    }
+    Err(RemoteHeadsError {
+        command: spec.safe_shape,
+        exit_code: result.as_ref().ok().and_then(|output| output.status.code()),
+        stderr_excerpt: redact_stderr(&stderr, remote_url, environment),
+    })
+}
+
+pub fn ls_remote_head(
+    remote_url: &RemoteUrl,
+    environment: &GitProcessEnvironment,
+) -> Result<Option<RemoteHead>, RemoteHeadsError> {
+    let spec = remote_head_command(remote_url, environment);
+    let result = run(&spec);
+    let parsed = result
+        .as_ref()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_remote_head(&output.stdout));
+    if let Some(Ok(head)) = parsed {
+        return Ok(head);
+    }
+    let mut stderr = Vec::new();
+    append_result_stderr(&mut stderr, &result);
+    if let Some(Err(error)) = parsed {
+        stderr.extend_from_slice(error.as_bytes());
+    }
+    Err(RemoteHeadsError {
+        command: spec.safe_shape,
+        exit_code: result.as_ref().ok().and_then(|output| output.status.code()),
+        stderr_excerpt: redact_stderr(&stderr, remote_url, environment),
+    })
+}
+
+struct CommandSpec {
+    program: PathBuf,
+    args: Vec<OsString>,
+    environment: BTreeMap<OsString, OsString>,
+    safe_shape: String,
+}
+
 pub fn push(
-    sidecar_git_dir: &Path,
+    git_dir: &Path,
     remote_url: &RemoteUrl,
     updates: &BTreeMap<QualifiedRef, LeaseUpdate>,
     environment: &GitProcessEnvironment,
@@ -255,9 +310,9 @@ pub fn push(
     let mut refs = updates
         .keys()
         .cloned()
-        .map(|qualified_ref| {
+        .map(|reference| {
             (
-                qualified_ref,
+                reference,
                 PushRefReport {
                     status: PushRefStatus::NotReported,
                     observed_oid: None,
@@ -265,21 +320,18 @@ pub fn push(
             )
         })
         .collect::<BTreeMap<_, _>>();
-
-    let push_spec = push_command(sidecar_git_dir, remote_url, updates, environment);
-    let observation_spec = observation_command(sidecar_git_dir, remote_url, updates, environment);
+    let push_spec = push_command(git_dir, remote_url, updates, environment);
+    let observation_spec = observation_command(git_dir, remote_url, updates, environment);
     if updates.is_empty() {
         return Err(PushError {
             kind: PushErrorKind::InvalidInput,
             report: PushReport {
                 refs,
-                diagnostic: CommandDiagnostic {
-                    push_command: push_spec.safe_shape,
-                    push_exit_code: None,
-                    observation_command: observation_spec.safe_shape,
-                    observation_exit_code: None,
-                    stderr_excerpt: "no refs were requested".to_owned(),
-                },
+                diagnostic: empty_diagnostic(
+                    &push_spec,
+                    &observation_spec,
+                    "no refs were requested",
+                ),
             },
         });
     }
@@ -287,26 +339,22 @@ pub fn push(
     if let Ok(output) = &push_result {
         parse_push_porcelain(&output.stdout, &mut refs);
     }
-
+    // Observation is unconditional: the Git exit status is never journal authority.
     let observation_result = run(&observation_spec);
     let observation_parse_error = match &observation_result {
         Ok(output) if output.status.success() => parse_observation(&output.stdout, &mut refs).err(),
         _ => None,
     };
-
     let diagnostic = diagnostic(
         &push_spec,
-        push_result.as_ref().ok(),
-        push_result.as_ref().err(),
+        &push_result,
         &observation_spec,
-        observation_result.as_ref().ok(),
-        observation_result.as_ref().err(),
+        &observation_result,
         observation_parse_error.as_deref(),
         remote_url,
         environment,
     );
     let report = PushReport { refs, diagnostic };
-
     if observation_result
         .as_ref()
         .map_or(true, |output| !output.status.success())
@@ -329,95 +377,245 @@ pub fn push(
     Ok(report)
 }
 
-struct CommandSpec {
-    program: PathBuf,
-    args: Vec<OsString>,
-    environment: BTreeMap<OsString, OsString>,
-    safe_shape: String,
+pub fn fetch(
+    git_dir: &Path,
+    remote_name: &str,
+    bookmarks: &[String],
+    remote_url: &RemoteUrl,
+    environment: &GitProcessEnvironment,
+) -> Result<FetchReport, FetchError> {
+    let requested = observation_refs(remote_name, bookmarks).map_err(|message| FetchError {
+        report: FetchReport {
+            heads: BTreeMap::new(),
+            diagnostic: CommandDiagnostic {
+                command: "git fetch <remote>".to_owned(),
+                exit_code: None,
+                observation_command: "git show-ref".to_owned(),
+                observation_exit_code: None,
+                stderr_excerpt: message,
+            },
+        },
+    })?;
+    let fetch_spec = fetch_command(git_dir, remote_name, bookmarks, remote_url, environment);
+    let observation_spec = fetched_observation_command(git_dir, &requested, environment);
+    let fetch_result = run(&fetch_spec);
+    let observation_result = fetch_result
+        .as_ref()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|_| run(&observation_spec));
+    let mut heads = BTreeMap::new();
+    let mut parse_error = None;
+    if let Some(Ok(output)) = &observation_result
+        && output.status.success()
+    {
+        match parse_fetched_observation(&output.stdout, &requested) {
+            Ok(value) => heads = value,
+            Err(error) => parse_error = Some(error),
+        }
+    }
+    let missing_observation = observation_result.as_ref().is_none_or(|result| {
+        result
+            .as_ref()
+            .map_or(true, |output| !output.status.success())
+    });
+    let observation_for_diagnostic =
+        observation_result.unwrap_or_else(|| Err("fetch did not complete".to_owned()));
+    let diagnostic = diagnostic(
+        &fetch_spec,
+        &fetch_result,
+        &observation_spec,
+        &observation_for_diagnostic,
+        parse_error.as_deref(),
+        remote_url,
+        environment,
+    );
+    let report = FetchReport { heads, diagnostic };
+    if fetch_result
+        .as_ref()
+        .map_or(true, |output| !output.status.success())
+        || missing_observation
+        || parse_error.is_some()
+    {
+        return Err(FetchError { report });
+    }
+    Ok(report)
 }
 
 fn push_command(
-    sidecar_git_dir: &Path,
+    git_dir: &Path,
     remote_url: &RemoteUrl,
     updates: &BTreeMap<QualifiedRef, LeaseUpdate>,
     environment: &GitProcessEnvironment,
 ) -> CommandSpec {
     let mut args = vec![
-        OsString::from(format!("--git-dir={}", sidecar_git_dir.display())),
-        OsString::from("push"),
-        OsString::from("--porcelain"),
-        OsString::from("--no-verify"),
-        OsString::from("--atomic"),
+        git_dir_arg(git_dir),
+        "push".into(),
+        "--porcelain".into(),
+        "--no-verify".into(),
+        "--atomic".into(),
     ];
-    let mut safe_args = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    for (qualified_ref, update) in updates {
-        let expected = update
-            .expected_old_oid
-            .map_or_else(String::new, GitOid::hex);
-        let lease = format!("--force-with-lease={qualified_ref}:{expected}");
-        args.push(OsString::from(&lease));
-        safe_args.push(lease);
+    let mut safe = os_strings(&args);
+    for (reference, update) in updates {
+        let expected = update.expected_old_oid.map_or_else(String::new, oid_hex);
+        let lease = format!("--force-with-lease={reference}:{expected}");
+        args.push(lease.clone().into());
+        safe.push(lease);
     }
-    args.push(OsString::from("--"));
-    args.push(OsString::from(remote_url.expose()));
-    safe_args.push("--".to_owned());
-    safe_args.push("<remote>".to_owned());
-    for (qualified_ref, update) in updates {
+    args.push("--".into());
+    args.push(remote_url.expose().into());
+    safe.push("--".to_owned());
+    safe.push("<remote>".to_owned());
+    for (reference, update) in updates {
         let refspec = update.new_oid.map_or_else(
-            || format!(":{qualified_ref}"),
-            |oid| format!("{}:{qualified_ref}", oid.hex()),
+            || format!(":{reference}"),
+            |oid| format!("{}:{reference}", oid_hex(oid)),
         );
-        args.push(OsString::from(&refspec));
-        safe_args.push(refspec);
+        args.push(refspec.clone().into());
+        safe.push(refspec);
     }
-    CommandSpec {
-        program: environment.git_executable.clone(),
-        args,
-        environment: command_environment(environment),
-        safe_shape: safe_command_shape(&environment.git_executable, &safe_args),
-    }
+    command_spec(args, safe, environment)
 }
 
 fn observation_command(
-    sidecar_git_dir: &Path,
+    git_dir: &Path,
     remote_url: &RemoteUrl,
     updates: &BTreeMap<QualifiedRef, LeaseUpdate>,
     environment: &GitProcessEnvironment,
 ) -> CommandSpec {
     let mut args = vec![
-        OsString::from(format!("--git-dir={}", sidecar_git_dir.display())),
-        OsString::from("ls-remote"),
-        OsString::from("--refs"),
-        OsString::from("--"),
-        OsString::from(remote_url.expose()),
+        git_dir_arg(git_dir),
+        "ls-remote".into(),
+        "--refs".into(),
+        "--".into(),
+        remote_url.expose().into(),
     ];
-    let mut safe_args = vec![
-        format!("--git-dir={}", sidecar_git_dir.display()),
+    let mut safe = vec![
+        format!("--git-dir={}", git_dir.display()),
         "ls-remote".to_owned(),
         "--refs".to_owned(),
         "--".to_owned(),
         "<remote>".to_owned(),
     ];
-    for qualified_ref in updates.keys() {
-        args.push(OsString::from(qualified_ref.as_str()));
-        safe_args.push(qualified_ref.to_string());
+    for reference in updates.keys() {
+        args.push(reference.as_str().into());
+        safe.push(reference.to_string());
     }
+    command_spec(args, safe, environment)
+}
+
+fn remote_heads_command(
+    remote_url: &RemoteUrl,
+    environment: &GitProcessEnvironment,
+) -> CommandSpec {
+    let args = vec![
+        "ls-remote".into(),
+        "--refs".into(),
+        "--".into(),
+        remote_url.expose().into(),
+        "refs/heads/*".into(),
+    ];
+    let safe = vec![
+        "ls-remote".to_owned(),
+        "--refs".to_owned(),
+        "--".to_owned(),
+        "<remote>".to_owned(),
+        "refs/heads/*".to_owned(),
+    ];
+    command_spec(args, safe, environment)
+}
+
+fn remote_head_command(remote_url: &RemoteUrl, environment: &GitProcessEnvironment) -> CommandSpec {
+    let args = vec![
+        "ls-remote".into(),
+        "--symref".into(),
+        "--".into(),
+        remote_url.expose().into(),
+        "HEAD".into(),
+    ];
+    let safe = vec![
+        "ls-remote".to_owned(),
+        "--symref".to_owned(),
+        "--".to_owned(),
+        "<remote>".to_owned(),
+        "HEAD".to_owned(),
+    ];
+    command_spec(args, safe, environment)
+}
+
+fn fetch_command(
+    git_dir: &Path,
+    remote_name: &str,
+    bookmarks: &[String],
+    remote_url: &RemoteUrl,
+    environment: &GitProcessEnvironment,
+) -> CommandSpec {
+    let mut args = vec![
+        git_dir_arg(git_dir),
+        "fetch".into(),
+        "--".into(),
+        remote_url.expose().into(),
+    ];
+    let mut safe = vec![
+        format!("--git-dir={}", git_dir.display()),
+        "fetch".to_owned(),
+        "--".to_owned(),
+        "<remote>".to_owned(),
+    ];
+    for bookmark in bookmarks {
+        let refspec =
+            format!("+refs/heads/{bookmark}:refs/devspace/remotes/{remote_name}/{bookmark}");
+        args.push(refspec.clone().into());
+        safe.push(refspec);
+    }
+    command_spec(args, safe, environment)
+}
+
+fn fetched_observation_command(
+    git_dir: &Path,
+    requested: &BTreeMap<String, String>,
+    environment: &GitProcessEnvironment,
+) -> CommandSpec {
+    let mut args = vec![git_dir_arg(git_dir), "show-ref".into(), "--verify".into()];
+    let mut safe = os_strings(&args);
+    for reference in requested.values() {
+        args.push(reference.into());
+        safe.push(reference.clone());
+    }
+    command_spec(args, safe, environment)
+}
+
+fn command_spec(
+    args: Vec<OsString>,
+    safe: Vec<String>,
+    environment: &GitProcessEnvironment,
+) -> CommandSpec {
     CommandSpec {
         program: environment.git_executable.clone(),
         args,
         environment: command_environment(environment),
-        safe_shape: safe_command_shape(&environment.git_executable, &safe_args),
+        safe_shape: safe_command_shape(&environment.git_executable, &safe),
     }
+}
+
+fn git_dir_arg(path: &Path) -> OsString {
+    format!("--git-dir={}", path.display()).into()
+}
+fn os_strings(values: &[OsString]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect()
+}
+fn oid_hex(oid: Oid) -> String {
+    hex(&oid.0)
 }
 
 fn command_environment(environment: &GitProcessEnvironment) -> BTreeMap<OsString, OsString> {
     let mut values = environment.extra.clone();
-    values.insert(OsString::from("LC_ALL"), OsString::from("C"));
+    values.insert("LC_ALL".into(), "C".into());
     if environment.mode == GitProcessMode::Background {
-        values.insert(OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0"));
+        values.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
     }
     values
 }
@@ -437,29 +635,19 @@ fn parse_push_porcelain(bytes: &[u8], refs: &mut BTreeMap<QualifiedRef, PushRefR
             continue;
         }
         let fields = line[2..].split(|byte| *byte == b'\t').collect::<Vec<_>>();
-        let Some(summary) = fields.get(1) else {
+        let (Some(refspec), Some(summary)) = (fields.first(), fields.get(1)) else {
             continue;
         };
-        let refspec = String::from_utf8_lossy(fields[0]);
+        let refspec = String::from_utf8_lossy(refspec);
         let destination = refspec
             .rsplit_once(':')
             .map_or(refspec.as_ref(), |(_, value)| value);
-        let Ok(qualified_ref) = QualifiedRef::from_qualified(destination) else {
+        let Ok(reference) = QualifiedRef::from_qualified(destination) else {
             continue;
         };
-        let Some(report) = refs.get_mut(&qualified_ref) else {
-            continue;
-        };
-        report.status = status_from_porcelain(line[0], summary);
-    }
-}
-
-impl QualifiedRef {
-    fn from_qualified(value: &str) -> Result<Self, QualifiedRefError> {
-        let Some(bookmark) = value.strip_prefix("refs/heads/") else {
-            return Err(QualifiedRefError);
-        };
-        Self::from_bookmark(bookmark)
+        if let Some(report) = refs.get_mut(&reference) {
+            report.status = status_from_porcelain(line[0], summary);
+        }
     }
 }
 
@@ -482,67 +670,230 @@ fn parse_observation(
     bytes: &[u8],
     refs: &mut BTreeMap<QualifiedRef, PushRefReport>,
 ) -> Result<(), String> {
+    if bytes.len() > MAX_OBSERVATION_BYTES {
+        return Err("Git remote observation exceeded its byte limit".to_owned());
+    }
     let mut observed = BTreeMap::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             continue;
         }
-        let Some(tab) = line.iter().position(|byte| *byte == b'\t') else {
-            return Err("Git returned a malformed remote observation".to_owned());
-        };
-        let oid = std::str::from_utf8(&line[..tab])
-            .ok()
-            .and_then(|value| GitOid::from_hex(value).ok())
+        let tab = line
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| "Git returned a malformed remote observation".to_owned())?;
+        let oid = Oid::from_hex(&line[..tab])
             .ok_or_else(|| "Git returned an invalid observed object ID".to_owned())?;
         let name = std::str::from_utf8(&line[tab + 1..])
             .map_err(|_| "Git returned a non-UTF-8 observed ref".to_owned())?;
-        let qualified_ref = QualifiedRef::from_qualified(name)
+        let reference = QualifiedRef::from_qualified(name)
             .map_err(|_| "Git returned an invalid observed ref".to_owned())?;
-        if refs.contains_key(&qualified_ref) {
-            observed.insert(qualified_ref, oid);
+        if refs.contains_key(&reference) {
+            observed.insert(reference, oid);
         }
     }
-    for (qualified_ref, report) in refs {
-        report.observed_oid = observed.get(qualified_ref).copied();
+    for (reference, report) in refs {
+        report.observed_oid = observed.get(reference).copied();
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+fn parse_remote_heads(bytes: &[u8]) -> Result<BTreeMap<String, Oid>, String> {
+    if bytes.len() > MAX_OBSERVATION_BYTES {
+        return Err("Git remote observation exceeded its byte limit".to_owned());
+    }
+    let mut heads = BTreeMap::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        if heads.len() >= MAX_REMOTE_HEADS {
+            return Err("Git remote has too many branch heads".to_owned());
+        }
+        let tab = line
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| "Git returned a malformed remote observation".to_owned())?;
+        let oid = Oid::from_hex(&line[..tab])
+            .ok_or_else(|| "Git returned an invalid observed object ID".to_owned())?;
+        let reference = std::str::from_utf8(&line[tab + 1..])
+            .map_err(|_| "Git returned a non-UTF-8 observed ref".to_owned())?;
+        let bookmark = reference
+            .strip_prefix("refs/heads/")
+            .ok_or_else(|| "Git returned an invalid observed ref".to_owned())?;
+        QualifiedRef::from_bookmark(bookmark)
+            .map_err(|_| "Git returned an invalid observed ref".to_owned())?;
+        if heads.insert(bookmark.to_owned(), oid).is_some() {
+            return Err("Git returned a duplicate observed ref".to_owned());
+        }
+    }
+    Ok(heads)
+}
+
+fn parse_remote_head(bytes: &[u8]) -> Result<Option<RemoteHead>, String> {
+    if bytes.len() > MAX_OBSERVATION_BYTES {
+        return Err("Git remote observation exceeded its byte limit".to_owned());
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let mut branch = None;
+    let mut oid = None;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let line = std::str::from_utf8(line)
+            .map_err(|_| "Git returned a non-UTF-8 HEAD observation".to_owned())?;
+        if let Some(value) = line.strip_prefix("ref: ") {
+            let (reference, name) = value
+                .split_once(char::is_whitespace)
+                .ok_or_else(|| "Git returned a malformed HEAD symref".to_owned())?;
+            if name.trim() != "HEAD" {
+                return Err("Git returned a malformed HEAD symref".to_owned());
+            }
+            let name = reference
+                .strip_prefix("refs/heads/")
+                .ok_or_else(|| "Git remote HEAD does not point to a branch".to_owned())?;
+            QualifiedRef::from_bookmark(name)
+                .map_err(|_| "Git remote HEAD points to an invalid branch".to_owned())?;
+            branch = Some(name.to_owned());
+            continue;
+        }
+        let (value, name) = line
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| "Git returned a malformed HEAD observation".to_owned())?;
+        if name.trim() != "HEAD" {
+            return Err("Git returned a malformed HEAD observation".to_owned());
+        }
+        if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("SHA-256 Git remotes are not supported".to_owned());
+        }
+        oid = Some(
+            Oid::from_hex(value.as_bytes())
+                .ok_or_else(|| "Git returned an invalid HEAD object ID".to_owned())?,
+        );
+    }
+    match (branch, oid) {
+        (Some(branch), Some(oid)) => Ok(Some(RemoteHead { branch, oid })),
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err("Git remote HEAD is detached; it must point to a branch".to_owned()),
+        (Some(_), None) => Err("Git remote HEAD did not advertise an object ID".to_owned()),
+    }
+}
+
+fn observation_refs(
+    remote: &str,
+    bookmarks: &[String],
+) -> Result<BTreeMap<String, String>, String> {
+    if !valid_bookmark(remote) {
+        return Err("remote name cannot be represented in an observation ref".to_owned());
+    }
+    let mut requested = BTreeMap::new();
+    for bookmark in bookmarks {
+        QualifiedRef::from_bookmark(bookmark).map_err(|error| error.to_string())?;
+        if requested
+            .insert(
+                bookmark.clone(),
+                format!("refs/devspace/remotes/{remote}/{bookmark}"),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "bookmark `{bookmark}` was requested more than once"
+            ));
+        }
+    }
+    if requested.is_empty() {
+        return Err("no refs were requested".to_owned());
+    }
+    Ok(requested)
+}
+
+fn parse_fetched_observation(
+    bytes: &[u8],
+    requested: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, Oid>, String> {
+    if bytes.len() > MAX_OBSERVATION_BYTES {
+        return Err("Git fetch observation exceeded its byte limit".to_owned());
+    }
+    let mut by_ref = BTreeMap::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let separator = line
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace())
+            .ok_or_else(|| "Git returned a malformed fetch observation".to_owned())?;
+        let oid = Oid::from_hex(&line[..separator])
+            .ok_or_else(|| "Git returned an invalid fetched object ID".to_owned())?;
+        let name = std::str::from_utf8(&line[separator..])
+            .map_err(|_| "Git returned a non-UTF-8 fetched ref".to_owned())?
+            .trim();
+        by_ref.insert(name.to_owned(), oid);
+    }
+    requested
+        .iter()
+        .map(|(bookmark, reference)| {
+            by_ref
+                .get(reference)
+                .copied()
+                .map(|oid| (bookmark.clone(), oid))
+                .ok_or_else(|| format!("Git did not retain observation ref {reference}"))
+        })
+        .collect()
+}
+
 fn diagnostic(
-    push_spec: &CommandSpec,
-    push_output: Option<&Output>,
-    push_error: Option<&String>,
-    observation_spec: &CommandSpec,
-    observation_output: Option<&Output>,
-    observation_error: Option<&String>,
-    observation_parse_error: Option<&str>,
+    command: &CommandSpec,
+    result: &Result<Output, String>,
+    observation: &CommandSpec,
+    observation_result: &Result<Output, String>,
+    parse_error: Option<&str>,
     remote_url: &RemoteUrl,
     environment: &GitProcessEnvironment,
 ) -> CommandDiagnostic {
     let mut stderr = Vec::new();
-    if let Some(output) = push_output {
-        stderr.extend_from_slice(&output.stderr);
-    }
-    if let Some(error) = push_error {
-        stderr.extend_from_slice(error.as_bytes());
-    }
-    if let Some(output) = observation_output {
-        stderr.extend_from_slice(&output.stderr);
-    }
-    if let Some(error) = observation_error {
-        stderr.extend_from_slice(error.as_bytes());
-    }
-    if let Some(error) = observation_parse_error {
+    append_result_stderr(&mut stderr, result);
+    append_result_stderr(&mut stderr, observation_result);
+    if let Some(error) = parse_error {
         stderr.extend_from_slice(error.as_bytes());
     }
     CommandDiagnostic {
-        push_command: push_spec.safe_shape.clone(),
-        push_exit_code: push_output.and_then(|output| output.status.code()),
-        observation_command: observation_spec.safe_shape.clone(),
-        observation_exit_code: observation_output.and_then(|output| output.status.code()),
+        command: command.safe_shape.clone(),
+        exit_code: result.as_ref().ok().and_then(|output| output.status.code()),
+        observation_command: observation.safe_shape.clone(),
+        observation_exit_code: observation_result
+            .as_ref()
+            .ok()
+            .and_then(|output| output.status.code()),
         stderr_excerpt: redact_stderr(&stderr, remote_url, environment),
+    }
+}
+
+fn empty_diagnostic(
+    command: &CommandSpec,
+    observation: &CommandSpec,
+    message: &str,
+) -> CommandDiagnostic {
+    CommandDiagnostic {
+        command: command.safe_shape.clone(),
+        exit_code: None,
+        observation_command: observation.safe_shape.clone(),
+        observation_exit_code: None,
+        stderr_excerpt: message.to_owned(),
+    }
+}
+
+fn append_result_stderr(buffer: &mut Vec<u8>, result: &Result<Output, String>) {
+    match result {
+        Ok(output) => buffer.extend_from_slice(&output.stderr),
+        Err(error) => buffer.extend_from_slice(error.as_bytes()),
     }
 }
 
@@ -568,23 +919,11 @@ fn redact_stderr(
     );
     let mut redacted = String::new();
     for line in text.lines() {
-        if sensitive
-            .iter()
-            .any(|sensitive_value| line.contains(sensitive_value))
-        {
+        if sensitive.iter().any(|value| line.contains(value)) {
             continue;
         }
-        let separator = usize::from(!redacted.is_empty());
-        if redacted.len() + separator + line.len() > MAX_DIAGNOSTIC_BYTES {
-            const MARKER: &str = "<truncated>";
-            let available = MAX_DIAGNOSTIC_BYTES.saturating_sub(MARKER.len() + separator);
-            while redacted.len() > available {
-                redacted.pop();
-            }
-            if !redacted.is_empty() {
-                redacted.push('\n');
-            }
-            redacted.push_str(MARKER);
+        if redacted.len() + line.len() + 1 > MAX_DIAGNOSTIC_BYTES {
+            redacted.push_str("\n<truncated>");
             break;
         }
         if !redacted.is_empty() {
@@ -611,12 +950,11 @@ fn remote_authority(url: &str) -> Option<&str> {
 }
 
 fn safe_command_shape(program: &Path, args: &[String]) -> String {
-    let mut shape = shell_word(&program.display().to_string());
-    for arg in args {
-        shape.push(' ');
-        shape.push_str(&shell_word(arg));
-    }
-    shape
+    std::iter::once(program.display().to_string())
+        .chain(args.iter().cloned())
+        .map(|word| shell_word(&word))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn shell_word(value: &str) -> String {
@@ -624,13 +962,20 @@ fn shell_word(value: &str) -> String {
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || b"_+-./:=[]".contains(&byte))
     {
-        return value.to_owned();
+        value.to_owned()
+    } else {
+        format!("{value:?}")
     }
-    format!("{:?}", value)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn valid_bookmark(bookmark: &str) -> bool {
-    if bookmark.is_empty()
+    !(bookmark.is_empty()
         || bookmark.starts_with('-')
         || bookmark.starts_with('/')
         || bookmark.ends_with('/')
@@ -643,165 +988,61 @@ fn valid_bookmark(bookmark: &str) -> bool {
             byte <= b' '
                 || byte == 0x7f
                 || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
-        })
-    {
-        return false;
-    }
-    bookmark
-        .split('/')
-        .all(|component| !component.starts_with('.') && !component.ends_with(".lock"))
+        }))
+        && bookmark
+            .split('/')
+            .all(|component| !component.starts_with('.') && !component.ends_with(".lock"))
 }
 
 fn resolve_git_executable() -> PathBuf {
     env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
-        .map(|directory| directory.join("git"))
-        .find(|candidate| candidate.is_file())
+        .and_then(|path| {
+            env::split_paths(&path)
+                .map(|directory| directory.join("git"))
+                .find(|candidate| candidate.is_file())
+        })
         .unwrap_or_else(|| PathBuf::from("git"))
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parsed_status(line: &[u8]) -> PushRefStatus {
-        let qualified_ref = QualifiedRef::from_bookmark("main").unwrap();
-        let mut refs = BTreeMap::from([(
-            qualified_ref.clone(),
-            PushRefReport {
-                status: PushRefStatus::NotReported,
-                observed_oid: None,
-            },
-        )]);
-        parse_push_porcelain(line, &mut refs);
-        refs[&qualified_ref].status
-    }
-
-    // Byte fixtures captured from git version 2.54.0.
     #[test]
-    fn parses_fixed_push_porcelain_lines() {
-        assert_eq!(
-            parsed_status(b"*\trefs/heads/main:refs/heads/main\t[new branch]\n"),
-            PushRefStatus::Updated
-        );
-        assert_eq!(
-            parsed_status(b" \trefs/heads/main:refs/heads/main\t4bdc3e7..f30ab12\n"),
-            PushRefStatus::Updated
-        );
-        assert_eq!(
-            parsed_status(b"-\t:refs/heads/main\t[deleted]\n"),
-            PushRefStatus::Deleted
-        );
-        assert_eq!(
-            parsed_status(b"=\trefs/heads/main:refs/heads/main\t[up to date]\n"),
-            PushRefStatus::UpToDate
-        );
-        assert_eq!(
-            parsed_status(b"!\trefs/heads/main:refs/heads/main\t[rejected] (stale info)\n"),
-            PushRefStatus::LeaseRejected
-        );
-        assert_eq!(
-            parsed_status(b"!\trefs/heads/main:refs/heads/main\t[rejected] (non-fast-forward)\n"),
-            PushRefStatus::RemoteRejected
-        );
-        assert_eq!(
-            parsed_status(b"?\trefs/heads/main:refs/heads/main\t[unknown]\n"),
-            PushRefStatus::OtherRejected
-        );
-    }
-
-    #[test]
-    fn background_commands_disable_terminal_prompts() {
-        let environment =
-            GitProcessEnvironment::new("git", GitProcessMode::Background).with_extra_environment(
-                BTreeMap::from([(OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("1"))]),
-            );
+    fn push_shape_has_atomic_leases_c_locale_and_no_url() {
+        let secret = RemoteUrl::new("https://user:secret@example.invalid/repo.git");
+        let reference = QualifiedRef::from_bookmark("main").unwrap();
         let updates = BTreeMap::from([(
-            QualifiedRef::from_bookmark("main").unwrap(),
+            reference,
             LeaseUpdate {
                 expected_old_oid: None,
-                new_oid: None,
+                new_oid: Some(Oid([0x11; 20])),
             },
         )]);
-        let spec = push_command(
-            Path::new("sidecar.git"),
-            &RemoteUrl::new("remote.git"),
-            &updates,
-            &environment,
+        let environment = GitProcessEnvironment::new("git", GitProcessMode::Foreground);
+        let command = push_command(Path::new("repo.git"), &secret, &updates, &environment);
+        assert!(command.safe_shape.contains("--porcelain"));
+        assert!(command.safe_shape.contains("--no-verify"));
+        assert!(command.safe_shape.contains("--atomic"));
+        assert!(
+            command
+                .safe_shape
+                .contains("--force-with-lease=refs/heads/main:")
         );
+        assert!(command.safe_shape.contains("<remote>"));
+        assert!(!command.safe_shape.contains("secret"));
         assert_eq!(
-            spec.environment
-                .get(std::ffi::OsStr::new("GIT_TERMINAL_PROMPT")),
-            Some(&OsString::from("0"))
-        );
-        assert_eq!(
-            spec.environment.get(std::ffi::OsStr::new("LC_ALL")),
+            command.environment.get(&OsString::from("LC_ALL")),
             Some(&OsString::from("C"))
         );
-
-        let foreground = GitProcessEnvironment::new("git", GitProcessMode::Foreground);
-        let spec = push_command(
-            Path::new("sidecar.git"),
-            &RemoteUrl::new("remote.git"),
-            &updates,
-            &foreground,
-        );
-        assert!(
-            !spec
-                .environment
-                .contains_key(std::ffi::OsStr::new("GIT_TERMINAL_PROMPT"))
-        );
     }
 
     #[test]
-    fn bookmark_qualification_matches_git_ref_rules() {
-        for valid in ["main", "feature/nested", "unicode-ä"] {
-            assert!(QualifiedRef::from_bookmark(valid).is_ok(), "{valid}");
-        }
-        for invalid in [
-            "", "-main", ".hidden", "a..b", "a//b", "a.lock", "a@{b", "a:b", "a?b",
-        ] {
-            assert!(QualifiedRef::from_bookmark(invalid).is_err(), "{invalid}");
-        }
-    }
-
-    #[test]
-    fn command_uses_empty_creation_lease_and_unforced_refspec() {
-        let qualified_ref = QualifiedRef::from_bookmark("main").unwrap();
-        let updates = BTreeMap::from([(
-            qualified_ref,
-            LeaseUpdate {
-                expected_old_oid: None,
-                new_oid: Some(GitOid([0x12; 20])),
-            },
-        )]);
-        let spec = push_command(
-            Path::new("sidecar.git"),
-            &RemoteUrl::new("remote.git"),
-            &updates,
-            &GitProcessEnvironment::new("git", GitProcessMode::Foreground),
-        );
-        let arguments = spec
-            .args
-            .iter()
-            .map(|argument| argument.to_string_lossy())
-            .collect::<Vec<_>>();
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "--force-with-lease=refs/heads/main:")
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == &format!("{}:refs/heads/main", "12".repeat(20)))
-        );
+    fn redaction_removes_url_authority_and_environment_values() {
+        let secret = RemoteUrl::new("https://user:secret@example.invalid/repo.git");
+        let environment = GitProcessEnvironment::new("git", GitProcessMode::Foreground)
+            .with_extra_environment(BTreeMap::from([("TOKEN".into(), "top-secret".into())]));
+        let stderr = b"safe\nhttps://user:secret@example.invalid/repo.git\nuser:secret@example.invalid\ntop-secret\n";
+        assert_eq!(redact_stderr(stderr, &secret, &environment), "safe");
     }
 }

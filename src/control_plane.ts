@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
-import { toHex } from "./kernel";
+import { gitToHex } from "./kernel";
 import { lowerHexStringSchema } from "./validation";
 
 const idSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/);
@@ -235,9 +235,7 @@ export class ControlPlane extends DurableObject<Env> {
     const authority = creation.authority;
     if (!creation.needsActivation) return creationSuccess(authority, request.name);
 
-    const stub = this.env.REPOSITORIES.get(
-      this.env.REPOSITORIES.idFromString(authority.repositoryId),
-    );
+    const stub = this.env.REPOSITORIES.getByName(authority.repositoryId);
     const initialized = await stub.initializeRepository(authority);
     if (!initialized.ok) return initialized;
     try {
@@ -479,14 +477,9 @@ export class ControlPlane extends DurableObject<Env> {
     if (status === "deleted") return { ok: true as const, deleted: false };
 
     const authority = { ...identity, repositoryId: request.repositoryId, incarnation: request.incarnation };
-    const stub = this.env.REPOSITORIES.get(
-      this.env.REPOSITORIES.idFromString(request.repositoryId),
-    );
+    const stub = this.env.REPOSITORIES.getByName(request.repositoryId);
     const retired = await stub.retireRepository(authority);
     if (!retired.ok) return retired;
-    const gitStub = this.env.REPOSITORIES_GIT.getByName(request.repositoryId);
-    const gitRetired = await gitStub.retireRepository(authority);
-    if (!gitRetired.ok) return gitRetired;
     this.finalizeRepositoryRetirement(identity.userId, request.repositoryId);
     return { ok: true as const, deleted: true };
   }
@@ -499,17 +492,10 @@ export class ControlPlane extends DurableObject<Env> {
         repositoryId: repository.repository_id,
         incarnation: repository.incarnation,
       };
-      const stub = this.env.REPOSITORIES.get(
-        this.env.REPOSITORIES.idFromString(repository.repository_id),
-      );
+      const stub = this.env.REPOSITORIES.getByName(repository.repository_id);
       const retired = await stub.retireRepository(authority);
       if (!retired.ok) {
         throw new Error(`repository retirement recovery failed: ${retired.error}`);
-      }
-      const gitStub = this.env.REPOSITORIES_GIT.getByName(repository.repository_id);
-      const gitRetired = await gitStub.retireRepository(authority);
-      if (!gitRetired.ok) {
-        throw new Error(`Git repository retirement recovery failed: ${gitRetired.error}`);
       }
       this.finalizeRepositoryRetirement(repository.user_id, repository.repository_id);
     }
@@ -599,7 +585,7 @@ function requireIncarnation(value: unknown): string {
 }
 
 function randomHex(bytes: number): string {
-  return toHex(crypto.getRandomValues(new Uint8Array(bytes)));
+  return gitToHex(crypto.getRandomValues(new Uint8Array(bytes)));
 }
 
 function expectedFailure(error: unknown) {

@@ -1,127 +1,124 @@
 # Git projection
 
-Git projection maintains 2 invariants across the machine-store path and the
-repository Durable Object:
+Devspace keeps one canonical Git history and exposes an explicit public Git
+boundary. Projection removes paths selected by `.dsprivate` while preserving
+all other Git semantics that can remain byte-identical.
 
-- bytes matched by each canonical commit's hidden set do not enter public Git
-  objects; and
-- a push remains recoverable when the remote ref moves but the machine does
-  not finalise the cloud journal.
+Canonical and public objects live in the same bare Git object database and use
+ordinary 20-byte Git OIDs. Public objects are cloud-durable Git objects, not
+temporary export artifacts.
 
 ## Machine projection
 
-`GitProjection` owns a rebuildable bare-Git sidecar backed by jj's Git backend.
-It translates commits between a stock native `SimpleBackend` store and Git
-without making the sidecar authoritative. Export resolves each commit's root
-and nested `.dsprivate` files as a prefix-aware gitignore chain, caches policy
-blobs by `FileId`, prunes matching directories without descent and filters
-matching leaves before reading them. Every `.dsprivate` is always excluded.
-Export rejects conflicts, non-file `.dsprivate` entries and Git links with
-typed errors. Import is unfiltered and rejects Git links before asking the
-simple backend to encode a tree.
+Projection walks canonical commits parent-first. A journal mapping is a stop
+point: its public commit already defines the projection of that canonical
+lineage.
 
-Translation receipts are external inputs and outputs. The adapter accepts
-durable canonical-to-Git or Git-to-public mappings, reuses consistent rows and
-rejects conflicting rows. Export seeding uses accepted rows repository-wide,
-across remotes and bookmarks. During normal export, missing mapped bytes fail
-closed with a typed error instead of re-deriving. Batch replay may re-derive a
-missing mapped Git object because recovery compares the rebuilt head with the
-journal's exact proposed Git ID before Git contact. A missing sidecar can
-therefore be recreated from the native objects and accepted cloud mappings.
+For each unseeded commit the machine:
 
-The machine can discover and pack a commit closure that is not reachable from
-an operation head. This makes both the selected private commit and each public
-shadow commit cloud durable before a pending push is accepted.
+1. resolves the inherited `.dsprivate` files from its canonical merged tree;
+2. removes `.dsprivate` and every matched path from the Git tree;
+3. substitutes the public OID for any rewritten parent;
+4. reuses every unchanged tree object;
+5. writes a new commit only if its tree or parent list changed.
+
+If neither the tree nor any parent changes, the commit takes the identity fast
+path. Its public OID equals its canonical OID. No new object and no mapping row
+are produced. Signed commits on an entirely identity lineage retain their exact
+`gpgsig` and `mergetag` bytes.
+
+A rewritten commit retains the canonical author, committer, message, encoding,
+and opaque headers that remain valid. Projection removes GitBackend-private
+headers and records the canonical OID in the rewritten commit metadata. It
+rejects conflicted canonical commits, malformed objects, and a proposed public
+tree that still contains a hidden path.
+
+Tree rewriting is minimal and deterministic. The cache key includes the source
+tree and effective hidden-policy chain, so identical subtrees under the same
+policy reuse one public tree OID.
+
+## Overlay lift
+
+Fetch runs the inverse operation over foreign public history. Existing
+canonical/public pairs seed the traversal. For every new public commit,
+overlay-lift:
+
+1. maps its public parents to canonical parents;
+2. merges the public parents and canonical parents separately;
+3. resolves the hidden policy and hidden content from the canonical base;
+4. applies the public tree change over that canonical base;
+5. writes a canonical mirror only when the parents or hidden overlay require
+   one.
+
+A hidden-free commit whose parents remain identical takes the identity fast
+path and produces no mapping. Otherwise the resulting pair is
+`canonicalOid`/`publicOid`; the public object remains unchanged.
+
+If foreign history publishes a path that the inherited policy marks hidden,
+overlay-lift emits a `WARNING: DATA DISCLOSURE` diagnostic. It preserves the
+public content in a Jujutsu tree conflict against a deterministic tombstone so
+the canonical result is explicit and resolvable. The warning means the foreign
+bytes are already public on the remote; fetch cannot retract them.
 
 ## Cloud journal
 
-The per-repository Durable Object owns Git-object receipts, append-only
-projection states, exact ref cursors, pending push batches and final results.
-Each state binds a Git object ID, private canonical commit, public shadow
-commit and nullable hidden-set identity. It does not execute Git.
+The journal stores pair-shaped projection state:
 
-A batch contains the exact remote and bookmark set, expected old Git IDs, the
-full reachable state set, one optional proposed state per ref, an owner machine
-and a monotonic fencing token. The hidden-set binding belongs to each state,
-not the batch. Draft mappings remain quarantined until the complete batch is
-accepted. Disjoint ref batches may coexist; an overlapping ref is locked by
-its pending batch.
+```text
+canonicalOid  publicOid  hiddenSetId?
+```
 
-Creating a batch checks that every private and public commit is already in the
-cloud object store. Git receipts are repository-wide and immutable: one Git
-commit ID cannot later name a different public shadow. Reusing a batch ID with
-different canonical input or hidden-set identity fails.
+An active remote bookmark cursor selects one pair. For identity history the
+cursor can store the one shared OID without adding a receipt row. Rewritten
+history stores the pair and the nullable 64-byte identity of the effective
+hidden set.
 
-Any authenticated machine may claim a pending batch. Claiming assigns a new
-fencing token, so a callback from the previous owner cannot finalise it. A
-claimant cannot finalise through the normal callback and cannot abort a batch
-while the remote still matches the expected refs: an already-running push from
-the previous owner could still land. Instead, the claimant repeats the exact
-lease-protected push recorded by the batch, then recovers from the observed
-remote values. The replay endpoint returns the bounded, quarantined mapping
-set and proposed-state positions, so a fresh claimant can download the already
-durable native objects, rebuild the exact Git objects and perform that push.
-Recovery compares the complete observed ref set with the journal:
+The receipt invariant is one-way: one canonical OID cannot map to two public
+OIDs. The Worker rejects a conflicting pair. A public OID can be reached from
+more than one canonical lineage only when fetch can resolve that lineage
+without ambiguity.
 
-- all refs at their proposed values accepts every draft and advances or clears
-  every cursor atomically, including deletion-only batches;
-- all refs at their expected values aborts an unclaimed batch, while a claimed
-  batch remains pending until its exact push is replayed;
-- mixed or otherwise ambiguous values retain the batch and fail closed.
+Push updates use durable batches. Each batch contains:
 
-The Durable Object accepts only exact Git IDs. It does not accept a client
-claim that an unrecorded Git commit is a descendant; that requires imported
-ancestry and a durable projection state first.
+- remote and bookmark;
+- expected old public OID;
+- proposed pair state or deletion;
+- owner machine, fencing token, request hash, and idempotency key.
+
+The batch begins before the Git subprocess runs. Recovery claims the fence,
+replays the exact lease updates, observes the live remote refs, and either
+activates every cursor atomically or records an aborted result. A partially
+accepted multi-ref push never becomes a partially committed journal update.
+
+Fetch records observed public refs, any new pair states, and either a proposed
+state index or `identityOid`. The Worker verifies that all referenced commits
+are already durable before it advances cursors.
 
 ## Verification
 
-The normal Rust tests pin nested gitignore chaining and the canonical
-hidden-set digest, resolve different policy sets across one history walk,
-partition shared-subtree caches by the active policy chain, prove filtering
-before leaf reads, scan every blob in a fresh sidecar for binary private
-sentinels, rebuild a deleted sidecar from durable mapping rows, and reject a
-Git link without changing the native operation head.
+The projection suite proves:
 
-Workers Vitest exercises the authenticated HTTP routes and real SQLite-backed
-Durable Object. It covers nullable and concrete hidden-set identities through
-replay and accepted snapshots, malformed identity rejection, identity-bound
-batch retries, eviction, overlapping batches, stale fences, before-push abort,
-post-push acceptance, mixed-outcome quarantine, cloud-durability checks and
-immutable receipt collisions.
+- hidden-free signed history creates no mirror objects or mapping rows;
+- hidden files and `.dsprivate` never enter public trees;
+- only affected trees and commits are rewritten;
+- merges preserve public parent order and canonical hidden lineage;
+- repeated projection is deterministic;
+- overlay-lift preserves hidden files through public edits and deletions;
+- disclosure collisions become explicit conflicts and warnings;
+- push and fetch recover after process failure without journal drift;
+- fresh-machine recovery succeeds using cloud packs and journal state.
 
-Rust transport coverage proves both the sync and projection clients use the
-hardened HTTP client and terminate when a Worker accepts a request but never
-responds.
+The Worker checks all journal mutations transactionally and rejects stale
+incarnations, stale leases, missing durable commits, ambiguous mappings, and
+request-key reuse.
 
-The ignored `projection_live` test crosses the Rust/TypeScript boundary against
-`wrangler dev` or a deployment. It creates private native history, exports and
-scans a public Git graph, uploads private and public commit closures, creates a
-pending batch, pushes with an exact lease to a real bare Git remote and omits
-the first machine's final callback. A second client claims the batch, reads its
-durable replay mappings, downloads the cloud pack into a fresh native store,
-rebuilds an empty sidecar, observes the remote and recovers the batch. The test
-then claims a second batch before its remote ref moves, proves recovery retains
-the unchanged batch, reads the replay payload, performs the exact lease push
-from the rebuilt sidecar and finalises it from the observed remote value. It
-scans every blob in both the remote and rebuilt sidecar for both private values.
+## Budgets and measurements
 
-The live probe accepts the shared development credential with machine IDs `11`
-repeated 16 times and `22` repeated 16 times. It remains a manual deployment
-probe because its repository authority and Git remote are supplied explicitly.
+The integrated validation module and Worker dry-run currently measure:
 
-## Budgets and benchmarks
+- `dist/kernel.wasm`: 192,676 bytes, zero imports;
+- Worker upload: 897.01 KiB;
+- Worker upload gzip: 181.92 KiB.
 
-The journal bounds one request to 4 MiB, 256 refs and 8,192 projection states.
-Repository-wide pending and active ref sets are each bounded to 512. Remote
-and bookmark names are bounded to 256 UTF-8 bytes. Mapping reads page 256 rows
-under one fixed activation high-water. These are current safety limits, not
-settled production quotas.
-
-The projection path does not run during warm repository open. A release-only
-comparison measured the Devspace wrapper at 1.304 to 1.309 times stock jj,
-inside the 2 times budget for that shared subpath. The embedded command runner
-connects checkout `ds git push` execution to the projection journal while warm
-repository open and bare-repository `log` remain local-only paths.
-
-The dry-run Worker bundle is 270.78 KiB uncompressed and 80.67 KiB compressed.
-The validation Wasm is 142,859 bytes and remains below its 200 KiB build gate.
+The WebAssembly build enforces a 200 KiB limit. `pnpm build` performs a Worker
+dry run only; deployment is a separate operator action.

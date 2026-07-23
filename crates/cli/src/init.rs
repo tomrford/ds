@@ -3,9 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use devspace_machine::{CatalogEntry, MachineStore, RepositoryName};
-use devspace_machine_git::{
-    GitProcessEnvironment, MachineGitRepository, RemoteUrl, ls_remote_head,
-};
+use devspace_machine::{GitProcessEnvironment, MachineGitRepository, RemoteUrl, ls_remote_head};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;

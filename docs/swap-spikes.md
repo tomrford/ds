@@ -1,5 +1,7 @@
 # GitBackend swap — spike plan
 
+Status: completed; the validated GitBackend stack is now the primary implementation.
+
 The canonical store moves from jj's SimpleBackend to jj's GitBackend
 (colocated git odb as the object store). Clean cut: the worker is wiped and
 redeployed; no migration code, ever. Three spikes mirror the repository's
@@ -69,3 +71,9 @@ implementation continues. After all three: integration (CLI cutover, worker
 wipe/redeploy), then a simplification pass over semi-legacy machinery whose
 assumptions the swap invalidates (sign-on-export custody, rewrite handling,
 shim fabrication), then dogfooding resumes.
+
+## Open item
+
+Decide whether public commits that projection must rewrite should be signed.
+Identity commits already preserve the canonical Git commit and its existing
+signature bytes.

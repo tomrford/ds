@@ -4,13 +4,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use devspace_machine_git::{MachineGitRepository, MachineGitRepositoryError};
 use jj_lib::settings::UserSettings;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::locked_json::{LockedJsonError, LockedJsonFile};
-use crate::{decode_lower_hex, sync_directory};
+use crate::{MachineGitRepository, MachineGitRepositoryError, decode_lower_hex, sync_directory};
 
 mod repository_clone;
 pub use repository_clone::StagedRepositoryClone;
