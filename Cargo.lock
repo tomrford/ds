@@ -709,6 +709,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "devspace-kernel-git-oracle"
+version = "0.0.0"
+dependencies = [
+ "devspace-kernel-git",
+ "futures 0.3.32",
+ "jj-lib",
+ "tempfile",
+]
+
+[[package]]
 name = "devspace-kernel-wasm"
 version = "0.1.0"
 dependencies = [

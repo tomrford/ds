@@ -13,28 +13,32 @@ struct Vector {
 }
 
 fn vectors() -> Vec<Vector> {
-    include_str!("git_golden.txt")
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| {
-            let mut fields = line.split('|');
-            let kind = match fields.next().expect("vector type") {
-                "blob" => ObjectKind::Blob,
-                "tree" => ObjectKind::Tree,
-                "commit" => ObjectKind::Commit,
-                other => panic!("unknown vector type {other}"),
-            };
-            let expected = Oid::from_hex(fields.next().expect("expected id").as_bytes())
-                .expect("20-byte expected id");
-            let payload = decode_hex(fields.next().expect("payload hex"));
-            assert!(fields.next().is_none(), "extra vector field");
-            Vector {
-                kind,
-                expected,
-                payload,
-            }
-        })
-        .collect()
+    [
+        include_str!("git_golden.txt"),
+        include_str!("git_golden_oracle.txt"),
+    ]
+    .into_iter()
+    .flat_map(str::lines)
+    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    .map(|line| {
+        let mut fields = line.split('|');
+        let kind = match fields.next().expect("vector type") {
+            "blob" => ObjectKind::Blob,
+            "tree" => ObjectKind::Tree,
+            "commit" => ObjectKind::Commit,
+            other => panic!("unknown vector type {other}"),
+        };
+        let expected = Oid::from_hex(fields.next().expect("expected id").as_bytes())
+            .expect("20-byte expected id");
+        let payload = decode_hex(fields.next().expect("payload hex"));
+        assert!(fields.next().is_none(), "extra vector field");
+        Vector {
+            kind,
+            expected,
+            payload,
+        }
+    })
+    .collect()
 }
 
 fn decode_hex(hex: &str) -> Vec<u8> {
