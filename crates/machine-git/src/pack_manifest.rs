@@ -380,6 +380,24 @@ mod worker_fixture_generation {
             vec![commit.0.id],
             vec![blob.clone(), tree.clone(), commit.clone()],
         );
+        let journal_commits = (0..260)
+            .map(|index| {
+                object(
+                    ObjectKind::Commit,
+                    format!(
+                        "tree {}\nauthor Journal Fixture <journal@example.invalid> {} +0000\ncommitter Journal Fixture <journal@example.invalid> {} +0000\n\njournal fixture {index}\n",
+                        crate::hex(&tree.0.id.0),
+                        1_700_001_000 + index,
+                        1_700_001_000 + index,
+                    )
+                    .into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let journal = fixture(
+            journal_commits.iter().map(|commit| commit.0.id).collect(),
+            [vec![blob.clone(), tree.clone()], journal_commits].concat(),
+        );
         let dependency = fixture(Vec::new(), vec![blob.clone()]);
         let missing_reference = fixture(vec![commit.0.id], vec![tree, commit]);
 
@@ -400,6 +418,7 @@ mod worker_fixture_generation {
 
         let output = json!({
             "complete": complete,
+            "journal": journal,
             "dependency": dependency,
             "missingReference": missing_reference,
             "malformed": malformed,

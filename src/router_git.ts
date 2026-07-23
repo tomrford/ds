@@ -4,6 +4,8 @@ import {
   MAX_GIT_MANIFEST_BYTES,
   readBoundedGitBody,
 } from "./pack_git_protocol";
+import { MAX_GIT_PROJECTION_REQUEST_BYTES } from "./projection_git_protocol";
+import { MAX_REMOTE_REQUEST_BYTES } from "./remote_protocol";
 import type { RepositoryGit } from "./repository_git";
 import { cursorStringSchema, lowerHexStringSchema } from "./validation";
 
@@ -23,7 +25,29 @@ export async function routeGitRepository(
     url.pathname,
   );
   const packCatalogMatch = /^\/repositories\/([^/]+)\/git\/packs$/.exec(url.pathname);
-  const repositoryId = chunkMatch?.[1] ?? packMatch?.[1] ?? packCatalogMatch?.[1];
+  const projectionMatch = /^\/repositories\/([^/]+)\/git\/projection$/.exec(url.pathname);
+  const remotesMatch = /^\/repositories\/([^/]+)\/git\/remotes$/.exec(url.pathname);
+  const remoteMatch = /^\/repositories\/([^/]+)\/git\/remotes\/([^/]+)$/.exec(url.pathname);
+  const projectionPushMatch = /^\/repositories\/([^/]+)\/git\/projection\/pushes$/.exec(
+    url.pathname,
+  );
+  const projectionFetchMatch = /^\/repositories\/([^/]+)\/git\/projection\/fetches$/.exec(
+    url.pathname,
+  );
+  const projectionPushActionMatch =
+    /^\/repositories\/([^/]+)\/git\/projection\/pushes\/([^/]+)\/(claim|recover|replay)$/.exec(
+      url.pathname,
+    );
+  const repositoryId =
+    chunkMatch?.[1] ??
+    packMatch?.[1] ??
+    packCatalogMatch?.[1] ??
+    projectionMatch?.[1] ??
+    remotesMatch?.[1] ??
+    remoteMatch?.[1] ??
+    projectionPushMatch?.[1] ??
+    projectionFetchMatch?.[1] ??
+    projectionPushActionMatch?.[1];
   const packId = chunkMatch?.[2] ?? packMatch?.[2];
   if (repositoryId === undefined) return undefined;
 
@@ -99,6 +123,88 @@ export async function routeGitRepository(
       if (packId === undefined) throw new Error("pack route did not capture an ID");
       return gitRpcResponse(await stub.installPack(authority, packId));
     }
+    if (projectionMatch !== null && request.method === "GET") {
+      const after = cursorStringSchema.safeParse(url.searchParams.get("after") ?? "0");
+      const throughValue = url.searchParams.get("through");
+      const through = throughValue === null ? undefined : cursorStringSchema.safeParse(throughValue);
+      if (!after.success || (through !== undefined && !through.success)) {
+        return gitErrorResponse(400, "invalid projection cursor");
+      }
+      return gitRpcResponse(
+        await stub.getProjection(
+          authority,
+          url.searchParams.get("incarnation"),
+          after.data,
+          through?.data,
+        ),
+      );
+    }
+    if (remotesMatch !== null && request.method === "GET") {
+      return gitRpcResponse(
+        await stub.listRemotes(authority, url.searchParams.get("incarnation")),
+      );
+    }
+    if (remoteMatch !== null && request.method === "PUT") {
+      let name: string;
+      try {
+        name = decodeURIComponent(remoteMatch[2]);
+      } catch {
+        return gitErrorResponse(400, "remote name has invalid URL encoding", "invalid-remote-name");
+      }
+      const body = await readGitJsonBody(
+        request,
+        MAX_REMOTE_REQUEST_BYTES,
+        "remote request",
+        "invalid-remote-request",
+      );
+      if (body instanceof Response) return body;
+      return gitRpcResponse(await stub.setRemote(authority, name, body));
+    }
+    if (projectionPushMatch !== null && request.method === "POST") {
+      const body = await readGitJsonBody(
+        request,
+        MAX_GIT_PROJECTION_REQUEST_BYTES,
+        "projection push request",
+        "invalid-projection-request",
+      );
+      if (body instanceof Response) return body;
+      return gitRpcResponse(await stub.beginProjectionPush(authority, body));
+    }
+    if (projectionFetchMatch !== null && request.method === "POST") {
+      const body = await readGitJsonBody(
+        request,
+        MAX_GIT_PROJECTION_REQUEST_BYTES,
+        "projection fetch request",
+        "invalid-fetch-request",
+      );
+      if (body instanceof Response) return body;
+      return gitRpcResponse(await stub.recordProjectionFetch(authority, body));
+    }
+    if (projectionPushActionMatch?.[3] === "replay" && request.method === "GET") {
+      return gitRpcResponse(
+        await stub.getProjectionPushReplay(
+          authority,
+          projectionPushActionMatch[2],
+          url.searchParams.get("incarnation"),
+        ),
+      );
+    }
+    if (projectionPushActionMatch !== null && request.method === "POST") {
+      const body = await readGitJsonBody(
+        request,
+        MAX_GIT_PROJECTION_REQUEST_BYTES,
+        "projection push request",
+        "invalid-projection-request",
+      );
+      if (body instanceof Response) return body;
+      const batchId = projectionPushActionMatch[2];
+      switch (projectionPushActionMatch[3]) {
+        case "claim":
+          return gitRpcResponse(await stub.claimProjectionPush(authority, batchId, body));
+        case "recover":
+          return gitRpcResponse(await stub.recoverProjectionPush(authority, batchId, body));
+      }
+    }
     return gitErrorResponse(404, "not found");
   } catch (error) {
     console.error(
@@ -143,4 +249,23 @@ function gitRpcResponse(result: {
   }
   const { ok: _, status: __, ...body } = result;
   return Response.json(body);
+}
+
+async function readGitJsonBody(
+  request: Request,
+  limit: number,
+  label: string,
+  code: string,
+): Promise<unknown | Response> {
+  let bytes: Uint8Array;
+  try {
+    bytes = await readBoundedGitBody(request, limit, label);
+  } catch (error) {
+    return gitErrorResponse(400, error instanceof Error ? error.message : `invalid ${label}`, code);
+  }
+  try {
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+  } catch {
+    return gitErrorResponse(400, `${label} must be valid JSON`, code);
+  }
 }
